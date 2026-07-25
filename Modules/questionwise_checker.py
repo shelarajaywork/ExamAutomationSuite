@@ -597,4 +597,4 @@ def show():
             )
 
     except Exception as error:
-        st.error(f"Something was wrong while processing this file: {error}")
+        st.error(f"Something went wrong while processing this file: {error}")
