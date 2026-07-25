@@ -43,6 +43,7 @@ import streamlit as st
 PASSWORDS = [
     "Exam@108",
     "UPG@123",
+    "Exam@105"
 ]
 
 # Non-question metadata columns
