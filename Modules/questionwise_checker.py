@@ -9,17 +9,22 @@ This Streamlit tool helps exam staff:
 
 1. Open password-protected or unprotected Excel mark sheets exported from
    the examination system.
-2. Clean the raw export (remove blank/footer rows, drop unused
-   columns).
+2. Clean the raw export (remove blank/footer rows, drop unused columns).
 3. Sort records so each student's rows appear in a fixed order:
    Examiner -> Moderator -> Reval 1 -> Reval 2.
 4. Compare each Moderator / Revaluer's question-wise marks against
    the original Examiner's marks and highlight increases, decreases,
-   and missing marks in the preview.
+   and missing marks in the previews.
 5. Summarise how many students were moderated / revalued, and how
    many scores went up, down, or stayed the same.
-6. Export the processed output Excel file formatted with continuous SrNo,
-   borders, bold scores, renamed sheet, removed Reval 1/2 rows, and dynamic output filename.
+6. Display three preview sections with 1-based indexing and visible SrNo: 
+   All Data Preview, Moderation / Revaluation Cases Only, and Changes Only.
+7. Export the processed output Excel file formatted with continuous SrNo,
+   renamed 'PRNNumber' to 'SAP ID', renamed 'Subject Name-Subject code' to 
+   'Subject code', center alignment for specified columns, dropped 'Semester', 
+   thin borders, bold scores, frozen top row, grey header highlighting, 
+   hidden default gridlines, auto-sized columns, renamed worksheet, 
+   removed UserType/Reval rows, and dynamic output filename.
 ==================================================
 """
 
@@ -30,7 +35,8 @@ import re
 import tempfile
 
 import msoffcrypto
-from openpyxl.styles import Border, Font, Side
+from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+from openpyxl.utils import get_column_letter
 import pandas as pd
 import streamlit as st
 
@@ -46,7 +52,7 @@ PASSWORDS = [
     "Exam@105"
 ]
 
-# Non-question metadata columns
+# Non-question metadata columns (Includes Name and CampusName so they are not treated as questions)
 FIXED_COLUMNS = [
     "SrNo",
     "ExamAssingment_ID",
@@ -56,13 +62,16 @@ FIXED_COLUMNS = [
     "Semester",
     "RollNo",
     "PRNNumber",
+    "Name",
+    "CampusName",
     "UserType",
     "MarkAttendance",
     "Email",
 ]
 
-# Columns to completely remove from the final Excel download file
+# Columns to completely remove from the final Excel download file (including Semester & UserType)
 COLUMNS_TO_DROP = [
+    "Semester",
     "ExamAssingment_ID",
     "OnScreenID",
     "RollNo",
@@ -73,8 +82,12 @@ COLUMNS_TO_DROP = [
     "Email",
 ]
 
-# Columns hidden from the on-screen Streamlit preview tables
+# Columns hidden from on-screen Streamlit preview tables (SrNo is kept visible)
 PREVIEW_HIDDEN_COLUMNS = [
+    "OnScreenID",
+    "RollNo",
+    "Name",
+    "CampusName",
     "Subject Name-Subject code",
     "SubjectName",
     "Semester",
@@ -188,7 +201,9 @@ def process_data_for_download(df):
     - Removes 'Reval 1' and 'Reval 2' rows completely
     - Filters Moderator rows (drops Examiner rows for PRNs with Moderator)
     - Replaces "AB" with "UFM" or "ABSENT" based on MarkAttendance
-    - Drops unwanted columns specified in COLUMNS_TO_DROP
+    - Drops unwanted columns specified in COLUMNS_TO_DROP (including Semester & UserType)
+    - Renames 'Subject Name-Subject code' to 'Subject code'
+    - Renames 'PRNNumber' to 'SAP ID'
     - Makes SrNo numbers continuous starting from 1
     """
     download_df = df.copy()
@@ -227,8 +242,16 @@ def process_data_for_download(df):
 
         download_df["TotalObtainedScore"] = download_df.apply(adjust_score, axis=1)
 
-    # --- Rule: Drop Unwanted Columns ---
+    # --- Rule: Drop Unwanted Columns (including Semester & UserType) ---
     download_df = download_df.drop(columns=COLUMNS_TO_DROP, errors="ignore")
+
+    # --- Rule: Rename Subject Name-Subject code to Subject code ---
+    if "Subject Name-Subject code" in download_df.columns:
+        download_df = download_df.rename(columns={"Subject Name-Subject code": "Subject code"})
+
+    # --- Rule: Rename PRNNumber to SAP ID ---
+    if "PRNNumber" in download_df.columns:
+        download_df = download_df.rename(columns={"PRNNumber": "SAP ID"})
 
     # Reset index cleanly
     download_df = download_df.reset_index(drop=True)
@@ -260,7 +283,7 @@ def format_value(value):
 
 
 def highlight_rows(data, question_columns):
-    """Applies CSS styles for Streamlit preview table."""
+    """Applies CSS styles for Streamlit preview table safely."""
     styles = pd.DataFrame("", index=data.index, columns=data.columns)
 
     for idx in data.index:
@@ -281,6 +304,10 @@ def highlight_rows(data, question_columns):
                     continue
 
                 for col in question_columns:
+                    # Guard against hidden preview columns
+                    if col not in data.columns:
+                        continue
+
                     examiner_value = str(examiner_row[col]).strip()
                     current_value = str(data.loc[idx, col]).strip()
 
@@ -309,11 +336,11 @@ def highlight_rows(data, question_columns):
 
 
 def style_preview(df, question_columns, hide_columns=PREVIEW_HIDDEN_COLUMNS):
-    """Builds styled interactive preview table for web display."""
-    display_df = df.drop(columns=hide_columns, errors="ignore")
+    """Builds styled interactive preview table for web display with 1-based indexing."""
+    display_df = df.drop(columns=hide_columns, errors="ignore").copy()
+    display_df.index = range(1, len(display_df) + 1)  # Make built-in index start from 1
     return (
         display_df.style
-        .hide(axis="index")
         .format(format_value)
         .apply(lambda data: highlight_rows(data, question_columns), axis=None)
     )
@@ -420,8 +447,15 @@ def to_excel_bytes(df):
     """
     Converts processed DataFrame to styled Excel file bytes:
     - Applies download-specific column drops, Moderator filters, and removes Reval rows
+    - Renames 'Subject Name-Subject code' to 'Subject code'
+    - Renames 'PRNNumber' to 'SAP ID'
     - Ensures SrNo is sequential (1, 2, 3...)
     - Renames worksheet to SubjectName
+    - Freezes top header row
+    - Highlights column headings in grey color
+    - Disables Excel default gridlines
+    - Auto-sizes column widths based on content length
+    - Center aligns SrNo, Subject code, SAP ID, TotalObtainedScore, and all columns in between
     - Bold TotalObtainedScore column values
     - Applies thin borders across all data and header cells
     """
@@ -440,6 +474,12 @@ def to_excel_bytes(df):
         workbook = writer.book
         worksheet = writer.sheets[sheet_name]
 
+        # Disable default Excel gridlines
+        worksheet.views.sheetView[0].showGridLines = False
+
+        # Freeze the header row (Row 1)
+        worksheet.freeze_panes = "A2"
+
         thin_border = Border(
             left=Side(style="thin", color="000000"),
             right=Side(style="thin", color="000000"),
@@ -447,20 +487,50 @@ def to_excel_bytes(df):
             bottom=Side(style="thin", color="000000")
         )
 
-        total_score_col_idx = None
-        for col_idx, col_name in enumerate(download_df.columns, start=1):
-            if col_name == "TotalObtainedScore":
-                total_score_col_idx = col_idx
-                break
+        center_align = Alignment(horizontal="center")
+        grey_fill = PatternFill(start_color="D9D9D9", end_color="D9D9D9", fill_type="solid")
+
+        # Find column indices for center alignment
+        cols = download_df.columns.tolist()
+        center_col_indices = []
+
+        for col_idx, col_name in enumerate(cols, start=1):
+            if col_name in ["SrNo", "Subject code"]:
+                center_col_indices.append(col_idx)
+
+        if "SAP ID" in cols and "TotalObtainedScore" in cols:
+            sap_idx = cols.index("SAP ID") + 1
+            tot_idx = cols.index("TotalObtainedScore") + 1
+            for idx in range(sap_idx, tot_idx + 1):
+                center_col_indices.append(idx)
+
+        center_col_indices = set(center_col_indices)
+
+        total_score_col_idx = cols.index("TotalObtainedScore") + 1 if "TotalObtainedScore" in cols else None
 
         for row in worksheet.iter_rows(min_row=1, max_row=worksheet.max_row, min_col=1, max_col=worksheet.max_column):
             for cell in row:
                 cell.border = thin_border
                 
+                # Make header row bold and highlighted in grey
                 if cell.row == 1:
                     cell.font = Font(bold=True)
+                    cell.fill = grey_fill
                 elif total_score_col_idx and cell.column == total_score_col_idx:
                     cell.font = Font(bold=True)
+
+                # Center align specified data columns
+                if cell.row > 1 and cell.column in center_col_indices:
+                    cell.alignment = center_align
+
+        # Auto-size columns based on maximum content length
+        for col in worksheet.columns:
+            max_len = 0
+            col_letter = get_column_letter(col[0].column)
+            for cell in col:
+                if cell.value is not None:
+                    max_len = max(max_len, len(str(cell.value)))
+            worksheet.column_dimensions[col_letter].width = max(max_len + 3, 10)
 
     return buffer.getvalue()
 
@@ -569,7 +639,7 @@ def show():
         st.subheader("All Data Preview")
         st.write(style_preview(df, question_columns))
 
-        # Step 5: Moderation / Revaluation only preview
+        # Step 5: Moderation / Revaluation Cases Only preview
         review_prns = df[
             df["UserType"].astype(str).str.strip().isin(["Moderator", "Reval 1", "Reval 2"])
         ]["PRNNumber"].unique()
@@ -579,10 +649,31 @@ def show():
         if not review_df.empty:
             st.subheader("Moderation / Revaluation Cases Only")
             st.write(style_preview(review_df, question_columns))
-            st.write(f"Students Requiring Review: {review_df['PRNNumber'].nunique()}")
-            st.write(f"Total Records: {len(review_df)}")
 
-        # Step 6: Downloads
+        # Step 6: Changes Only preview window (below Moderation / Revaluation Cases Only)
+        changed_prns = set()
+        if "TotalObtainedScore" in df.columns and "UserType" in df.columns:
+            for prn, group in df.groupby("PRNNumber", dropna=False):
+                examiner_rows = group[group["UserType"] == "Examiner"]
+                reviewer_rows = group[group["UserType"].isin(["Moderator", "Reval 1", "Reval 2"])]
+                if not examiner_rows.empty and not reviewer_rows.empty:
+                    try:
+                        ex_score = float(examiner_rows.iloc[0]["TotalObtainedScore"])
+                        for _, rev_row in reviewer_rows.iterrows():
+                            rev_score = float(rev_row["TotalObtainedScore"])
+                            if rev_score != ex_score:
+                                changed_prns.add(prn)
+                                break
+                    except (TypeError, ValueError):
+                        continue
+
+        changes_df = df[df["PRNNumber"].isin(changed_prns)].copy()
+
+        if not changes_df.empty:
+            st.subheader("Changes Only")
+            st.write(style_preview(changes_df, question_columns))
+
+        # Step 7: Downloads
         st.markdown("---")
         download_col1, download_col2 = st.columns(2)
 
