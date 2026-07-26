@@ -11,20 +11,30 @@ This is the entry point of the Streamlit app. It handles:
   3. Routing to the right "page" based on user selection.
 
 The actual logic for each tool lives in its own file inside the
-`Modules/` folder (e.g. `Modules/questionwise_checker.py`).
+`Modules/` subfolders (e.g. `Modules/Questionwise_Checker/questionwise_checker.py`,
+`Modules/Gracing_Checker/gracing_checker.py`).
 ==================================================
 """
 
 import streamlit as st
 
-# Import module tools
+# Import Questionwise Checker module tool
 try:
     from Modules.Questionwise_Checker.questionwise_checker import show as questionwise_checker
 except Exception as import_error:
     questionwise_checker = None
-    _import_error_message = str(import_error)
+    _qc_import_error_message = str(import_error)
 else:
-    _import_error_message = None
+    _qc_import_error_message = None
+
+# Import Gracing Checker module tool
+try:
+    from Modules.Gracing_Checker.gracing_checker import show as gracing_checker
+except Exception as import_error:
+    gracing_checker = None
+    _gc_import_error_message = str(import_error)
+else:
+    _gc_import_error_message = None
 
 
 # --------------------
@@ -59,10 +69,10 @@ st.sidebar.title("🎓 Exam Tools")
 
 tools_list = [
     "🏠 Dashboard",
+    "✅ Gracing Checker",
     "📝 Questionwise Checker",
     "📂 DigiLocker Tracker",
     "🔍 Duplicate Checker",
-    "✅ ABC Validation",
     "📊 Result Analysis",
     "🧹 Data Cleaner",
     "🔗 Merge Files",
@@ -90,6 +100,10 @@ if st.session_state.selected_tool == "🏠 Dashboard":
     # Defined tool cards with icons and descriptions
     tools_info = [
         {
+            "name": "✅ Gracing Checker",
+            "desc": "Check and validate grace marks, ordinance rules, and eligibility criteria for candidates.",
+        },
+        {
             "name": "📝 Questionwise Checker",
             "desc": "Verify question-wise marks, compare Examiner vs. Moderator scores, and export cleaned mark sheets.",
         },
@@ -100,10 +114,6 @@ if st.session_state.selected_tool == "🏠 Dashboard":
         {
             "name": "🔍 Duplicate Checker",
             "desc": "Detect and remove duplicate student entries across examination sheets.",
-        },
-        {
-            "name": "✅ ABC Validation",
-            "desc": "Validate Academic Bank of Credits (ABC) IDs for candidate submissions.",
         },
         {
             "name": "📊 Result Analysis",
@@ -132,7 +142,8 @@ if st.session_state.selected_tool == "🏠 Dashboard":
             with st.container(border=True):
                 st.subheader(tool["name"])
                 st.write(tool["desc"])
-                if st.button(f"Open {tool['name'].split(' ')[1]}", key=f"btn_{i}"):
+                btn_label = tool["name"].split(" ", 1)[1] if " " in tool["name"] else tool["name"]
+                if st.button(f"Open {btn_label}", key=f"btn_{i}"):
                     st.session_state.selected_tool = tool["name"]
                     st.rerun()
 
@@ -142,9 +153,44 @@ if st.session_state.selected_tool == "🏠 Dashboard":
                 with st.container(border=True):
                     st.subheader(tool["name"])
                     st.write(tool["desc"])
-                    if st.button(f"Open {tool['name'].split(' ')[1]}", key=f"btn_{i+1}"):
+                    btn_label = tool["name"].split(" ", 1)[1] if " " in tool["name"] else tool["name"]
+                    if st.button(f"Open {btn_label}", key=f"btn_{i+1}"):
                         st.session_state.selected_tool = tool["name"]
                         st.rerun()
+
+# --------------------
+# Gracing Checker
+# --------------------
+elif st.session_state.selected_tool == "✅ Gracing Checker":
+
+    if gracing_checker is not None:
+        gracing_checker()
+    else:
+        st.title("✅ Gracing Checker")
+        if _gc_import_error_message:
+            st.info("This tool file (`Modules/Gracing_Checker/gracing_checker.py`) is currently blank or under development.")
+        else:
+            st.error(
+                "This tool could not be loaded due to an import error:\n\n"
+                f"`{_gc_import_error_message}`\n\n"
+                "Check that `Modules/Gracing_Checker/gracing_checker.py` defines a `show()` function."
+            )
+
+# --------------------
+# Questionwise Checker
+# --------------------
+elif st.session_state.selected_tool == "📝 Questionwise Checker":
+
+    if questionwise_checker is not None:
+        questionwise_checker()
+    else:
+        st.title("📝 Questionwise Checker")
+        st.error(
+            "This tool could not be loaded due to an import error:\n\n"
+            f"`{_qc_import_error_message}`\n\n"
+            "Check that `Modules/Questionwise_Checker/questionwise_checker.py` exists and that "
+            "all its dependencies (see requirements.txt) are installed."
+        )
 
 # --------------------
 # DigiLocker Tracker
@@ -162,35 +208,11 @@ elif st.session_state.selected_tool == "📂 DigiLocker Tracker":
         st.success("File Uploaded Successfully")
 
 # --------------------
-# Questionwise Checker
-# --------------------
-elif st.session_state.selected_tool == "📝 Questionwise Checker":
-
-    if questionwise_checker is not None:
-        questionwise_checker()
-    else:
-        st.title("📝 Questionwise Checker")
-        st.error(
-            "This tool could not be loaded due to an import error:\n\n"
-            f"`{_import_error_message}`\n\n"
-            "Check that `Modules/questionwise_checker.py` exists and that "
-            "all its dependencies (see requirements.txt) are installed."
-        )
-
-# --------------------
 # Duplicate Checker
 # --------------------
 elif st.session_state.selected_tool == "🔍 Duplicate Checker":
 
     st.title("🔍 Duplicate Checker")
-    st.info("Tool under development")
-
-# --------------------
-# ABC Validation
-# --------------------
-elif st.session_state.selected_tool == "✅ ABC Validation":
-
-    st.title("✅ ABC Validation")
     st.info("Tool under development")
 
 # --------------------
