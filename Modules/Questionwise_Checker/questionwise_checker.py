@@ -17,9 +17,10 @@ This Streamlit tool helps exam staff:
    and missing marks in the previews.
 5. Summarise how many students were moderated / revalued, and how
    many scores went up, down, or stayed the same.
-6. Display three preview sections with 1-based indexing: All Data Preview, 
-   Moderation / Revaluation Cases Only (MarkAttendance removed), and 
-   Changes Only (MarkAttendance removed, clean continuous list of changed cases).
+6. Display three tab-based preview windows with 1-based indexing: 
+   - All Data Preview
+   - Moderation / Revaluation Cases Only (MarkAttendance removed)
+   - Changes Only (MarkAttendance removed)
 7. Export the processed output Excel file formatted with center-aligned headers, 
    continuous SrNo, renamed 'PRNNumber' to 'SAP ID', renamed 'Subject Name-Subject code' 
    to 'Subject code', center alignment for data columns, dropped 'Semester', 
@@ -636,26 +637,19 @@ def show():
                 f"Reval 2: {reval2_no_change}"
             )
 
-        # Step 4: All-data preview
+        st.markdown("---")
         st.header(build_paper_info(df))
-        st.subheader("All Data Preview")
-        st.write(style_preview(df, question_columns))
 
-        # Hide MarkAttendance in Moderation/Revaluation and Changes preview windows
+        # Hidden preview column lists
         no_attendance_hidden_columns = PREVIEW_HIDDEN_COLUMNS + ["MarkAttendance"]
 
-        # Step 5: Moderation / Revaluation Cases Only preview (MarkAttendance removed)
+        # Filter Moderation/Revaluation records
         review_prns = df[
             df["UserType"].astype(str).str.strip().isin(["Moderator", "Reval 1", "Reval 2"])
         ]["PRNNumber"].unique()
-
         review_df = df[df["PRNNumber"].isin(review_prns)].copy()
 
-        if not review_df.empty:
-            st.subheader("Moderation / Revaluation Cases Only")
-            st.write(style_preview(review_df, question_columns, hide_columns=no_attendance_hidden_columns))
-
-        # Step 6: Changes Only preview window (MarkAttendance removed, clean continuous list of changed cases)
+        # Filter Changed PRNs records
         changed_prns = []
         if "TotalObtainedScore" in df.columns and "UserType" in df.columns:
             for prn, group in df.groupby("PRNNumber", dropna=False, sort=False):
@@ -672,13 +666,34 @@ def show():
                     except (TypeError, ValueError):
                         continue
 
-        if changed_prns:
-            changes_df = df[df["PRNNumber"].isin(changed_prns)].copy()
+        changes_df = df[df["PRNNumber"].isin(changed_prns)].copy() if changed_prns else pd.DataFrame()
 
+        # Tab-based Preview Windows
+        tab1, tab2, tab3 = st.tabs([
+            "📋 All Data Preview", 
+            "🔍 Moderation / Revaluation Cases Only", 
+            "⚡ Changes Only"
+        ])
+
+        with tab1:
+            st.subheader("All Data Preview")
+            st.write(style_preview(df, question_columns))
+
+        with tab2:
+            st.subheader("Moderation / Revaluation Cases Only")
+            if not review_df.empty:
+                st.write(style_preview(review_df, question_columns, hide_columns=no_attendance_hidden_columns))
+            else:
+                st.info("No moderation or revaluation cases found in this file.")
+
+        with tab3:
             st.subheader("Changes Only")
-            st.write(style_preview(changes_df, question_columns, hide_columns=no_attendance_hidden_columns))
+            if not changes_df.empty:
+                st.write(style_preview(changes_df, question_columns, hide_columns=no_attendance_hidden_columns))
+            else:
+                st.info("No score changes detected between examiner and reviewers.")
 
-        # Step 7: Downloads
+        # Downloads Section
         st.markdown("---")
         download_col1, download_col2 = st.columns(2)
 
