@@ -17,11 +17,12 @@ This Streamlit tool helps exam staff:
    and missing marks in the previews.
 5. Summarise how many students were moderated / revalued, and how
    many scores went up, down, or stayed the same.
-6. Display three preview sections with 1-based indexing and visible SrNo: 
-   All Data Preview, Moderation / Revaluation Cases Only, and Changes Only.
-7. Export the processed output Excel file formatted with continuous SrNo,
-   renamed 'PRNNumber' to 'SAP ID', renamed 'Subject Name-Subject code' to 
-   'Subject code', center alignment for specified columns, dropped 'Semester', 
+6. Display three preview sections with 1-based indexing: All Data Preview, 
+   Moderation / Revaluation Cases Only (MarkAttendance removed), and 
+   Changes Only (MarkAttendance removed, clean continuous list of changed cases).
+7. Export the processed output Excel file formatted with center-aligned headers, 
+   continuous SrNo, renamed 'PRNNumber' to 'SAP ID', renamed 'Subject Name-Subject code' 
+   to 'Subject code', center alignment for data columns, dropped 'Semester', 
    thin borders, bold scores, frozen top row, grey header highlighting, 
    hidden default gridlines, auto-sized columns, renamed worksheet, 
    removed UserType/Reval rows, and dynamic output filename.
@@ -270,8 +271,8 @@ def format_value(value):
     """Formats values cleanly for preview display."""
     text = str(value).strip()
 
-    if text == "" or text.upper() == "NA":
-        return "NA"
+    if text == "" or text.upper() == "NA" or text.upper() == "NAN":
+        return "" if text == "" else "NA"
 
     try:
         number = float(text)
@@ -452,7 +453,7 @@ def to_excel_bytes(df):
     - Ensures SrNo is sequential (1, 2, 3...)
     - Renames worksheet to SubjectName
     - Freezes top header row
-    - Highlights column headings in grey color
+    - Highlights column headings in grey color and centers them
     - Disables Excel default gridlines
     - Auto-sizes column widths based on content length
     - Center aligns SrNo, Subject code, SAP ID, TotalObtainedScore, and all columns in between
@@ -487,7 +488,7 @@ def to_excel_bytes(df):
             bottom=Side(style="thin", color="000000")
         )
 
-        center_align = Alignment(horizontal="center")
+        center_align = Alignment(horizontal="center", vertical="center")
         grey_fill = PatternFill(start_color="D9D9D9", end_color="D9D9D9", fill_type="solid")
 
         # Find column indices for center alignment
@@ -512,10 +513,11 @@ def to_excel_bytes(df):
             for cell in row:
                 cell.border = thin_border
                 
-                # Make header row bold and highlighted in grey
+                # Make header row bold, grey highlighted, and CENTER ALIGNED
                 if cell.row == 1:
                     cell.font = Font(bold=True)
                     cell.fill = grey_fill
+                    cell.alignment = center_align
                 elif total_score_col_idx and cell.column == total_score_col_idx:
                     cell.font = Font(bold=True)
 
@@ -639,7 +641,10 @@ def show():
         st.subheader("All Data Preview")
         st.write(style_preview(df, question_columns))
 
-        # Step 5: Moderation / Revaluation Cases Only preview
+        # Hide MarkAttendance in Moderation/Revaluation and Changes preview windows
+        no_attendance_hidden_columns = PREVIEW_HIDDEN_COLUMNS + ["MarkAttendance"]
+
+        # Step 5: Moderation / Revaluation Cases Only preview (MarkAttendance removed)
         review_prns = df[
             df["UserType"].astype(str).str.strip().isin(["Moderator", "Reval 1", "Reval 2"])
         ]["PRNNumber"].unique()
@@ -648,12 +653,12 @@ def show():
 
         if not review_df.empty:
             st.subheader("Moderation / Revaluation Cases Only")
-            st.write(style_preview(review_df, question_columns))
+            st.write(style_preview(review_df, question_columns, hide_columns=no_attendance_hidden_columns))
 
-        # Step 6: Changes Only preview window (below Moderation / Revaluation Cases Only)
-        changed_prns = set()
+        # Step 6: Changes Only preview window (MarkAttendance removed, clean continuous list of changed cases)
+        changed_prns = []
         if "TotalObtainedScore" in df.columns and "UserType" in df.columns:
-            for prn, group in df.groupby("PRNNumber", dropna=False):
+            for prn, group in df.groupby("PRNNumber", dropna=False, sort=False):
                 examiner_rows = group[group["UserType"] == "Examiner"]
                 reviewer_rows = group[group["UserType"].isin(["Moderator", "Reval 1", "Reval 2"])]
                 if not examiner_rows.empty and not reviewer_rows.empty:
@@ -662,16 +667,16 @@ def show():
                         for _, rev_row in reviewer_rows.iterrows():
                             rev_score = float(rev_row["TotalObtainedScore"])
                             if rev_score != ex_score:
-                                changed_prns.add(prn)
+                                changed_prns.append(prn)
                                 break
                     except (TypeError, ValueError):
                         continue
 
-        changes_df = df[df["PRNNumber"].isin(changed_prns)].copy()
+        if changed_prns:
+            changes_df = df[df["PRNNumber"].isin(changed_prns)].copy()
 
-        if not changes_df.empty:
             st.subheader("Changes Only")
-            st.write(style_preview(changes_df, question_columns))
+            st.write(style_preview(changes_df, question_columns, hide_columns=no_attendance_hidden_columns))
 
         # Step 7: Downloads
         st.markdown("---")
