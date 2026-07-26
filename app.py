@@ -19,7 +19,7 @@ import streamlit as st
 
 # Import module tools
 try:
-    from Modules.questionwise_checker import show as questionwise_checker
+    from Modules.Questionwise_Checker.questionwise_checker import show as questionwise_checker
 except Exception as import_error:
     questionwise_checker = None
     _import_error_message = str(import_error)
