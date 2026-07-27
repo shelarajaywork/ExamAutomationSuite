@@ -14,19 +14,22 @@ This Streamlit tool processes examination gracing sheets:
      Composite Score, Overall Grade, Completion Status after Gracing, Remarks & Scale.
    - Merged student header row across all columns:
      "Student Number | Student Name | Additional ID | Gender"
-   - Red text highlight on Composite Score if component marks don't sum up.
+   - Converts marks to numeric values; replaces Z1 with "AB" and Z3 with "UFM" (0.0 calculation).
+   - Highlights Z1 ("AB"), Z3 ("UFM"), marks < 40% of Max, and "F" grades in BOLD RED.
    - Summary row showing Total Composite Score, Total Composite Score (Max), 
-     and Percentage in Overall Grade.
+     and Percentage in Overall Grade with thick bottom border for student separation.
    - Center alignment for columns Credit through Overall Grade.
-   - Highlights 'Completed Unsuccessfuly' statuses in RED.
-3. Identifies all instances where grace marks were awarded.
+   - Highlights 'Completed Unsuccessfuly' statuses in BOLD RED.
+3. Identifies all instances where grace marks were awarded and students who failed.
 4. Computes high-level statistics & summary reports.
 5. Displays tab-based previews with 1-based indexing:
-   - 📊 Processed Data (First Tab)
+   - 📊 All Students (First Tab)
+   - ⚠️ Failed Students
+   - ✅ Graced Students
    - 📋 Graced Cases Details
    - 📚 Subject Summary
    - 👤 Student Summary
-6. Generates a formatted multi-sheet Excel report for download.
+6. Generates a formatted multi-sheet Excel report ("All Students", "Failed Students", "Graced Students", etc.).
 ==================================================
 """
 
@@ -44,8 +47,17 @@ import streamlit as st
 # ==================================================
 # HELPER FUNCTIONS
 # ==================================================
-def parse_scale(scale_val):
-    """Parses maximum mark integer from scale strings (e.g., 'R050' -> '50', 'S020' -> '20')."""
+def parse_scale_num(scale_val):
+    """Parses maximum mark numeric float from scale strings (e.g., 'R050' -> 50.0)."""
+    s = str(scale_val).strip()
+    digits = re.findall(r'\d+', s)
+    if digits:
+        return float(digits[0])
+    return 0.0
+
+
+def parse_scale_str(scale_val):
+    """Parses maximum mark integer display from scale strings (e.g., 'R050' -> '50')."""
     s = str(scale_val).strip()
     digits = re.findall(r'\d+', s)
     if digits:
@@ -53,32 +65,50 @@ def parse_scale(scale_val):
     return s if s.upper() not in ['NAN', 'NONE', 'NA'] else ''
 
 
+def parse_mark(val):
+    """
+    Converts mark values to numeric or replaced text strings:
+    - 'Z1' -> ('AB', 0.0, True)
+    - 'Z3' -> ('UFM', 0.0, True)
+    - Numeric values -> (int/float display, float calculation, False)
+    """
+    s = str(val).strip().upper()
+    if s == 'Z1':
+        return 'AB', 0.0, True
+    elif s == 'Z3':
+        return 'UFM', 0.0, True
+    elif s in ['', 'NAN', 'NONE', 'NA']:
+        return '', 0.0, False
+    else:
+        try:
+            num = float(s)
+            out_val = int(num) if num.is_integer() else num
+            return out_val, float(num), False
+        except (TypeError, ValueError):
+            return val, 0.0, False
+
+
 # ==================================================
 # STEP 1: PROCESSED DATA GENERATION
 # ==================================================
-def create_processed_data(df):
+def create_processed_data(df, target_student_ids=None):
     """
     Restructures raw examination records into a clean student-wise dataset:
     - Merged Student Info Row across all columns: "Student Number | Name | Add ID | Gender"
-    - Strict Column Order:
-      1. Module Code
-      2. Module Desc
-      3. Credit
-      4. Internal Actual (Max)
-      5. Internal Actual
-      6. Sem Actual (Max)
-      7. Sem Actual
-      8. Sem Grace
-      9. Composite Score (Max)
-      10. Composite Score
-      11. Overall Grade
-      12. Completion Status after Gracing
-      13. Remarks & Scale
+    - Replaces Z1 with "AB" and Z3 with "UFM"
+    - Checks 40% minimum passing criteria on max marks
+    - Formats numbers, totals, and percentages
+    - If target_student_ids is provided, filters strictly for those students.
     """
     df = df.copy()
     df.columns = df.columns.astype(str).str.strip()
 
-    student_ids = df['Student Number'].dropna().unique()
+    if target_student_ids is not None:
+        target_set = set(str(sid).strip() for sid in target_student_ids)
+        student_ids = [sid for sid in df['Student Number'].dropna().unique() if str(sid).strip() in target_set]
+    else:
+        student_ids = df['Student Number'].dropna().unique()
+
     all_processed_rows = []
 
     for s_num in student_ids:
@@ -115,7 +145,11 @@ def create_processed_data(df):
             'Completion Status after Gracing': '',
             'Remarks & Scale': '',
             'Row_Type': 'HEADER',
-            'Comp_Mismatch': False
+            'Comp_Mismatch': False,
+            'Red_Internal': False,
+            'Red_Sem': False,
+            'Red_Grace': False,
+            'Red_Composite': False
         })
 
         modules = module_df['Module Code'].dropna().unique()
@@ -126,24 +160,39 @@ def create_processed_data(df):
             m_sub = module_df[module_df['Module Code'] == m_code]
             m_desc = m_sub.iloc[0]['Module Desc']
 
-            # Non-zero credit from Overall Grade or first available row
+            # Credit parsing
             credit_row = m_sub[m_sub['Appraisal Type Code'].astype(str).str.strip() == 'Overall Grade']
-            credit = credit_row.iloc[0]['Credit'] if not credit_row.empty else m_sub.iloc[0]['Credit']
+            credit_raw = credit_row.iloc[0]['Credit'] if not credit_row.empty else m_sub.iloc[0]['Credit']
+            credit_val, _, _ = parse_mark(credit_raw)
 
-            # Extraction helper for appraisal type values and scale max marks
+            # Helper for extracting appraisal type values and scale max marks
             def get_val_and_scale(code):
                 sub = m_sub[m_sub['Appraisal Type Code'].astype(str).str.strip() == code]
                 if not sub.empty:
                     val = sub['Marks after Gracing'].iloc[0]
                     scale = sub['Scale'].iloc[0] if 'Scale' in sub.columns else ''
-                    return val, parse_scale(scale)
+                    return val, scale
                 return '', ''
 
-            internal_actual, internal_max = get_val_and_scale('Internal Actual')
-            sem_actual, sem_max = get_val_and_scale('Sem Actual')
-            sem_grace, _ = get_val_and_scale('Sem Grace')
-            composite_score, composite_max = get_val_and_scale('Composite Score')
+            int_raw, int_scale_raw = get_val_and_scale('Internal Actual')
+            sem_raw, sem_scale_raw = get_val_and_scale('Sem Actual')
+            grace_raw, _ = get_val_and_scale('Sem Grace')
+            comp_raw, comp_scale_raw = get_val_and_scale('Composite Score')
             overall_grade, _ = get_val_and_scale('Overall Grade')
+
+            int_display, i_num, int_is_abs_ufm = parse_mark(int_raw)
+            sem_display, s_num_val, sem_is_abs_ufm = parse_mark(sem_raw)
+            grace_display, g_num_val, grace_is_abs_ufm = parse_mark(grace_raw)
+            comp_display, c_num_val, comp_is_abs_ufm = parse_mark(comp_raw)
+
+            int_max_num = parse_scale_num(int_scale_raw)
+            int_max_display = parse_scale_str(int_scale_raw)
+
+            sem_max_num = parse_scale_num(sem_scale_raw)
+            sem_max_display = parse_scale_str(sem_scale_raw)
+
+            comp_max_num = parse_scale_num(comp_scale_raw)
+            comp_max_display = parse_scale_str(comp_scale_raw)
 
             sub_overall = m_sub[m_sub['Appraisal Type Code'].astype(str).str.strip() == 'Overall Grade']
             completion_status = sub_overall['Completion Status after Gracing'].iloc[0] if not sub_overall.empty else ''
@@ -157,67 +206,60 @@ def create_processed_data(df):
             remarks_combined = " | ".join(remarks_list)
 
             # Verification: Internal Actual + Sem Actual + Sem Grace == Composite Score
+            sum_components = i_num + s_num_val + g_num_val
+            calc_total_comp += c_num_val
+            calc_total_max_comp += comp_max_num
+
             is_mismatch = False
-            try:
-                i_val = float(internal_actual) if str(internal_actual).strip() not in ['', 'nan', 'NA'] else 0.0
-                s_val = float(sem_actual) if str(sem_actual).strip() not in ['', 'nan', 'NA'] else 0.0
-                g_val = float(sem_grace) if str(sem_grace).strip() not in ['', 'nan', 'NA'] else 0.0
-                c_val = float(composite_score) if str(composite_score).strip() not in ['', 'nan', 'NA'] else 0.0
+            if str(comp_raw).strip() not in ['', 'nan', 'NA']:
+                if abs(sum_components - c_num_val) >= 0.01:
+                    is_mismatch = True
 
-                calc_total_comp += c_val
-
-                sum_components = i_val + s_val + g_val
-                if str(composite_score).strip() not in ['', 'nan', 'NA']:
-                    if abs(sum_components - c_val) >= 0.01:
-                        is_mismatch = True
-            except (TypeError, ValueError):
-                pass
-
-            # Calculate total max composite marks
-            try:
-                cm_val = float(composite_max) if str(composite_max).strip() not in ['', 'nan', 'NA'] else 0.0
-                calc_total_max_comp += cm_val
-            except (TypeError, ValueError):
-                pass
+            # 40% Minimum Passing Criteria Checks
+            fail_int = (int_max_num > 0) and (i_num < 0.40 * int_max_num or int_is_abs_ufm)
+            fail_sem = (sem_max_num > 0) and (s_num_val < 0.40 * sem_max_num or sem_is_abs_ufm)
+            fail_comp = (comp_max_num > 0) and (c_num_val < 0.40 * comp_max_num or comp_is_abs_ufm)
 
             all_processed_rows.append({
                 'Module Code': m_code,
                 'Module Desc': m_desc,
-                'Credit': credit,
-                'Internal Actual (Max)': internal_max,
-                'Internal Actual': internal_actual,
-                'Sem Actual (Max)': sem_max,
-                'Sem Actual': sem_actual,
-                'Sem Grace': sem_grace,
-                'Composite Score (Max)': composite_max,
-                'Composite Score': composite_score,
+                'Credit': credit_val,
+                'Internal Actual (Max)': int_max_display,
+                'Internal Actual': int_display,
+                'Sem Actual (Max)': sem_max_display,
+                'Sem Actual': sem_display,
+                'Sem Grace': grace_display,
+                'Composite Score (Max)': comp_max_display,
+                'Composite Score': comp_display,
                 'Overall Grade': overall_grade,
                 'Completion Status after Gracing': completion_status,
                 'Remarks & Scale': remarks_combined,
                 'Row_Type': 'DATA',
-                'Comp_Mismatch': is_mismatch
+                'Comp_Mismatch': is_mismatch,
+                'Red_Internal': int_is_abs_ufm or fail_int,
+                'Red_Sem': sem_is_abs_ufm or fail_sem,
+                'Red_Grace': grace_is_abs_ufm,
+                'Red_Composite': comp_is_abs_ufm or fail_comp or is_mismatch
             })
 
         # 2. Total & Percentage Summary Row
         tot_val_raw = total_row.iloc[0]['Marks after Gracing'] if not total_row.empty else (total_row.iloc[0]['Marks before Gracing'] if not total_row.empty else '')
         perc_val_raw = perc_row.iloc[0]['Marks after Gracing'] if not perc_row.empty else (perc_row.iloc[0]['Marks before Gracing'] if not perc_row.empty else '')
 
+        tot_display, tot_num, _ = parse_mark(tot_val_raw)
+
         total_mismatch = False
-        try:
-            tot_num = float(tot_val_raw)
+        if str(tot_val_raw).strip() not in ['', 'nan', 'NA']:
             if abs(calc_total_comp - tot_num) >= 0.01:
                 total_mismatch = True
-            tot_display = f"{tot_num:g}"
-        except (TypeError, ValueError):
-            tot_display = str(tot_val_raw)
 
         try:
-            perc_num = float(perc_val_raw)
-            perc_display = f"{perc_num:g}%"
+            p_num = float(perc_val_raw)
+            perc_display = f"{p_num:g}%"
         except (TypeError, ValueError):
             perc_display = f"{perc_val_raw}%" if str(perc_val_raw).strip() != '' else ''
 
-        tot_max_display = f"{int(calc_total_max_comp)}" if calc_total_max_comp.is_integer() else f"{calc_total_max_comp:g}"
+        tot_max_display = int(calc_total_max_comp) if calc_total_max_comp.is_integer() else calc_total_max_comp
 
         all_processed_rows.append({
             'Module Code': '',
@@ -234,7 +276,11 @@ def create_processed_data(df):
             'Completion Status after Gracing': '',
             'Remarks & Scale': '',
             'Row_Type': 'SUMMARY',
-            'Comp_Mismatch': total_mismatch
+            'Comp_Mismatch': total_mismatch,
+            'Red_Internal': False,
+            'Red_Sem': False,
+            'Red_Grace': False,
+            'Red_Composite': total_mismatch
         })
 
     return pd.DataFrame(all_processed_rows)
@@ -374,10 +420,16 @@ def style_processed_preview(proc_df):
     Styles the Processed Data table:
     - Bold max columns
     - Center alignment for Credit through Overall Grade
-    - Red text for mismatched Composite Scores
-    - Red font for 'Completed Unsuccessfuly'
+    - BOLD Red font for marks < 40%, Z1 ("AB"), Z3 ("UFM"), or mismatched Composite Scores
+    - BOLD Red font for 'F' grades
+    - BOLD Red font for 'Completed Unsuccessfuly'
+    - Thick bottom border on student summary rows
     """
-    display_df = proc_df.drop(columns=['Row_Type', 'Comp_Mismatch'], errors='ignore').copy()
+    internal_flags = [
+        'Row_Type', 'Comp_Mismatch', 'Fail_Internal', 'Fail_Sem', 
+        'Fail_Composite', 'Red_Internal', 'Red_Sem', 'Red_Grace', 'Red_Composite'
+    ]
+    display_df = proc_df.drop(columns=internal_flags, errors='ignore').copy()
     display_df.index = range(1, len(display_df) + 1)
 
     def apply_custom_styles(data):
@@ -393,9 +445,10 @@ def style_processed_preview(proc_df):
 
         for idx in data.index:
             orig_idx = idx - 1
-            row_type = proc_df.iloc[orig_idx]['Row_Type'] if 'Row_Type' in proc_df.columns else ''
-            is_mismatch = proc_df.iloc[orig_idx]['Comp_Mismatch'] if 'Comp_Mismatch' in proc_df.columns else False
-            status_val = str(data.loc[idx, 'Completion Status after Gracing']).strip()
+            p_row = proc_df.iloc[orig_idx]
+            row_type = p_row.get('Row_Type', '')
+
+            status_val = str(data.loc[idx, 'Completion Status after Gracing']).strip() if 'Completion Status after Gracing' in data.columns else ''
 
             # Center align specified columns
             for col in center_cols:
@@ -412,18 +465,29 @@ def style_processed_preview(proc_df):
                 styles.loc[idx, :] += "background-color: #D9E1F2; font-weight: bold; color: #1F4E78;"
                 continue
 
-            # 2. Total Summary Row (Soft Yellow Background + Bold text)
+            # 2. Total Summary Row (Soft Yellow Background + Bold text + Thick Bottom Border)
             if row_type == 'SUMMARY':
-                styles.loc[idx, :] += "background-color: #FFF2CC; font-weight: bold; color: #000000;"
-                if is_mismatch and 'Composite Score' in data.columns:
+                styles.loc[idx, :] += "background-color: #FFF2CC; font-weight: bold; color: #000000; border-bottom: 3px solid #000000;"
+                if p_row.get('Red_Composite', False) and 'Composite Score' in data.columns:
                     styles.loc[idx, 'Composite Score'] += "color: red; font-weight: bold;"
                 continue
 
-            # 3. Red text highlight if Composite Score mismatched
-            if is_mismatch and 'Composite Score' in data.columns:
+            # 3. BOLD Red font for < 40%, Z1 ("AB"), Z3 ("UFM")
+            if p_row.get('Red_Internal', False) and 'Internal Actual' in data.columns:
+                styles.loc[idx, 'Internal Actual'] += "color: red; font-weight: bold;"
+            if p_row.get('Red_Sem', False) and 'Sem Actual' in data.columns:
+                styles.loc[idx, 'Sem Actual'] += "color: red; font-weight: bold;"
+            if p_row.get('Red_Grace', False) and 'Sem Grace' in data.columns:
+                styles.loc[idx, 'Sem Grace'] += "color: red; font-weight: bold;"
+            if p_row.get('Red_Composite', False) and 'Composite Score' in data.columns:
                 styles.loc[idx, 'Composite Score'] += "color: red; font-weight: bold;"
 
-            # 4. Red font for 'Completed Unsuccessfuly'
+            # 4. BOLD Red font for Grade 'F'
+            grade_val = str(data.loc[idx, 'Overall Grade']).strip().upper() if 'Overall Grade' in data.columns else ''
+            if grade_val == 'F' and 'Overall Grade' in data.columns:
+                styles.loc[idx, 'Overall Grade'] += "color: red; font-weight: bold;"
+
+            # 5. BOLD Red font for 'Completed Unsuccessfuly'
             if status_val.lower() == 'completed unsuccessfuly' and 'Completion Status after Gracing' in data.columns:
                 styles.loc[idx, 'Completion Status after Gracing'] += "color: red; font-weight: bold;"
 
@@ -446,13 +510,155 @@ def style_preview(df):
 # ==================================================
 # STEP 4: EXCEL REPORT GENERATION
 # ==================================================
-def to_excel_bytes(proc_df, graced_df, subject_summary, student_summary):
-    """Generates styled multi-sheet Excel output file."""
+def format_excel_processed_sheet(worksheet, clean_proc, proc_df):
+    """Helper to apply formatting, borders, bold fonts, and red highlights to processed student sheets."""
+    cols = clean_proc.columns.tolist()
+
+    column_widths = {
+        'Module Code': 15,
+        'Module Desc': 40,
+        'Credit': 7,
+        'Internal Actual (Max)': 11,
+        'Internal Actual': 11,
+        'Sem Actual (Max)': 11,
+        'Sem Actual': 11,
+        'Sem Grace': 11,
+        'Composite Score (Max)': 11,
+        'Composite Score': 11,
+        'Overall Grade': 11,
+        'Completion Status after Gracing': 25,
+        'Remarks & Scale': 25
+    }
+
+    center_cols_indices = [
+        i + 1 for i, c in enumerate(cols) if c in [
+            'Credit', 'Internal Actual (Max)', 'Internal Actual',
+            'Sem Actual (Max)', 'Sem Actual', 'Sem Grace', 
+            'Composite Score (Max)', 'Composite Score', 'Overall Grade'
+        ]
+    ]
+    max_cols_indices = [
+        i + 1 for i, c in enumerate(cols) if c in [
+            'Internal Actual (Max)', 'Sem Actual (Max)', 'Composite Score (Max)'
+        ]
+    ]
+
+    int_act_idx = cols.index('Internal Actual') + 1 if 'Internal Actual' in cols else None
+    sem_act_idx = cols.index('Sem Actual') + 1 if 'Sem Actual' in cols else None
+    sem_grace_idx = cols.index('Sem Grace') + 1 if 'Sem Grace' in cols else None
+    comp_score_idx = cols.index('Composite Score') + 1 if 'Composite Score' in cols else None
+    grade_idx = cols.index('Overall Grade') + 1 if 'Overall Grade' in cols else None
+    status_col_idx = cols.index('Completion Status after Gracing') + 1 if 'Completion Status after Gracing' in cols else None
+
+    thin_side = Side(style="thin", color="000000")
+    thick_side = Side(style="medium", color="000000")
+
+    thin_border = Border(left=thin_side, right=thin_side, top=thin_side, bottom=thin_side)
+    summary_thick_border = Border(left=thin_side, right=thin_side, top=thin_side, bottom=thick_side)
+
+    header_align = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    center_align = Alignment(horizontal="center", vertical="center")
+
+    header_fill = PatternFill(start_color="D9D9D9", end_color="D9D9D9", fill_type="solid")
+    student_header_fill = PatternFill(start_color="D9E1F2", end_color="D9E1F2", fill_type="solid")
+    summary_fill = PatternFill(start_color="FFF2CC", end_color="FFF2CC", fill_type="solid")
+
+    red_bold_font = Font(color="FF0000", bold=True)
+    bold_font = Font(bold=True)
+    bold_blue_font = Font(color="1F4E78", bold=True)
+
+    worksheet.views.sheetView[0].showGridLines = False
+    worksheet.freeze_panes = "A2"
+
+    for row_idx in range(1, len(clean_proc) + 2):
+        if row_idx == 1:
+            for col_idx in range(1, len(cols) + 1):
+                cell = worksheet.cell(row=row_idx, column=col_idx)
+                cell.border = thin_border
+                cell.font = bold_font
+                cell.fill = header_fill
+                cell.alignment = header_align
+            continue
+
+        proc_idx = row_idx - 2
+        p_row = proc_df.iloc[proc_idx]
+        row_type_val = p_row.get('Row_Type', '')
+
+        is_student_header = (row_type_val == 'HEADER')
+        is_summary_row = (row_type_val == 'SUMMARY')
+
+        if is_student_header:
+            worksheet.merge_cells(start_row=row_idx, start_column=1, end_row=row_idx, end_column=len(cols))
+            for col_idx in range(1, len(cols) + 1):
+                cell = worksheet.cell(row=row_idx, column=col_idx)
+                cell.border = thin_border
+                cell.font = bold_blue_font
+                cell.fill = student_header_fill
+        else:
+            for col_idx in range(1, len(cols) + 1):
+                cell = worksheet.cell(row=row_idx, column=col_idx)
+
+                if is_summary_row:
+                    cell.border = summary_thick_border
+                    cell.font = bold_font
+                    cell.fill = summary_fill
+                else:
+                    cell.border = thin_border
+                    if col_idx in max_cols_indices:
+                        cell.font = bold_font
+
+                if col_idx in center_cols_indices:
+                    cell.alignment = center_align
+
+                # BOLD RED font for marks < 40%, Z1 ("AB"), Z3 ("UFM")
+                if p_row.get('Red_Internal', False) and col_idx == int_act_idx:
+                    cell.font = red_bold_font
+                if p_row.get('Red_Sem', False) and col_idx == sem_act_idx:
+                    cell.font = red_bold_font
+                if p_row.get('Red_Grace', False) and col_idx == sem_grace_idx:
+                    cell.font = red_bold_font
+                if p_row.get('Red_Composite', False) and col_idx == comp_score_idx:
+                    cell.font = red_bold_font
+
+                # BOLD RED font for Overall Grade 'F'
+                grade_val = str(cell.value).strip().upper() if col_idx == grade_idx else ''
+                if col_idx == grade_idx and grade_val == 'F':
+                    cell.font = red_bold_font
+
+                # BOLD RED font for unsuccessful completion status
+                status_val = str(worksheet.cell(row=row_idx, column=status_col_idx).value).strip() if status_col_idx else ''
+                if status_col_idx and col_idx == status_col_idx and status_val.lower() == 'completed unsuccessfuly':
+                    cell.font = red_bold_font
+
+    # Apply specified fixed column widths
+    for col_name, width in column_widths.items():
+        if col_name in cols:
+            c_idx = cols.index(col_name) + 1
+            col_letter = get_column_letter(c_idx)
+            worksheet.column_dimensions[col_letter].width = width
+
+
+def to_excel_bytes(all_proc_df, failed_proc_df, graced_proc_df, graced_df, subject_summary, student_summary):
+    """
+    Generates styled multi-sheet Excel output file:
+    - Sheets: "All Students", "Failed Students", "Graced Students", 
+              "Graced Cases Details", "Subject Summary", "Student Summary"
+    """
     buffer = io.BytesIO()
-    clean_proc = proc_df.drop(columns=['Row_Type', 'Comp_Mismatch'], errors='ignore')
+    internal_flags = [
+        'Row_Type', 'Comp_Mismatch', 'Fail_Internal', 'Fail_Sem', 
+        'Fail_Composite', 'Red_Internal', 'Red_Sem', 'Red_Grace', 'Red_Composite'
+    ]
+
+    clean_all = all_proc_df.drop(columns=internal_flags, errors='ignore')
+    clean_failed = failed_proc_df.drop(columns=internal_flags, errors='ignore')
+    clean_graced_students = graced_proc_df.drop(columns=internal_flags, errors='ignore')
 
     with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
-        clean_proc.to_excel(writer, index=False, sheet_name="Processed Data")
+        clean_all.to_excel(writer, index=False, sheet_name="All Students")
+        clean_failed.to_excel(writer, index=False, sheet_name="Failed Students")
+        clean_graced_students.to_excel(writer, index=False, sheet_name="Graced Students")
+
         if not graced_df.empty:
             graced_df.to_excel(writer, index=False, sheet_name="Graced Cases Details")
             subject_summary.to_excel(writer, index=False, sheet_name="Subject Summary")
@@ -460,112 +666,38 @@ def to_excel_bytes(proc_df, graced_df, subject_summary, student_summary):
 
         workbook = writer.book
 
-        thin_border = Border(
-            left=Side(style="thin", color="000000"),
-            right=Side(style="thin", color="000000"),
-            top=Side(style="thin", color="000000"),
-            bottom=Side(style="thin", color="000000")
-        )
-        center_align = Alignment(horizontal="center", vertical="center")
-        header_fill = PatternFill(start_color="D9D9D9", end_color="D9D9D9", fill_type="solid")
-        student_header_fill = PatternFill(start_color="D9E1F2", end_color="D9E1F2", fill_type="solid")
-        summary_fill = PatternFill(start_color="FFF2CC", end_color="FFF2CC", fill_type="solid")
+        # Format All Students, Failed Students, Graced Students sheets
+        format_excel_processed_sheet(workbook["All Students"], clean_all, all_proc_df)
+        format_excel_processed_sheet(workbook["Failed Students"], clean_failed, failed_proc_df)
+        format_excel_processed_sheet(workbook["Graced Students"], clean_graced_students, graced_proc_df)
 
-        red_font = Font(color="FF0000", bold=True)
-        bold_blue_font = Font(color="1F4E78", bold=True)
+        # Format remaining summary sheets
+        thin_side = Side(style="thin", color="000000")
+        thin_border = Border(left=thin_side, right=thin_side, top=thin_side, bottom=thin_side)
+        header_align = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        header_fill = PatternFill(start_color="D9D9D9", end_color="D9D9D9", fill_type="solid")
         bold_font = Font(bold=True)
 
-        sheets = ["Processed Data"] + (["Graced Cases Details", "Subject Summary", "Student Summary"] if not graced_df.empty else [])
-
-        for sheet_name in sheets:
+        other_sheets = ["Graced Cases Details", "Subject Summary", "Student Summary"] if not graced_df.empty else []
+        for sheet_name in other_sheets:
             worksheet = workbook[sheet_name]
-
-            # Disable gridlines & freeze header
             worksheet.views.sheetView[0].showGridLines = False
             worksheet.freeze_panes = "A2"
 
-            if sheet_name == "Processed Data":
-                cols = clean_proc.columns.tolist()
-                center_cols_indices = [
-                    i + 1 for i, c in enumerate(cols) if c in [
-                        'Credit', 'Internal Actual (Max)', 'Internal Actual',
-                        'Sem Actual (Max)', 'Sem Actual', 'Sem Grace', 
-                        'Composite Score (Max)', 'Composite Score', 'Overall Grade'
-                    ]
-                ]
-                max_cols_indices = [
-                    i + 1 for i, c in enumerate(cols) if c in [
-                        'Internal Actual (Max)', 'Sem Actual (Max)', 'Composite Score (Max)'
-                    ]
-                ]
-                comp_score_idx = cols.index('Composite Score') + 1 if 'Composite Score' in cols else None
-                status_col_idx = cols.index('Completion Status after Gracing') + 1 if 'Completion Status after Gracing' in cols else None
+            for row in worksheet.iter_rows(min_row=1, max_row=worksheet.max_row, min_col=1, max_col=worksheet.max_column):
+                for cell in row:
+                    cell.border = thin_border
+                    if cell.row == 1:
+                        cell.font = bold_font
+                        cell.fill = header_fill
+                        cell.alignment = header_align
 
-                for row_idx in range(1, len(clean_proc) + 2):
-                    if row_idx == 1:
-                        for col_idx in range(1, len(cols) + 1):
-                            cell = worksheet.cell(row=row_idx, column=col_idx)
-                            cell.border = thin_border
-                            cell.font = bold_font
-                            cell.fill = header_fill
-                            cell.alignment = center_align
-                        continue
-
-                    proc_idx = row_idx - 2
-                    row_type_val = proc_df.iloc[proc_idx]['Row_Type'] if (0 <= proc_idx < len(proc_df) and 'Row_Type' in proc_df.columns) else ''
-                    is_mismatch = proc_df.iloc[proc_idx]['Comp_Mismatch'] if (0 <= proc_idx < len(proc_df) and 'Comp_Mismatch' in proc_df.columns) else False
-
-                    is_student_header = (row_type_val == 'HEADER')
-                    is_summary_row = (row_type_val == 'SUMMARY')
-
-                    status_val = str(worksheet.cell(row=row_idx, column=status_col_idx).value).strip() if status_col_idx else ''
-
-                    if is_student_header:
-                        # Merge student header across all data columns
-                        worksheet.merge_cells(start_row=row_idx, start_column=1, end_row=row_idx, end_column=len(cols))
-                        for col_idx in range(1, len(cols) + 1):
-                            cell = worksheet.cell(row=row_idx, column=col_idx)
-                            cell.border = thin_border
-                            cell.font = bold_blue_font
-                            cell.fill = student_header_fill
-                    else:
-                        for col_idx in range(1, len(cols) + 1):
-                            cell = worksheet.cell(row=row_idx, column=col_idx)
-                            cell.border = thin_border
-
-                            if is_summary_row:
-                                cell.font = bold_font
-                                cell.fill = summary_fill
-                            elif col_idx in max_cols_indices:
-                                cell.font = bold_font
-
-                            if col_idx in center_cols_indices:
-                                cell.alignment = center_align
-
-                            # Red font for mismatched composite score
-                            if is_mismatch and col_idx == comp_score_idx:
-                                cell.font = red_font
-
-                            # Red font for unsuccessful completion status
-                            if status_col_idx and col_idx == status_col_idx and status_val.lower() == 'completed unsuccessfuly':
-                                cell.font = red_font
-            else:
-                for row in worksheet.iter_rows(min_row=1, max_row=worksheet.max_row, min_col=1, max_col=worksheet.max_column):
-                    for cell in row:
-                        cell.border = thin_border
-                        if cell.row == 1:
-                            cell.font = bold_font
-                            cell.fill = header_fill
-                            cell.alignment = center_align
-
-            # Auto-size columns
             for col in worksheet.columns:
                 max_len = 0
                 col_letter = get_column_letter(col[0].column)
                 for cell in col:
                     if cell.value is not None:
-                        val_str = str(cell.value)
-                        max_len = max(max_len, len(val_str))
+                        max_len = max(max_len, len(str(cell.value)))
                 worksheet.column_dimensions[col_letter].width = max(max_len + 3, 14)
 
     return buffer.getvalue()
@@ -576,7 +708,7 @@ def to_excel_bytes(proc_df, graced_df, subject_summary, student_summary):
 # ==================================================
 def show():
     """Renders the Gracing Checker tool page in Streamlit."""
-    st.title("🎁 Gracing Checker")
+    st.title("✅ Gracing Checker")
     st.caption("Upload an examination result Excel file to analyze awarded grace marks.")
 
     uploaded_file = st.file_uploader("Upload Excel File", type=["xlsx", "xls"])
@@ -603,15 +735,29 @@ def show():
             st.error(f"The uploaded file is missing expected columns: {', '.join(missing_cols)}")
             return
 
-        # Generate Processed Data & Gracing Analysis
-        proc_df = create_processed_data(df)
+        # Filter student lists
+        failed_prns = df[
+            df['Completion Status after Gracing'].astype(str).str.strip().str.lower() == 'completed unsuccessfuly'
+        ]['Student Number'].dropna().unique().tolist()
+
+        graced_prns = df[
+            (df['Appraisal Type Code'].astype(str).str.strip().isin(['Sem Grace', 'Grace on Total marks'])) &
+            (pd.to_numeric(df['Marks after Gracing'], errors='coerce').fillna(0) > 0)
+        ]['Student Number'].dropna().unique().tolist()
+
+        # Generate Processed Datasets
+        all_proc_df = create_processed_data(df)
+        failed_proc_df = create_processed_data(df, target_student_ids=failed_prns)
+        graced_proc_df = create_processed_data(df, target_student_ids=graced_prns)
+
+        # Generate Summaries
         graced_df = process_gracing_data(df)
         subject_summary = get_subject_summary(graced_df)
         student_summary = get_student_summary(graced_df)
 
         # Statistics
         total_students = df['Student Number'].nunique()
-        graced_students_count = graced_df['Student Number'].nunique() if not graced_df.empty else 0
+        graced_students_count = len(graced_prns)
         total_graced_cases = len(graced_df)
         total_grace_marks = graced_df['Grace Marks'].sum() if not graced_df.empty else 0
 
@@ -637,36 +783,52 @@ def show():
 
         st.markdown("---")
 
-        # Tab-based Preview Windows (Processed Data tab is first)
-        tab1, tab2, tab3, tab4 = st.tabs([
-            "📊 Processed Data", 
+        # Tab-based Preview Windows
+        tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+            "📊 All Students", 
+            "⚠️ Failed Students", 
+            "✅ Graced Students",
             "📋 Graced Cases Details", 
             "📚 Subject Summary", 
             "👤 Student Summary"
         ])
 
         with tab1:
-            st.subheader("Processed Data Preview")
-            if not proc_df.empty:
-                st.write(style_processed_preview(proc_df))
+            st.subheader("All Students Preview")
+            if not all_proc_df.empty:
+                st.write(style_processed_preview(all_proc_df))
             else:
-                st.info("No processed data generated.")
+                st.info("No student data generated.")
 
         with tab2:
+            st.subheader("Failed Students Preview")
+            if not failed_proc_df.empty:
+                st.write(style_processed_preview(failed_proc_df))
+            else:
+                st.info("No failed students found in this file.")
+
+        with tab3:
+            st.subheader("Graced Students Preview")
+            if not graced_proc_df.empty:
+                st.write(style_processed_preview(graced_proc_df))
+            else:
+                st.info("No graced students found in this file.")
+
+        with tab4:
             st.subheader("Graced Cases Details")
             if not graced_df.empty:
                 st.write(style_preview(graced_df))
             else:
                 st.info("No grace marks were awarded in this file.")
 
-        with tab3:
+        with tab5:
             st.subheader("Subject-Wise Gracing Summary")
             if not subject_summary.empty:
                 st.write(style_preview(subject_summary))
             else:
                 st.info("No subject-wise gracing data available.")
 
-        with tab4:
+        with tab6:
             st.subheader("Student-Wise Gracing Summary")
             if not student_summary.empty:
                 st.write(style_preview(student_summary))
@@ -677,7 +839,7 @@ def show():
         st.markdown("---")
         st.subheader("📥 Export Gracing Report")
 
-        excel_bytes = to_excel_bytes(proc_df, graced_df, subject_summary, student_summary)
+        excel_bytes = to_excel_bytes(all_proc_df, failed_proc_df, graced_proc_df, graced_df, subject_summary, student_summary)
         date_str = datetime.now().strftime("%d-%m-%y")
         output_filename = f"Gracing_Analysis_Report_{date_str}.xlsx"
 
