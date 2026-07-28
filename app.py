@@ -27,6 +27,15 @@ except Exception as import_error:
 else:
     _qc_import_error_message = None
 
+# Import Rank List Generator module tool
+try:
+    from Modules.Rank_List_Generator.rank_list_generator import show as rank_list_generator
+except Exception as import_error:
+    rank_list_generator = None
+    _rlg_import_error_message = str(import_error)
+else:
+    _rlg_import_error_message = None
+
 # Import Gracing Checker module tool
 try:
     from Modules.Gracing_Checker.gracing_checker import show as gracing_checker
@@ -71,6 +80,7 @@ tools_list = [
     "🏠 Dashboard",
     "✅ Gracing Checker",
     "📝 Questionwise Checker",
+    "🏆 Rank List Generator",
     "📂 DigiLocker Tracker",
     "🔍 Duplicate Checker",
     "📊 Result Analysis",
@@ -106,6 +116,10 @@ if st.session_state.selected_tool == "🏠 Dashboard":
         {
             "name": "📝 Questionwise Checker",
             "desc": "Verify question-wise marks, compare Examiner vs. Moderator scores, and export cleaned mark sheets.",
+        },
+        {
+            "name": "🏆 Rank List Generator",
+            "desc": "Process student CGPAs across programs to extract top 5% rank holders and export formatted Word documents.",
         },
         {
             "name": "📂 DigiLocker Tracker",
@@ -190,6 +204,21 @@ elif st.session_state.selected_tool == "📝 Questionwise Checker":
             f"`{_qc_import_error_message}`\n\n"
             "Check that `Modules/Questionwise_Checker/questionwise_checker.py` exists and that "
             "all its dependencies (see requirements.txt) are installed."
+        )
+
+# --------------------
+# Rank List Generator
+# --------------------
+elif st.session_state.selected_tool == "🏆 Rank List Generator":
+
+    if rank_list_generator is not None:
+        rank_list_generator()
+    else:
+        st.title("🏆 Rank List Generator")
+        st.error(
+            "This tool could not be loaded due to an import error:\n\n"
+            f"`{_rlg_import_error_message}`\n\n"
+            "Check that `Modules/Rank_List_Generator/rank_list_generator.py` exists and defines a `show()` function."
         )
 
 # --------------------
