@@ -501,7 +501,7 @@ def show():
                 st.warning("⚠️ Please select a College Name and Academic Year from the dropdowns above before generating the Word documents.")
             
             # Generate Word Documents
-            if st.button("🚀 Generate Word Documents", type="primary", disabled=(not selected_college_short or not academic_year)):
+            if st.button("Generate Word Documents", type="primary", disabled=(not selected_college_short or not academic_year)):
                 with st.spinner("Generating formatted Word documents..."):
                     top5_doc = generate_word_report(df_combined, college_name_full, academic_year)
                     rank1_doc = generate_first_rankers_report(df_combined, college_name_full, academic_year, annual_day_date_str)

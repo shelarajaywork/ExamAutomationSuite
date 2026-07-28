@@ -3,3 +3,4 @@ pandas
 openpyxl
 msoffcrypto-tool
 numpy
+python-docx
