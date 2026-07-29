@@ -297,7 +297,6 @@ def main():
     st.set_page_config(page_title="Exam Timetable Generator", layout="wide", page_icon="📅")
     
     st.title("📅 Exam Timetable Generator")
-    st.markdown("Upload your exam registration data to generate clash-free timetables automatically.")
     st.divider()
 
     # --- CONFIGURATION PANEL IN MAIN WINDOW ---
@@ -334,7 +333,6 @@ def main():
 
     # --- CONDITIONAL UPLOAD SECTIONS ---
     if not is_reexam:
-        st.info("Upload All Subject Student Data from ZACAD_REPORT.")
         uploaded_files = st.file_uploader(
             "Upload All Subjects Students Data files [ZACAD_REPORT]. (.xlsx, .xls)",
             type=["xlsx", "xls"],
@@ -342,7 +340,6 @@ def main():
             key="regular_uploader"
         )
     else:
-        st.subheader("Re-Examination Data Upload")
         uploaded_files = st.file_uploader(
             "Upload Re-Examination Applications Lists Excel Files [ZREEXAM_REPORT] (.xlsx, .xls)",
             type=["xlsx", "xls"],
