@@ -11,8 +11,7 @@ This is the entry point of the Streamlit app. It handles:
   3. Routing to the right "page" based on user selection.
 
 The actual logic for each tool lives in its own file inside the
-`Modules/` subfolders (e.g. `Modules/Questionwise_Checker/questionwise_checker.py`,
-`Modules/Gracing_Checker/gracing_checker.py`).
+`Modules/` subfolders.
 ==================================================
 """
 
@@ -44,6 +43,21 @@ except Exception as import_error:
     _gc_import_error_message = str(import_error)
 else:
     _gc_import_error_message = None
+
+# Import Exam Timetable Generator module tool
+try:
+    from Modules.Exam_Timetable_Generator.exam_timetable_generator import main as exam_timetable_generator
+except Exception as import_error:
+    try:
+        # Fallback if the function inside exam_timetable_generator.py is named `show`
+        from Modules.Exam_Timetable_Generator.exam_timetable_generator import show as exam_timetable_generator
+    except Exception as import_error_2:
+        exam_timetable_generator = None
+        _etg_import_error_message = str(import_error_2)
+    else:
+        _etg_import_error_message = None
+else:
+    _etg_import_error_message = None
 
 
 # --------------------
@@ -78,6 +92,7 @@ st.sidebar.title("🎓 Exam Tools")
 
 tools_list = [
     "🏠 Dashboard",
+    "📅 Exam Timetable Generator",
     "✅ Gracing Checker",
     "📝 Questionwise Checker",
     "🏆 Rank List Generator",
@@ -109,6 +124,10 @@ if st.session_state.selected_tool == "🏠 Dashboard":
 
     # Defined tool cards with icons and descriptions
     tools_info = [
+        {
+            "name": "📅 Exam Timetable Generator",
+            "desc": "Generate clash-free exam timetables for Regular and Re-Examinations using DSATUR graph coloring.",
+        },
         {
             "name": "✅ Gracing Checker",
             "desc": "Check and validate grace marks, ordinance rules, and eligibility criteria for candidates.",
@@ -171,6 +190,22 @@ if st.session_state.selected_tool == "🏠 Dashboard":
                     if st.button(f"Open {btn_label}", key=f"btn_{i+1}"):
                         st.session_state.selected_tool = tool["name"]
                         st.rerun()
+
+# --------------------
+# Exam Timetable Generator
+# --------------------
+elif st.session_state.selected_tool == "📅 Exam Timetable Generator":
+
+    if exam_timetable_generator is not None:
+        exam_timetable_generator()
+    else:
+        st.title("📅 Exam Timetable Generator")
+        st.error(
+            "This tool could not be loaded due to an import error:\n\n"
+            f"`{_etg_import_error_message}`\n\n"
+            "Ensure that `Modules/Exam_Timetable_Generator/exam_timetable_generator.py` exists "
+            "and defines a `main()` or `show()` entry point function."
+        )
 
 # --------------------
 # Gracing Checker

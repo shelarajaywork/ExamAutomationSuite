@@ -1,6 +1,7 @@
 import io
 import re
 import datetime
+import math
 import pandas as pd
 import docx
 from docx import Document
@@ -192,7 +193,7 @@ def generate_word_report(df_combined, college_name, academic_year):
     for prog in programs:
         prog_df = df_combined[df_combined['Program Name'] == prog]
         total_students = len(prog_df)
-        top_count = max(1, round(total_students * 0.05))
+        top_count = max(1, math.ceil(total_students * 0.05))
         
         # Banner Row (0.9 cm height)
         banner_row = table.add_row()
