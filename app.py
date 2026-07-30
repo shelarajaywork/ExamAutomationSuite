@@ -59,6 +59,20 @@ except Exception as import_error:
 else:
     _etg_import_error_message = None
 
+# Import Convocation Data Generator module tool
+try:
+    from Modules.Convocation_Data_Generator.convocation_data_generator import show as convocation_data_generator
+except Exception as import_error:
+    try:
+        from Modules.Convocation_Data_Generator.convocation_data_generator import main as convocation_data_generator
+    except Exception as import_error_2:
+        convocation_data_generator = None
+        _cdg_import_error_message = str(import_error_2)
+    else:
+        _cdg_import_error_message = None
+else:
+    _cdg_import_error_message = None
+
 
 # --------------------
 # Page Configuration
@@ -96,7 +110,7 @@ tools_list = [
     "✅ Gracing Checker",
     "📝 Questionwise Checker",
     "🏆 Rank List Generator",
-    "📂 DigiLocker Tracker",
+    "🎓 Convocation Data Generator",
     "🔍 Duplicate Checker",
     "📊 Result Analysis",
     "🧹 Data Cleaner",
@@ -141,8 +155,8 @@ if st.session_state.selected_tool == "🏠 Dashboard":
             "desc": "Process student CGPAs across programs to extract top 5% rank holders and export formatted Word documents.",
         },
         {
-            "name": "📂 DigiLocker Tracker",
-            "desc": "Track, validate, and identify DigiLocker upload errors and discrepancies.",
+            "name": "🎓 Convocation Data Generator",
+            "desc": "Process MKCL reports and Master Data to generate standardized convocation Excel reports.",
         },
         {
             "name": "🔍 Duplicate Checker",
@@ -257,19 +271,19 @@ elif st.session_state.selected_tool == "🏆 Rank List Generator":
         )
 
 # --------------------
-# DigiLocker Tracker
+# Convocation Data Generator
 # --------------------
-elif st.session_state.selected_tool == "📂 DigiLocker Tracker":
+elif st.session_state.selected_tool == "🎓 Convocation Data Generator":
 
-    st.title("📂 DigiLocker Tracker")
-
-    uploaded_file = st.file_uploader(
-        "Upload Excel or CSV File",
-        type=["xlsx", "csv"],
-    )
-
-    if uploaded_file:
-        st.success("File Uploaded Successfully")
+    if convocation_data_generator is not None:
+        convocation_data_generator()
+    else:
+        st.title("🎓 Convocation Data Generator")
+        st.error(
+            "This tool could not be loaded due to an import error:\n\n"
+            f"`{_cdg_import_error_message}`\n\n"
+            "Check that `Modules/Convocation_Data_Generator/convocation_data_generator.py` exists and defines a `show()` or `main()` function."
+        )
 
 # --------------------
 # Duplicate Checker
