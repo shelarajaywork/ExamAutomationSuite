@@ -273,12 +273,12 @@ elif st.session_state.selected_tool == "🏆 Rank List Generator":
 # --------------------
 # Convocation Data Generator
 # --------------------
-elif st.session_state.selected_tool == "🎓 Convocation Data Generator":
+elif st.session_state.selected_tool == "👩🏽‍🎓 Convocation Data Generator":
 
     if convocation_data_generator is not None:
         convocation_data_generator()
     else:
-        st.title("🎓 Convocation Data Generator")
+        st.title("👩🏽‍🎓 Convocation Data Generator")
         st.error(
             "This tool could not be loaded due to an import error:\n\n"
             f"`{_cdg_import_error_message}`\n\n"

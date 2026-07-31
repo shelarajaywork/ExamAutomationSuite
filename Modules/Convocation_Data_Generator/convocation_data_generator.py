@@ -6,6 +6,11 @@ import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 import streamlit as st
+from deep_translator import GoogleTranslator
+
+
+# Initialize Google Translator via deep_translator (Python 3.13+ compatible)
+translator = GoogleTranslator(source='en', target='mr')
 
 
 # ==========================================
@@ -54,29 +59,43 @@ def sanitize_key(val) -> str:
     return clean_str.upper()
 
 
+def transliterate_name_to_marathi(name_str: str) -> str:
+    """
+    Transliterates English student name to Marathi Devanagari script using deep_translator.
+    """
+    if pd.isna(name_str) or not str(name_str).strip():
+        return ""
+    try:
+        clean_name = str(name_str).strip()
+        result = translator.translate(clean_name)
+        return result if result else ""
+    except Exception:
+        return ""
+
+
 def derive_faculty(degnm: str) -> str:
     """
     Derive Faculty based on keywords/patterns in DEGNM (case-insensitive):
     - Commerce: COMMERCE, Management, Finance, Economics, B.Com, BCom
-    - Science & Technology: SCIENCE, BSc, B.Sc, B.Sc.
-    - Humanities: ARTS, B.A.
+    - Science: SCIENCE, BSc, B.Sc, B.Sc.
+    - Arts: ARTS, B.A.
     """
     if pd.isna(degnm) or not str(degnm).strip():
         return ""
     
     degnm_str = str(degnm).strip()
     
-    commerce_pattern = r'(?i)\b(commerce|management|finance|economics|b\.?com)\b'
+    commerce_pattern = r'(?i)\b(commerce|accounting|management|finance|financial|marketing|business|economics|b\.?com|m\.?com)\b'
     if re.search(commerce_pattern, degnm_str):
         return "Commerce"
         
-    science_pattern = r'(?i)\b(science|b\.?sc\.?)\b'
+    science_pattern = r'(?i)\b(science|artificial|intelligent|data|b\.?sc\.?|m\.?sc\.?)\b'
     if re.search(science_pattern, degnm_str):
-        return "Science & Technology"
+        return "Science"
         
-    arts_pattern = r'(?i)\b(arts|b\.?a\.?)\b'
+    arts_pattern = r'(?i)\b(arts|entertainment|media|film|b\.?a\.?|m\.?a\.?)\b'
     if re.search(arts_pattern, degnm_str):
-        return "Humanities"
+        return "Arts"
         
     return ""
 
@@ -189,7 +208,8 @@ def build_master_lookup(master_files):
 def process_data(mkcl_files, student_lookup, college_choice):
     """
     Merges MKCL files across sheets, performs Python lookup for DEGNM,
-    applies filters & transformations, and eliminates duplicate rows.
+    applies dynamic row filtering (Convocation Number blank, CGPA and all existing 
+    SEM_GPA columns present), eliminates duplicate rows, and sorts by SEAT_NO.
     """
     mkcl_dfs = []
     total_mkcl_raw_rows = 0
@@ -202,16 +222,24 @@ def process_data(mkcl_files, student_lookup, college_choice):
 
             df.columns = [str(c).replace("\xa0", " ").strip() for c in df.columns]
             
+            # 1. Convocation Number filter: must be blank/null/empty
             conv_col = next((c for c in df.columns if c.lower() == "convocation number"), None)
-            cgpa_col = next((c for c in df.columns if c.lower() == "cgpa"), None)
-
             if conv_col:
                 df = df[df[conv_col].isna() | (df[conv_col].astype(str).str.strip() == "")]
-            
+
+            # 2. CGPA filter: must contain a value
+            cgpa_col = next((c for c in df.columns if c.lower() == "cgpa"), None)
             if cgpa_col:
                 df = df[df[cgpa_col].notna() & (df[cgpa_col].astype(str).str.strip() != "")]
             else:
                 df = df.iloc[0:0]
+
+            # 3. Dynamic Semester GPA filter: All present SEM X_GPA columns must contain a value
+            target_sem_gpas = ["SEM 1_GPA", "SEM 2_GPA", "SEM 3_GPA", "SEM 4_GPA", "SEM 5_GPA", "SEM 6_GPA"]
+            for sem_gpa_name in target_sem_gpas:
+                sem_col = next((c for c in df.columns if c.lower() == sem_gpa_name.lower()), None)
+                if sem_col:
+                    df = df[df[sem_col].notna() & (df[sem_col].astype(str).str.strip() != "")]
 
             if not df.empty:
                 mkcl_dfs.append(df)
@@ -272,11 +300,17 @@ def process_data(mkcl_files, student_lookup, college_choice):
     out_df["FACULTY"] = out_df["DEGNM"].apply(derive_faculty)
     out_df["SUBDEGNM"] = out_df["DEGNM"].apply(derive_subdegnm)
 
+    # Transliterate NAME column to Marathi for NAME_MARAT
+    out_df["NAME_MARAT"] = out_df["NAME"].apply(transliterate_name_to_marathi)
+
     out_df = out_df.fillna("").astype(str).replace("nan", "")
     out_df = out_df[TARGET_COLUMNS]
 
     # Deduplicate rows in the output dataset
     out_df = out_df.drop_duplicates().reset_index(drop=True)
+
+    # Sort output dataframe by SEAT_NO
+    out_df = out_df.sort_values(by="SEAT_NO", ascending=True).reset_index(drop=True)
 
     unmatched_df = pd.DataFrame(unmatched_rows)
     if not unmatched_df.empty:
@@ -289,7 +323,7 @@ def process_data(mkcl_files, student_lookup, college_choice):
 # 5. OPENPYXL EXCEL GENERATION & STYLING
 # ==========================================
 def generate_formatted_excel(df: pd.DataFrame) -> bytes:
-    """Generates formatted Excel workbook."""
+    """Generates formatted Excel workbook with default row height 20."""
     wb = openpyxl.Workbook()
     
     # SHEET 1: Convocation Data
@@ -330,6 +364,10 @@ def generate_formatted_excel(df: pd.DataFrame) -> bytes:
                 cell.alignment = center_align
             else:
                 cell.alignment = left_align
+
+    # Set row height to 20 for Sheet 1
+    for r in range(1, ws.max_row + 1):
+        ws.row_dimensions[r].height = 20
 
     ws.freeze_panes = "A2"
 
@@ -389,6 +427,10 @@ def generate_formatted_excel(df: pd.DataFrame) -> bytes:
                 else:
                     cell.alignment = center_align
 
+    # Set row height to 20 for Sheet 2
+    for r in range(1, ws_stats.max_row + 1):
+        ws_stats.row_dimensions[r].height = 20
+
     for col in ws_stats.columns:
         max_len = 0
         col_letter = get_column_letter(col[0].column)
@@ -409,7 +451,7 @@ def generate_formatted_excel(df: pd.DataFrame) -> bytes:
 # ==========================================
 def show():
     """Main UI layout function called by app.py routing."""
-    st.title("🎓 Convocation Data Converter & Master Lookup")
+    st.title("👩🏻‍🎓 Convocation Data Generator 👨🏻‍🎓")
     st.markdown(
         "Upload **MKCL Reports** and **Student Master Data** files. The app automatically handles "
         "Excel text/number mismatches to fetch degree/program names accurately, standardizes columns, "
@@ -420,7 +462,7 @@ def show():
     col1, col2, col3 = st.columns(3)
 
     with col1:
-        st.subheader("🏫 Select College")
+        st.text("🏫 Select College")
         college_option = st.selectbox(
             "Select College",
             options=[
@@ -431,7 +473,6 @@ def show():
         )
 
     with col2:
-        st.subheader("1. 📊 MKCL Reports")
         mkcl_files = st.file_uploader(
             "Upload MKCL Report Files (.xlsx / .xls)",
             type=["xlsx", "xls"],
@@ -440,7 +481,6 @@ def show():
         )
 
     with col3:
-        st.subheader("2. 🗂️ Student Master Data")
         master_files = st.file_uploader(
             "Upload Student Master Data Files (.xlsx / .xls)",
             type=["xlsx", "xls"],
@@ -458,7 +498,7 @@ def show():
 
     if process_btn and process_ready:
         try:
-            with st.spinner("Building Student Master Lookup Map & Processing MKCL Reports..."):
+            with st.spinner("Building Student Master Lookup Map, Processing MKCL Reports & Transliterating Names to Marathi..."):
                 student_lookup, master_total_records = build_master_lookup(master_files)
 
                 final_df, unmatched_df, mkcl_raw_count, filtered_count, matched_count, unmatched_count = process_data(
@@ -469,7 +509,7 @@ def show():
             m1, m2, m3, m4, m5 = st.columns(5)
             m1.metric("Master Records Loaded", f"{master_total_records:,}")
             m2.metric("MKCL Raw Records", f"{mkcl_raw_count:,}")
-            m3.metric("Filtered Records (Conv/CGPA)", f"{filtered_count:,}")
+            m3.metric("Filtered Records (Conv/CGPA/GPAs)", f"{filtered_count:,}")
             m4.metric("Program Matches Found", f"{matched_count:,}")
             m5.metric("Unmatched Records", f"{unmatched_count:,}")
 
