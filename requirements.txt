@@ -5,3 +5,4 @@ msoffcrypto-tool
 numpy
 python-docx
 networkx
+deep_translator

@@ -1,16 +1,53 @@
 import io
 import re
 from datetime import datetime
+from functools import lru_cache
+
 import pandas as pd
 import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 import streamlit as st
-from deep_translator import GoogleTranslator
 
 
-# Initialize Google Translator via deep_translator (Python 3.13+ compatible)
-translator = GoogleTranslator(source='en', target='mr')
+# ==========================================
+# OPTIONAL DEPENDENCY: deep_translator
+# ==========================================
+# The plugin/module loader that scans for show()/main() has to *import*
+# this file first. A top-level `from deep_translator import GoogleTranslator`
+# means: if that package isn't installed in the hosting environment, the
+# import blows up before show() is ever discovered -- which is exactly the
+# "No module named 'deep_translator'" error you hit. To fix that properly,
+# add this line to your requirements.txt:
+#
+#     deep_translator
+#
+# But even without that fix, the app below now degrades gracefully: the
+# translator is created lazily (only the first time it's actually needed),
+# any failure is caught, and NAME_MARAT is simply left blank instead of the
+# whole module refusing to load.
+_translator = None
+_translator_unavailable = False
+
+
+def _get_translator():
+    """Lazily create and cache the GoogleTranslator instance.
+
+    Returns None (and remembers the failure) if deep_translator is not
+    installed or fails to initialize, instead of raising.
+    """
+    global _translator, _translator_unavailable
+    if _translator is not None:
+        return _translator
+    if _translator_unavailable:
+        return None
+    try:
+        from deep_translator import GoogleTranslator
+        _translator = GoogleTranslator(source="en", target="mr")
+    except Exception:
+        _translator_unavailable = True
+        _translator = None
+    return _translator
 
 
 # ==========================================
@@ -59,18 +96,29 @@ def sanitize_key(val) -> str:
     return clean_str.upper()
 
 
-def transliterate_name_to_marathi(name_str: str) -> str:
-    """
-    Transliterates English student name to Marathi Devanagari script using deep_translator.
-    """
-    if pd.isna(name_str) or not str(name_str).strip():
+@lru_cache(maxsize=4096)
+def _translate_cached(clean_name: str) -> str:
+    """Cached lookup so repeated names across rows only hit the API once."""
+    translator = _get_translator()
+    if translator is None:
         return ""
     try:
-        clean_name = str(name_str).strip()
         result = translator.translate(clean_name)
         return result if result else ""
     except Exception:
         return ""
+
+
+def transliterate_name_to_marathi(name_str: str) -> str:
+    """
+    Transliterates English student name to Marathi Devanagari script using deep_translator.
+    Returns "" (without raising) if deep_translator is unavailable or the
+    translation call fails for any reason, e.g. no network access.
+    """
+    if pd.isna(name_str) or not str(name_str).strip():
+        return ""
+    clean_name = str(name_str).strip()
+    return _translate_cached(clean_name)
 
 
 def derive_faculty(degnm: str) -> str:
@@ -457,6 +505,14 @@ def show():
         "Excel text/number mismatches to fetch degree/program names accurately, standardizes columns, "
         "and generates formatted convocation reports."
     )
+
+    if _get_translator() is None:
+        st.warning(
+            "⚠️ The `deep_translator` package isn't installed, so the **NAME_MARAT** "
+            "(Marathi name) column will be left blank. Add `deep_translator` to your "
+            "requirements.txt and redeploy to enable automatic transliteration.",
+            icon="⚠️",
+        )
 
     # 3-Column horizontal single-line layout for controls & uploaders
     col1, col2, col3 = st.columns(3)
