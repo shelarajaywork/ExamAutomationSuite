@@ -6,3 +6,6 @@ numpy
 python-docx
 networkx
 deep_translator
+requests
+msal
+reportlab

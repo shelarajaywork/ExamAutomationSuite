@@ -499,7 +499,7 @@ def generate_formatted_excel(df: pd.DataFrame) -> bytes:
 # ==========================================
 def show():
     """Main UI layout function called by app.py routing."""
-    st.title("👩🏻‍🎓 Convocation Data Generator 👨🏻‍🎓")
+    st.title("📄 Convocation Data Generator")
     st.markdown(
         "Upload **MKCL Reports** and **Student Master Data** files. The app automatically handles "
         "Excel text/number mismatches to fetch degree/program names accurately, standardizes columns, "

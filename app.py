@@ -26,6 +26,20 @@ except Exception as import_error:
 else:
     _qc_import_error_message = None
 
+# Import Letters to Ext. Examiners module tool
+try:
+    from Modules.Letters_to_Ext_Exmnrs.letters_to_ext_exmnrs import show as letters_to_ext_examiners
+except Exception as import_error:
+    try:
+        from Modules.Letters_to_Ext_Exmnrs.letters_to_ext_exmnrs import main as letters_to_ext_examiners
+    except Exception as import_error_2:
+        letters_to_ext_examiners = None
+        _lte_import_error_message = str(import_error_2)
+    else:
+        _lte_import_error_message = None
+else:
+    _lte_import_error_message = None
+
 # Import Rank List Generator module tool
 try:
     from Modules.Rank_List_Generator.rank_list_generator import show as rank_list_generator
@@ -109,6 +123,7 @@ tools_list = [
     "📅 Exam Timetable Generator",
     "✅ Gracing Checker",
     "📝 Questionwise Checker",
+    "✉️ Letters to Ext. Examiners",
     "🏆 Rank List Generator",
     "🎓 Convocation Data Generator",
     "🔍 Duplicate Checker",
@@ -149,6 +164,10 @@ if st.session_state.selected_tool == "🏠 Dashboard":
         {
             "name": "📝 Questionwise Checker",
             "desc": "Verify question-wise marks, compare Examiner vs. Moderator scores, and export cleaned mark sheets.",
+        },
+        {
+            "name": "✉️ Letters to Ext. Examiners",
+            "desc": "Select examiners from evaluation dashboards and generate draft appointment/thanking emails with attached PDFs.",
         },
         {
             "name": "🏆 Rank List Generator",
@@ -253,6 +272,22 @@ elif st.session_state.selected_tool == "📝 Questionwise Checker":
             f"`{_qc_import_error_message}`\n\n"
             "Check that `Modules/Questionwise_Checker/questionwise_checker.py` exists and that "
             "all its dependencies (see requirements.txt) are installed."
+        )
+
+# --------------------
+# Letters to Ext. Examiners
+# --------------------
+elif st.session_state.selected_tool == "✉️ Letters to Ext. Examiners":
+
+    if letters_to_ext_examiners is not None:
+        letters_to_ext_examiners()
+    else:
+        st.title("✉️ Letters to Ext. Examiners")
+        st.error(
+            "This tool could not be loaded due to an import error:\n\n"
+            f"`{_lte_import_error_message}`\n\n"
+            "Ensure that `Modules/Letters_to_Ext_Exmnrs/letters_to_ext_exmnrs.py` exists "
+            "and defines a `show()` or `main()` entry point function."
         )
 
 # --------------------
