@@ -50,12 +50,17 @@ import streamlit as st
 # CONFIGURATION
 # ==================================================
 
+# Candidate passwords tried (in order) against any password-protected upload.
+# decrypt_and_load() stops at the first one that successfully opens the file.
 PASSWORDS = [
     "Exam@108",
     "UPG@123",
     "Exam@105"
 ]
 
+# Canonical set of "known" (non-question) columns that always appear in a
+# processed sheet. Anything NOT in this list is treated as a question-mark
+# column (see calculate_paper_max_marks / question_columns usage below).
 FIXED_COLUMNS = [
     "SrNo",
     "ExamAssingment_ID",
@@ -78,7 +83,8 @@ FIXED_COLUMNS = [
     "Change %",
 ]
 
-# Columns to drop from the original standard clean downloaded Excel files
+# Columns to drop from the original standard clean downloaded Excel files.
+# This is the "legacy" export: no GMR-derived columns, no Change %.
 COLUMNS_TO_DROP_STANDARD = [
     "Semester",
     "ExamAssingment_ID",
@@ -97,7 +103,9 @@ COLUMNS_TO_DROP_STANDARD = [
     "Change %",
 ]
 
-# Columns to drop from the formatted downloaded Excel files
+# Columns to drop from the formatted downloaded Excel files.
+# This export keeps UserType, GMR columns, Grade, Change %, etc. - it only
+# drops the columns nobody needs to see (identifiers/admin metadata).
 COLUMNS_TO_DROP_FORMATTED = [
     "Semester",
     "ExamAssingment_ID",
@@ -108,6 +116,8 @@ COLUMNS_TO_DROP_FORMATTED = [
     "MarkAttendance",
 ]
 
+# Columns hidden from the on-screen Streamlit preview tables (kept in the
+# underlying DataFrame / exported Excel files - this only affects display).
 PREVIEW_HIDDEN_COLUMNS = [
     "OnScreenID",
     "RollNo",
@@ -118,6 +128,9 @@ PREVIEW_HIDDEN_COLUMNS = [
     "Semester",
 ]
 
+# Defines the fixed row order within each student's record block.
+# Lower number = appears first. Anything not listed here (shouldn't happen)
+# falls back to 99 via .fillna(99) in clean_and_sort().
 USER_TYPE_ORDER = {
     "Examiner": 1,
     "Moderator": 2,
@@ -125,6 +138,9 @@ USER_TYPE_ORDER = {
     "Reval 2": 4,
 }
 
+# Row background colours (CSS strings) used only in the Streamlit preview
+# tables (see highlight_rows/style_preview) to visually distinguish
+# Moderator/Reval rows from the Examiner row above them.
 ROW_COLOURS = {
     "Moderator": "background-color:#032E15;",
     "Reval 1": "background-color:#162456;color:white;",
@@ -134,6 +150,8 @@ ROW_COLOURS = {
 INCREASE_STYLE = "color:#9ACD32;font-weight:bold;"  # mark went up / grade improved
 DECREASE_STYLE = "color:#FF4500;font-weight:bold;"  # mark went down / grade degraded
 
+# Ordinal rank of each grade letter, used purely for comparison (e.g. did a
+# reviewer's Grade rank higher or lower than the Examiner's Grade).
 GRADE_RANKS = {
     "O": 8,
     "A+": 7,
@@ -153,22 +171,32 @@ def decrypt_and_load(uploaded_file):
     """
     Attempts to load unprotected Excel files directly first.
     If protected, iterates through PASSWORDS list to decrypt.
+
+    Returns:
+        (DataFrame, label) on success, where `label` is either
+        "Unprotected (Direct)" or the password that worked.
+        (None, None) if the file could not be opened by any means.
     """
+    # --- Attempt 1: file has no password at all ------------------------
     try:
-        uploaded_file.seek(0)
+        uploaded_file.seek(0)  # Streamlit's UploadedFile is a stream; rewind before every read attempt.
         df = pd.read_excel(uploaded_file, dtype=object, keep_default_na=False)
         return df, "Unprotected (Direct)"
     except Exception:
+        # Not readable as a plain workbook - most likely it's encrypted. Fall through to password attempts.
         pass
 
+    # --- Attempt 2: try each known password in turn ---------------------
     for password in PASSWORDS:
         decrypted_path = None
         try:
             uploaded_file.seek(0)
 
             office_file = msoffcrypto.OfficeFile(uploaded_file)
-            office_file.load_key(password=password)
+            office_file.load_key(password=password)  # Raises if the password is wrong.
 
+            # msoffcrypto needs to write the decrypted bytes somewhere before pandas can read them,
+            # so we decrypt into a throwaway temp file and clean it up in `finally`.
             with tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx") as tmp:
                 office_file.decrypt(tmp)
                 decrypted_path = tmp.name
@@ -177,12 +205,15 @@ def decrypt_and_load(uploaded_file):
             return df, password
 
         except Exception:
+            # Wrong password (or some other decrypt/read failure) - try the next candidate.
             continue
 
         finally:
+            # Always scrub the temp file, whether decryption succeeded or failed.
             if decrypted_path and os.path.exists(decrypted_path):
                 os.remove(decrypted_path)
 
+    # Exhausted every option - unprotected read failed and no password matched.
     return None, None
 
 
@@ -190,7 +221,7 @@ def load_gmr_file(gmr_file):
     """Loads GMR file directly or decrypts if password protected."""
     if gmr_file is None:
         return None
-    df, _ = decrypt_and_load(gmr_file)
+    df, _ = decrypt_and_load(gmr_file)  # Reuse the same open/decrypt logic; we don't care which password worked.
     return df
 
 
@@ -200,23 +231,29 @@ def load_gmr_file(gmr_file):
 def clean_and_sort(df):
     """Clean up raw Questionwise export and sort rows."""
     df = df.copy()
-    df.columns = df.columns.astype(str).str.strip()
+    df.columns = df.columns.astype(str).str.strip()  # Guard against stray whitespace in exported headers.
 
+    # Drop rows with a blank PRNNumber - these are usually spacer/footer rows in the raw export.
     if "PRNNumber" in df.columns:
         df = df[df["PRNNumber"].astype(str).str.strip() != ""]
 
-    df = df.dropna(how="all")
+    df = df.dropna(how="all")  # Drop fully-empty rows (e.g. trailing blank lines in the sheet).
 
+    # The export appends a "Count: N" footer row - strip it out using whichever
+    # column is available to check ("SrNo" preferred, else the first column).
     if "SrNo" in df.columns:
         df = df[~df["SrNo"].astype(str).str.contains("Count:", case=False, na=False)]
     else:
         first_col = df.columns[0]
         df = df[~df[first_col].astype(str).str.contains("Count:", case=False, na=False)]
 
+    # PRNNumber should be numeric - coerce and drop anything that isn't
+    # (defensive cleanup in case a stray text row slipped through above).
     if "PRNNumber" in df.columns:
         df["PRNNumber"] = pd.to_numeric(df["PRNNumber"], errors="coerce")
         df = df[df["PRNNumber"].notna()]
 
+    # Sort so each student's rows appear in a fixed order: Examiner -> Moderator -> Reval 1 -> Reval 2.
     if "PRNNumber" in df.columns and "UserType" in df.columns:
         df["SortOrder"] = df["UserType"].map(USER_TYPE_ORDER).fillna(99)
         df = df.sort_values(by=["PRNNumber", "SortOrder"]).drop(columns=["SortOrder"])
@@ -232,10 +269,11 @@ def calculate_grade(total_obtained, total_max):
         max_m = float(total_max)
 
         if max_m <= 0:
-            return ""
+            return ""  # Avoid division by zero / nonsensical percentages.
 
         pct = (obtained / max_m) * 100.0
 
+        # Standard percentage-to-grade ladder, checked from highest to lowest.
         if pct >= 90:
             return "O"
         elif pct >= 80:
@@ -253,6 +291,7 @@ def calculate_grade(total_obtained, total_max):
         else:
             return "F"
     except (ValueError, TypeError):
+        # total_obtained/total_max were blank, "AB", "NA", etc. - no grade can be derived.
         return ""
 
 
@@ -266,7 +305,9 @@ def apply_gmr_lookup(df, gmr_df):
     - Grade: Calculated based on percentage criteria
     """
     df = df.copy()
-    
+
+    # Always create these columns (even with no GMR file) so downstream code
+    # (reorder_gmr_columns, exports, previews) can assume they exist.
     df["Internal Marks"] = ""
     df["Total Max Marks"] = ""
     df["Semester Total Max Marks"] = ""
@@ -274,34 +315,37 @@ def apply_gmr_lookup(df, gmr_df):
     df["Grade"] = ""
 
     if gmr_df is None or gmr_df.empty:
-        return df
+        return df  # No GMR file uploaded - leave the GMR columns blank.
 
     gmr_clean = gmr_df.copy()
     gmr_clean.columns = gmr_clean.columns.astype(str).str.strip()
 
+    # Bail out quietly if the GMR file doesn't have the columns we need to match on.
     required_gmr_cols = ["Student Number", "Modulecode", "AGR type", "Grades"]
     if not all(col in gmr_clean.columns for col in required_gmr_cols):
         return df
 
-    # Prepare Lookup Keys
+    # --- Build a composite lookup key (PRN + Subject code) on both sides ---
+    # so a single row in the Questionwise sheet can be matched to the right
+    # GMR record even though GMR uses different column names for the same IDs.
     df_key = (
-        df["PRNNumber"].astype(str).str.strip() + 
+        df["PRNNumber"].astype(str).str.strip() +
         df["Subject Name-Subject code"].astype(str).str.strip()
     )
 
     gmr_clean["LookupKey"] = (
-        gmr_clean["Student Number"].astype(str).str.strip() + 
+        gmr_clean["Student Number"].astype(str).str.strip() +
         gmr_clean["Modulecode"].astype(str).str.strip()
     )
 
-    # 1. Fetch Internal Marks
+    # 1. Fetch Internal Marks (GMR rows whose AGR type mentions "Internal Total").
     internal_df = gmr_clean[
         gmr_clean["AGR type"].astype(str).str.contains("Internal Total", case=False, na=False)
     ]
     internal_obtained_map = dict(zip(internal_df["LookupKey"], internal_df["Grades"]))
     df["Internal Marks"] = df_key.map(internal_obtained_map).fillna("")
 
-    # 2. Fetch Total Max Marks from Composite AGR type
+    # 2. Fetch Total Max Marks from Composite AGR type.
     composite_max_map = {}
     if "MAX Marks" in gmr_clean.columns:
         composite_df = gmr_clean[
@@ -310,7 +354,7 @@ def apply_gmr_lookup(df, gmr_df):
         composite_max_map = dict(zip(composite_df["LookupKey"], composite_df["MAX Marks"]))
     df["Total Max Marks"] = df_key.map(composite_max_map).fillna("")
 
-    # 3. Fetch Semester Total Max Marks from Semester Total AGR type
+    # 3. Fetch Semester Total Max Marks from Semester Total AGR type.
     sem_total_max_map = {}
     if "MAX Marks" in gmr_clean.columns:
         sem_total_df = gmr_clean[
@@ -319,7 +363,7 @@ def apply_gmr_lookup(df, gmr_df):
         sem_total_max_map = dict(zip(sem_total_df["LookupKey"], sem_total_df["MAX Marks"]))
     df["Semester Total Max Marks"] = df_key.map(sem_total_max_map).fillna("")
 
-    # 4. Calculate Total Marks Obtained
+    # 4. Calculate Total Marks Obtained = TotalObtainedScore (exam script) + Internal Marks (GMR).
     def compute_total_obtained(row):
         tot_score = row.get("TotalObtainedScore", "")
         int_marks = row.get("Internal Marks", "")
@@ -334,6 +378,8 @@ def apply_gmr_lookup(df, gmr_df):
         except (ValueError, TypeError):
             val_int = 0.0
 
+        # Only report a blank total if BOTH inputs were blank - otherwise treat
+        # a missing side as 0 (e.g. a student with Internal Marks but no script yet).
         if str(tot_score).strip() == "" and str(int_marks).strip() == "":
             return ""
 
@@ -341,7 +387,7 @@ def apply_gmr_lookup(df, gmr_df):
 
     df["Total Marks Obtained"] = df.apply(compute_total_obtained, axis=1)
 
-    # 5. Calculate Grade
+    # 5. Calculate Grade from the newly computed Total Marks Obtained / Total Max Marks.
     df["Grade"] = df.apply(
         lambda r: calculate_grade(r["Total Marks Obtained"], r["Total Max Marks"]), axis=1
     )
@@ -351,9 +397,11 @@ def apply_gmr_lookup(df, gmr_df):
 
 def calculate_paper_max_marks(df):
     """Extracts sum of question max marks from question column headers."""
+    # Question columns are simply "everything that isn't a known fixed column".
     question_columns = [col for col in df.columns if col not in FIXED_COLUMNS]
     total_q_max = 0.0
     for col in question_columns:
+        # Column headers look like "Q1 (10)" - pull the number out of the parentheses.
         match = re.search(r"\(([\d.]+)\)", col)
         if match:
             try:
@@ -372,8 +420,9 @@ def calculate_moderator_change_pct(df):
     df["Change %"] = pd.Series([""] * len(df), index=df.index, dtype="object")
 
     if "PRNNumber" not in df.columns or "UserType" not in df.columns or "TotalObtainedScore" not in df.columns:
-        return df
+        return df  # Can't compute anything meaningful without these three columns.
 
+    # Precompute once - used as the last-resort denominator fallback below.
     paper_q_max = calculate_paper_max_marks(df)
 
     for prn, group in df.groupby("PRNNumber", dropna=False):
@@ -381,7 +430,7 @@ def calculate_moderator_change_pct(df):
         moderator_rows = group[group["UserType"].astype(str).str.strip() == "Moderator"]
 
         if examiner_rows.empty or moderator_rows.empty:
-            continue
+            continue  # A student without both an Examiner AND a Moderator row has no "change" to report.
 
         examiner_row = examiner_rows.iloc[0]
         moderator_row = moderator_rows.iloc[0]
@@ -389,8 +438,9 @@ def calculate_moderator_change_pct(df):
         try:
             ex_score = float(examiner_row["TotalObtainedScore"])
             mod_score = float(moderator_row["TotalObtainedScore"])
-            
-            # 1. Try Semester Total Max Marks from GMR lookup
+
+            # Denominator selection, in priority order:
+            # 1. Try Semester Total Max Marks from GMR lookup (most accurate, whole-semester scale).
             sem_max_marks = 0.0
             sem_max_val = str(moderator_row.get("Semester Total Max Marks", "")).strip()
             if sem_max_val != "":
@@ -399,7 +449,7 @@ def calculate_moderator_change_pct(df):
                 except ValueError:
                     sem_max_marks = 0.0
 
-            # 2. Fallback to Total Max Marks if GMR Semester Total is not available
+            # 2. Fallback to Total Max Marks if GMR Semester Total is not available.
             if sem_max_marks <= 0:
                 tot_max_val = str(moderator_row.get("Total Max Marks", "")).strip()
                 if tot_max_val != "":
@@ -408,14 +458,16 @@ def calculate_moderator_change_pct(df):
                     except ValueError:
                         sem_max_marks = 0.0
 
-            # 3. Fallback to sum of question max marks from column headers
+            # 3. Fallback to sum of question max marks from column headers (no GMR file at all).
             if sem_max_marks <= 0:
                 sem_max_marks = paper_q_max
 
             if sem_max_marks > 0:
                 change_pct = ((mod_score - ex_score) / sem_max_marks) * 100.0
+                # Change % is only ever recorded on the Moderator row itself.
                 df.loc[moderator_rows.index[0], "Change %"] = round(change_pct, 2)
         except (ValueError, TypeError):
+            # Non-numeric scores (e.g. "AB"/"UFM") - leave Change % blank for this student.
             continue
 
     return df
@@ -439,9 +491,9 @@ def reorder_gmr_columns(df):
     if "TotalObtainedScore" in df.columns:
         cols = df.columns.tolist()
         tot_idx = cols.index("TotalObtainedScore")
-        head = cols[:tot_idx + 1]
-        tail = [c for c in target_tail if c in cols]
-        remaining = [c for c in cols if c not in head and c not in tail]
+        head = cols[:tot_idx + 1]                              # Everything up to and including TotalObtainedScore.
+        tail = [c for c in target_tail if c in cols]            # The GMR/derived columns, in their desired order.
+        remaining = [c for c in cols if c not in head and c not in tail]  # Question columns etc. stay where they were.
         df = df[head + tail + remaining]
     return df
 
@@ -454,12 +506,15 @@ def process_data_for_download(df, include_all_usertypes=False):
     download_df = df.copy()
 
     if not include_all_usertypes:
-        # Remove Reval 1 and Reval 2 Rows
+        # --- "Standard" export: only Examiner + (filtered) Moderator rows ---
+
+        # Remove Reval 1 and Reval 2 Rows entirely - they never appear in the standard export.
         if "UserType" in download_df.columns:
             reval_mask = download_df["UserType"].astype(str).str.strip().str.lower().isin(["reval 1", "reval 2"])
             download_df = download_df[~reval_mask]
 
-        # Filter Moderator Rows
+        # For any student who WAS moderated, only keep their Moderator row (drop the original Examiner row,
+        # since the Moderator row now represents the final mark). Students with no moderation keep all rows.
         if "PRNNumber" in download_df.columns and "UserType" in download_df.columns:
             moderator_prns = set(
                 download_df[download_df["UserType"].astype(str).str.strip().str.lower() == "moderator"]["PRNNumber"]
@@ -474,25 +529,25 @@ def process_data_for_download(df, include_all_usertypes=False):
 
             download_df = download_df[download_df.apply(filter_rows, axis=1)]
 
-    # Replace "AB" in TotalObtainedScore
+    # Replace "AB" in TotalObtainedScore with a human-readable label based on attendance.
     if "TotalObtainedScore" in download_df.columns:
         def adjust_score(row):
             score = str(row["TotalObtainedScore"]).strip()
             attendance = str(row.get("MarkAttendance", "")).strip().upper()
-            
+
             if score.upper() == "AB":
                 if attendance == "UFM":
-                    return "UFM"
+                    return "UFM"      # Unfair means - distinct from a plain absence.
                 return "ABSENT"
             return score
 
         download_df["TotalObtainedScore"] = download_df.apply(adjust_score, axis=1)
 
-    # Drop Unwanted Columns
+    # Drop Unwanted Columns - which set depends on which export flavour this is.
     cols_to_remove = COLUMNS_TO_DROP_FORMATTED if include_all_usertypes else COLUMNS_TO_DROP_STANDARD
     download_df = download_df.drop(columns=cols_to_remove, errors="ignore")
 
-    # Rename Columns
+    # Rename Columns to the labels expected in the exported file.
     if "Subject Name-Subject code" in download_df.columns:
         download_df = download_df.rename(columns={"Subject Name-Subject code": "Subject code"})
 
@@ -501,7 +556,7 @@ def process_data_for_download(df, include_all_usertypes=False):
 
     download_df = download_df.reset_index(drop=True)
 
-    # Make SrNo Continuous (1, 2, 3, ...)
+    # Make SrNo Continuous (1, 2, 3, ...) since rows may have been dropped/reordered above.
     if "SrNo" in download_df.columns:
         download_df["SrNo"] = download_df.index + 1
 
@@ -520,23 +575,28 @@ def format_value(value):
 
     try:
         number = float(text)
+        # Show whole numbers without a trailing ".0" (e.g. "8" not "8.0"),
+        # but keep decimals for fractional marks (e.g. "7.5").
         if number.is_integer():
             return str(int(number))
         return f"{number:g}"
     except (TypeError, ValueError):
-        return text
+        return text  # Not numeric - show as-is (e.g. "ABSENT", subject names, etc.).
 
 
 def highlight_rows(data, question_columns):
     """Applies CSS styles for Streamlit preview table safely."""
     styles = pd.DataFrame("", index=data.index, columns=data.columns)
 
+    # Pass 1: whole-row background colour based on UserType (Moderator/Reval 1/Reval 2).
     for idx in data.index:
         if "UserType" in data.columns:
             user_type = str(data.loc[idx, "UserType"]).strip()
             if user_type in ROW_COLOURS:
                 styles.loc[idx, :] += ROW_COLOURS[user_type]
 
+    # Pass 2: cell-level green/red highlighting - compare each reviewer row
+    # against that student's Examiner row, column by column.
     if "PRNNumber" in data.columns and "UserType" in data.columns:
         for _, group in data.groupby("PRNNumber", dropna=False):
             examiner_rows = group[group["UserType"] == "Examiner"]
@@ -546,9 +606,9 @@ def highlight_rows(data, question_columns):
 
             for idx in group.index:
                 if str(data.loc[idx, "UserType"]) == "Examiner":
-                    continue
+                    continue  # Never highlight the baseline Examiner row against itself.
 
-                # Question-wise marks highlighting
+                # Question-wise marks highlighting.
                 for col in question_columns:
                     if col not in data.columns:
                         continue
@@ -557,9 +617,10 @@ def highlight_rows(data, question_columns):
                     current_value = str(data.loc[idx, col]).strip()
 
                     if examiner_value == "" or examiner_value.upper() == "NA":
-                        continue
+                        continue  # Examiner didn't mark this question - nothing to compare.
 
                     if current_value == "" or current_value.upper() == "NA":
+                        # Reviewer removed a mark the Examiner had given - treat as a decrease.
                         styles.loc[idx, col] += DECREASE_STYLE
                         continue
 
@@ -574,7 +635,7 @@ def highlight_rows(data, question_columns):
                     elif cur_mark < ex_mark:
                         styles.loc[idx, col] += DECREASE_STYLE
 
-                # Grade Conditional Formatting
+                # Grade Conditional Formatting (rank comparison, not numeric comparison).
                 if "Grade" in data.columns:
                     ex_grade = str(examiner_row.get("Grade", "")).strip().upper()
                     cur_grade = str(data.loc[idx, "Grade"]).strip().upper()
@@ -588,7 +649,7 @@ def highlight_rows(data, question_columns):
                         elif cur_rank < ex_rank:
                             styles.loc[idx, "Grade"] += DECREASE_STYLE
 
-                # Total Marks Obtained Conditional Formatting
+                # Total Marks Obtained Conditional Formatting.
                 if "Total Marks Obtained" in data.columns:
                     ex_tot_str = str(examiner_row.get("Total Marks Obtained", "")).strip()
                     cur_tot_str = str(data.loc[idx, "Total Marks Obtained"]).strip()
@@ -603,7 +664,7 @@ def highlight_rows(data, question_columns):
                         except (ValueError, TypeError):
                             pass
 
-                # Change % Conditional Formatting
+                # Change % Conditional Formatting (sign-based: positive = green, negative = red).
                 if "Change %" in data.columns:
                     chg_str = str(data.loc[idx, "Change %"]).strip()
                     if chg_str != "":
@@ -616,6 +677,7 @@ def highlight_rows(data, question_columns):
                         except (ValueError, TypeError):
                             pass
 
+    # TotalObtainedScore is always bold, regardless of row type, for quick scanning.
     if "TotalObtainedScore" in data.columns:
         styles.loc[:, "TotalObtainedScore"] += "font-weight:bold;"
 
@@ -625,7 +687,7 @@ def highlight_rows(data, question_columns):
 def style_preview(df, question_columns, hide_columns=PREVIEW_HIDDEN_COLUMNS):
     """Builds styled interactive preview table for web display."""
     display_df = df.drop(columns=hide_columns, errors="ignore").copy()
-    display_df.index = range(1, len(display_df) + 1)
+    display_df.index = range(1, len(display_df) + 1)  # 1-based row numbers look nicer to end users.
     return (
         display_df.style
         .format(format_value)
@@ -658,13 +720,13 @@ def score_change_summary(df, review_type):
         review_rows = group[group["UserType"] == review_type]
 
         if examiner_rows.empty or review_rows.empty:
-            continue
+            continue  # Skip students who don't have both an Examiner row and a row of this review_type.
 
         try:
             examiner_score = float(examiner_rows.iloc[0]["TotalObtainedScore"])
             review_score = float(review_rows.iloc[0]["TotalObtainedScore"])
         except (TypeError, ValueError):
-            continue
+            continue  # Non-numeric score (e.g. "AB") - can't compare, skip.
 
         if review_score > examiner_score:
             increased += 1
@@ -699,9 +761,11 @@ def compute_moderation_10pct_metrics(df):
             if abs(float(val)) > 10.0:
                 count_gt_10pct += 1
         except (ValueError, TypeError):
-            continue
+            continue  # Blank Change % (no comparable Examiner row) - doesn't count either way.
 
     ratio_gt_10pct = (count_gt_10pct / mod_count) if mod_count > 0 else 0.0
+    # Regulation threshold: if MORE than half of moderated scripts moved by >10%,
+    # the whole paper must go through 100% moderation.
     is_eligible_100pct_moderation = ratio_gt_10pct > 0.50
 
     return mod_count, count_gt_10pct, ratio_gt_10pct, is_eligible_100pct_moderation
@@ -727,6 +791,7 @@ def generate_output_filename(df, idx=1, prefix=""):
     subject_name = str(df.iloc[0].get("SubjectName", "Subject")).strip()
     semester_raw = str(df.iloc[0].get("Semester", "Semester")).strip()
 
+    # Shorten "Semester X" to "Sem X" to keep filenames compact.
     semester_short = re.sub(r"(?i)\bsemester\b", "Sem", semester_raw).strip()
 
     unique_prns = df["PRNNumber"].nunique() if "PRNNumber" in df.columns else len(df)
@@ -745,14 +810,14 @@ def sanitize_sheet_name(subject_identifier):
         return "Questionwise Data"
 
     name = str(subject_identifier)
-    name = re.sub(r"\[[^\]]*\]", "", name)
-    name = re.sub(r"[\\/?*\[\]:]", "", name)
+    name = re.sub(r"\[[^\]]*\]", "", name)          # Drop any bracketed suffix, e.g. "[2024]".
+    name = re.sub(r"[\\/?*\[\]:]", "", name)          # Excel forbids these characters in sheet names.
     name = re.sub(r"\s+", " ", name).strip()
 
     if not name:
         name = "Questionwise Data"
 
-    return name[:31]
+    return name[:31]  # Excel's hard limit on sheet-name length.
 
 
 def get_sheet_name_for_df(df, default_idx=1):
@@ -773,6 +838,8 @@ def add_sheet_popup_validation(worksheet, is_eligible):
     if not is_eligible:
         return
 
+    # A "custom" validation with an always-true formula never blocks input - it exists
+    # purely to piggyback on Excel's input-message pop-up as a visible alert banner.
     dv = DataValidation(
         type="custom",
         formula1="TRUE",
@@ -784,6 +851,217 @@ def add_sheet_popup_validation(worksheet, is_eligible):
     )
     worksheet.add_data_validation(dv)
     dv.add(worksheet["A1"])
+
+
+# --------------------------------------------------
+# Shared Excel-styling helpers
+# --------------------------------------------------
+# The three export builders below (to_excel_bytes, to_excel_bytes_formatted,
+# create_consolidated_multi_sheet_excel) all need the same handful of styling
+# building blocks - a thin border, deciding which columns to center-align,
+# auto-sizing/fixing column widths, painting the header row, and (for the
+# two "formatted" exports) the green/red change-highlighting + student
+# borders. Pulling these out avoids keeping three near-identical ~150 line
+# copies of the same openpyxl code in sync by hand.
+
+def _thin_border():
+    """Returns a Border with a thin black line on all four sides."""
+    side = Side(style="thin", color="000000")
+    return Border(left=side, right=side, top=side, bottom=side)
+
+
+def _center_column_indices(cols, explicit_center_names):
+    """
+    Works out the 1-based column indices that should be center-aligned.
+
+    Two rules combine:
+      1. Any column whose name is in `explicit_center_names`.
+      2. Every column from 'SAP ID' to 'TotalObtainedScore' inclusive - this
+         is always the block of per-question mark columns.
+    """
+    indices = [i for i, name in enumerate(cols, start=1) if name in explicit_center_names]
+
+    if "SAP ID" in cols and "TotalObtainedScore" in cols:
+        sap_idx = cols.index("SAP ID") + 1
+        tot_idx = cols.index("TotalObtainedScore") + 1
+        indices.extend(range(sap_idx, tot_idx + 1))
+
+    return set(indices)
+
+
+def _autosize_or_fixed_width_columns(worksheet, fixed_width_cols=None, fixed_width=15):
+    """
+    Sets a fixed width for any column named in `fixed_width_cols`; every other
+    column auto-sizes to fit its longest cell value (+3 padding, 10 minimum).
+    """
+    fixed_width_cols = fixed_width_cols or set()
+    for col in worksheet.columns:
+        col_letter = get_column_letter(col[0].column)
+        col_name = str(col[0].value).strip()
+
+        if col_name in fixed_width_cols:
+            worksheet.column_dimensions[col_letter].width = fixed_width
+        else:
+            max_len = 0
+            for cell in col:
+                if cell.value is not None:
+                    max_len = max(max_len, len(str(cell.value)))
+            worksheet.column_dimensions[col_letter].width = max(max_len + 3, 10)
+
+
+def _apply_grid_styling(worksheet, cols, center_col_indices, total_score_col_idx,
+                         download_df=None, user_type_col_idx=None, moderator_fill=None):
+    """
+    Applies the shared per-cell formatting pass used by every exported sheet:
+      - thin border on every cell
+      - bold, grey, wrapped & centered header row (row 1)
+      - bold font on the 'TotalObtainedScore' column
+      - center alignment on any column flagged in `center_col_indices`
+      - (formatted sheets only) a light-green fill on rows whose UserType is
+        'Moderator' - enabled by passing `moderator_fill`, `user_type_col_idx`
+        and `download_df` together; omitted entirely for the plain export.
+    """
+    thin_border = _thin_border()
+    grey_fill = PatternFill(start_color="D9D9D9", end_color="D9D9D9", fill_type="solid")
+    center_wrap_align = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    center_align = Alignment(horizontal="center", vertical="center")
+
+    for row in worksheet.iter_rows(min_row=1, max_row=worksheet.max_row,
+                                    min_col=1, max_col=worksheet.max_column):
+        is_moderator_row = False
+        if moderator_fill is not None and user_type_col_idx is not None and download_df is not None:
+            row_idx = row[0].row - 2  # Excel row 2 == DataFrame index 0 (row 1 is the header).
+            if 0 <= row_idx < len(download_df):
+                u_type = str(download_df.iloc[row_idx].get("UserType", "")).strip().lower()
+                is_moderator_row = (u_type == "moderator")
+
+        for cell in row:
+            cell.border = thin_border
+
+            if cell.row == 1:
+                cell.font = Font(bold=True)
+                cell.fill = grey_fill
+                cell.alignment = center_wrap_align
+            else:
+                if is_moderator_row:
+                    cell.fill = moderator_fill
+                if total_score_col_idx and cell.column == total_score_col_idx:
+                    cell.font = Font(bold=True)
+
+            if cell.row > 1 and cell.column in center_col_indices:
+                cell.alignment = center_align
+
+
+def _apply_change_highlighting_and_group_borders(worksheet, download_df, cols, dark_green_font, red_font):
+    """
+    For every student (grouped by 'SAP ID'), compares each reviewer row
+    (Moderator / Reval 1 / Reval 2) against that student's Examiner row and:
+      - colors question marks, Grade, Total Marks Obtained and Change % cells
+        green if the value improved, red if it dropped or a mark disappeared
+      - draws a medium-thickness bottom border under the student's last row
+        so each student's block is visually separated on the sheet
+
+    Only used by the "formatted" exports (all UserTypes + GMR columns).
+    """
+    if "UserType" not in download_df.columns or "SAP ID" not in download_df.columns:
+        return
+
+    thin_side = Side(style="thin", color="000000")
+    medium_side = Side(style="medium", color="000000")
+
+    question_cols = [c for c in download_df.columns if c not in FIXED_COLUMNS and c not in COLUMNS_TO_DROP_FORMATTED]
+
+    for sap_id, group in download_df.groupby("SAP ID", dropna=False):
+        examiner_rows = group[group["UserType"] == "Examiner"]
+        if examiner_rows.empty:
+            continue
+        examiner_row = examiner_rows.iloc[0]
+
+        for row_idx in group.index:
+            if str(download_df.loc[row_idx, "UserType"]).strip() == "Examiner":
+                continue  # Never highlight the Examiner row against itself.
+
+            excel_row_num = row_idx + 2  # +1 for header row, +1 for 1-based Excel rows.
+
+            # --- Question-wise marks ---
+            for q_col in question_cols:
+                if q_col not in download_df.columns:
+                    continue
+                col_idx = cols.index(q_col) + 1
+                ex_val_str = str(examiner_row[q_col]).strip()
+                cur_val_str = str(download_df.loc[row_idx, q_col]).strip()
+
+                if ex_val_str == "" or ex_val_str.upper() == "NA":
+                    continue  # Examiner never marked this question - nothing to compare against.
+
+                cell = worksheet.cell(row=excel_row_num, column=col_idx)
+
+                if cur_val_str == "" or cur_val_str.upper() == "NA":
+                    cell.font = red_font  # Reviewer's mark went missing - treat as a decrease.
+                    continue
+
+                try:
+                    ex_val = float(ex_val_str)
+                    cur_val = float(cur_val_str)
+                    if cur_val > ex_val:
+                        cell.font = dark_green_font
+                    elif cur_val < ex_val:
+                        cell.font = red_font
+                except (ValueError, TypeError):
+                    pass
+
+            # --- Grade (rank comparison) ---
+            if "Grade" in download_df.columns:
+                grade_col_idx = cols.index("Grade") + 1
+                ex_grade = str(examiner_row.get("Grade", "")).strip().upper()
+                cur_grade = str(download_df.loc[row_idx, "Grade"]).strip().upper()
+
+                if ex_grade in GRADE_RANKS and cur_grade in GRADE_RANKS:
+                    cell = worksheet.cell(row=excel_row_num, column=grade_col_idx)
+                    if GRADE_RANKS[cur_grade] > GRADE_RANKS[ex_grade]:
+                        cell.font = dark_green_font
+                    elif GRADE_RANKS[cur_grade] < GRADE_RANKS[ex_grade]:
+                        cell.font = red_font
+
+            # --- Total Marks Obtained ---
+            if "Total Marks Obtained" in download_df.columns:
+                tot_obt_col_idx = cols.index("Total Marks Obtained") + 1
+                ex_tot_str = str(examiner_row.get("Total Marks Obtained", "")).strip()
+                cur_tot_str = str(download_df.loc[row_idx, "Total Marks Obtained"]).strip()
+
+                if ex_tot_str != "" and cur_tot_str != "":
+                    cell = worksheet.cell(row=excel_row_num, column=tot_obt_col_idx)
+                    try:
+                        ex_tot = float(ex_tot_str)
+                        cur_tot = float(cur_tot_str)
+                        if cur_tot > ex_tot:
+                            cell.font = dark_green_font
+                        elif cur_tot < ex_tot:
+                            cell.font = red_font
+                    except (ValueError, TypeError):
+                        pass
+
+            # --- Change % (sign-based) ---
+            if "Change %" in download_df.columns:
+                chg_col_idx = cols.index("Change %") + 1
+                chg_str = str(download_df.loc[row_idx, "Change %"]).strip()
+
+                if chg_str != "":
+                    cell = worksheet.cell(row=excel_row_num, column=chg_col_idx)
+                    try:
+                        chg_val = float(chg_str)
+                        if chg_val > 0:
+                            cell.font = dark_green_font
+                        elif chg_val < 0:
+                            cell.font = red_font
+                    except (ValueError, TypeError):
+                        pass
+
+        # Thick bottom border under this student's last row, marking the end of their block.
+        last_row_idx = group.index[-1] + 2
+        for c_idx in range(1, worksheet.max_column + 1):
+            cell = worksheet.cell(row=last_row_idx, column=c_idx)
+            cell.border = Border(left=thin_side, right=thin_side, top=cell.border.top, bottom=medium_side)
 
 
 def to_excel_bytes(df):
@@ -799,62 +1077,19 @@ def to_excel_bytes(df):
 
     with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
         download_df.to_excel(writer, index=False, sheet_name=sheet_name)
-        
-        workbook = writer.book
+
         worksheet = writer.sheets[sheet_name]
 
         worksheet.views.sheetView[0].showGridLines = False
-        worksheet.freeze_panes = "A2"
+        worksheet.freeze_panes = "A2"          # Freeze only the header row (column A itself scrolls).
         worksheet.row_dimensions[1].height = 30
 
-        thin_border = Border(
-            left=Side(style="thin", color="000000"),
-            right=Side(style="thin", color="000000"),
-            top=Side(style="thin", color="000000"),
-            bottom=Side(style="thin", color="000000")
-        )
-
-        center_wrap_align = Alignment(horizontal="center", vertical="center", wrap_text=True)
-        center_align = Alignment(horizontal="center", vertical="center")
-        grey_fill = PatternFill(start_color="D9D9D9", end_color="D9D9D9", fill_type="solid")
-
         cols = download_df.columns.tolist()
-        center_col_indices = []
-
-        for col_idx, col_name in enumerate(cols, start=1):
-            if col_name in ["SrNo", "Subject code"]:
-                center_col_indices.append(col_idx)
-
-        if "SAP ID" in cols and "TotalObtainedScore" in cols:
-            sap_idx = cols.index("SAP ID") + 1
-            tot_idx = cols.index("TotalObtainedScore") + 1
-            for idx in range(sap_idx, tot_idx + 1):
-                center_col_indices.append(idx)
-
-        center_col_indices = set(center_col_indices)
+        center_col_indices = _center_column_indices(cols, {"SrNo", "Subject code"})
         total_score_col_idx = cols.index("TotalObtainedScore") + 1 if "TotalObtainedScore" in cols else None
 
-        for row in worksheet.iter_rows(min_row=1, max_row=worksheet.max_row, min_col=1, max_col=worksheet.max_column):
-            for cell in row:
-                cell.border = thin_border
-                
-                if cell.row == 1:
-                    cell.font = Font(bold=True)
-                    cell.fill = grey_fill
-                    cell.alignment = center_wrap_align
-                elif total_score_col_idx and cell.column == total_score_col_idx:
-                    cell.font = Font(bold=True)
-
-                if cell.row > 1 and cell.column in center_col_indices:
-                    cell.alignment = center_align
-
-        for col in worksheet.columns:
-            max_len = 0
-            col_letter = get_column_letter(col[0].column)
-            for cell in col:
-                if cell.value is not None:
-                    max_len = max(max_len, len(str(cell.value)))
-            worksheet.column_dimensions[col_letter].width = max(max_len + 3, 10)
+        _apply_grid_styling(worksheet, cols, center_col_indices, total_score_col_idx)
+        _autosize_or_fixed_width_columns(worksheet)  # No fixed-width columns in this export - autosize everything.
 
     return buffer.getvalue()
 
@@ -873,191 +1108,47 @@ def to_excel_bytes_formatted(df):
 
     with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
         download_df.to_excel(writer, index=False, sheet_name=sheet_name)
-        
-        workbook = writer.book
+
         worksheet = writer.sheets[sheet_name]
 
         worksheet.views.sheetView[0].showGridLines = False
-        worksheet.freeze_panes = "F2"
+        worksheet.freeze_panes = "F2"          # Freeze header row + first 5 identifying columns.
         worksheet.row_dimensions[1].height = 30
 
-        thin_side = Side(style="thin", color="000000")
-        medium_side = Side(style="medium", color="000000")
-        thin_border = Border(left=thin_side, right=thin_side, top=thin_side, bottom=thin_side)
-
-        center_wrap_align = Alignment(horizontal="center", vertical="center", wrap_text=True)
-        center_align = Alignment(horizontal="center", vertical="center")
-        
-        grey_fill = PatternFill(start_color="D9D9D9", end_color="D9D9D9", fill_type="solid")
         mod_fill = PatternFill(start_color="E2EFDA", end_color="E2EFDA", fill_type="solid")
-
-        # Darker green font for text legibility
-        dark_green_font = Font(color="006100", bold=True)
+        dark_green_font = Font(color="006100", bold=True)  # Darker green than the preview's #9ACD32 - more legible on white Excel cells.
         red_font = Font(color="FF4500", bold=True)
 
         cols = download_df.columns.tolist()
-        center_col_indices = []
 
-        fixed_15_cols = [
-            "Semester Total Max Marks", "Internal Marks", 
+        fixed_15_cols = {
+            "Semester Total Max Marks", "Internal Marks",
             "Total Max Marks", "Total Marks Obtained", "Grade", "Change %"
-        ]
-
-        align_center_col_names = [
-            "SrNo", "Subject code", "Grade", "Internal Marks", 
+        }
+        align_center_col_names = {
+            "SrNo", "Subject code", "Grade", "Internal Marks",
             "Total Max Marks", "Semester Total Max Marks", "Total Marks Obtained", "Change %"
-        ]
+        }
 
-        for col_idx, col_name in enumerate(cols, start=1):
-            if col_name in align_center_col_names:
-                center_col_indices.append(col_idx)
-
-        if "SAP ID" in cols and "TotalObtainedScore" in cols:
-            sap_idx = cols.index("SAP ID") + 1
-            tot_idx = cols.index("TotalObtainedScore") + 1
-            for idx in range(sap_idx, tot_idx + 1):
-                center_col_indices.append(idx)
-
-        center_col_indices = set(center_col_indices)
+        center_col_indices = _center_column_indices(cols, align_center_col_names)
         total_score_col_idx = cols.index("TotalObtainedScore") + 1 if "TotalObtainedScore" in cols else None
         user_type_col_idx = cols.index("UserType") if "UserType" in cols else None
 
-        # Basic styling & Moderator Light Green Fill
-        for row in worksheet.iter_rows(min_row=1, max_row=worksheet.max_row, min_col=1, max_col=worksheet.max_column):
-            row_idx = row[0].row - 2  # Convert to 0-based dataframe index
-            is_moderator_row = False
-            if row_idx >= 0 and user_type_col_idx is not None and row_idx < len(download_df):
-                u_type = str(download_df.iloc[row_idx].get("UserType", "")).strip().lower()
-                is_moderator_row = (u_type == "moderator")
+        # Basic styling + Moderator light-green row fill.
+        _apply_grid_styling(
+            worksheet, cols, center_col_indices, total_score_col_idx,
+            download_df=download_df, user_type_col_idx=user_type_col_idx, moderator_fill=mod_fill,
+        )
 
-            for cell in row:
-                cell.border = thin_border
-                
-                if cell.row == 1:
-                    cell.font = Font(bold=True)
-                    cell.fill = grey_fill
-                    cell.alignment = center_wrap_align
-                else:
-                    if is_moderator_row:
-                        cell.fill = mod_fill
-                    if total_score_col_idx and cell.column == total_score_col_idx:
-                        cell.font = Font(bold=True)
+        # Green/red change highlighting + thick per-student borders.
+        _apply_change_highlighting_and_group_borders(worksheet, download_df, cols, dark_green_font, red_font)
 
-                if cell.row > 1 and cell.column in center_col_indices:
-                    cell.alignment = center_align
-
-        # Conditional Formatting on Exported Rows
-        if "UserType" in download_df.columns and "SAP ID" in download_df.columns:
-            question_cols = [c for c in download_df.columns if c not in FIXED_COLUMNS and c not in COLUMNS_TO_DROP_FORMATTED]
-            
-            for sap_id, group in download_df.groupby("SAP ID", dropna=False):
-                examiner_rows = group[group["UserType"] == "Examiner"]
-                if examiner_rows.empty:
-                    continue
-                examiner_row = examiner_rows.iloc[0]
-
-                for row_idx in group.index:
-                    if str(download_df.loc[row_idx, "UserType"]).strip() == "Examiner":
-                        continue
-
-                    excel_row_num = row_idx + 2
-
-                    # Marks Formatting
-                    for q_col in question_cols:
-                        if q_col not in download_df.columns:
-                            continue
-                        col_idx = cols.index(q_col) + 1
-                        ex_val_str = str(examiner_row[q_col]).strip()
-                        cur_val_str = str(download_df.loc[row_idx, q_col]).strip()
-
-                        if ex_val_str == "" or ex_val_str.upper() == "NA":
-                            continue
-
-                        cell = worksheet.cell(row=excel_row_num, column=col_idx)
-
-                        if cur_val_str == "" or cur_val_str.upper() == "NA":
-                            cell.font = red_font
-                            continue
-
-                        try:
-                            ex_val = float(ex_val_str)
-                            cur_val = float(cur_val_str)
-                            if cur_val > ex_val:
-                                cell.font = dark_green_font
-                            elif cur_val < ex_val:
-                                cell.font = red_font
-                        except (ValueError, TypeError):
-                            pass
-
-                    # Grade Formatting
-                    if "Grade" in download_df.columns:
-                        grade_col_idx = cols.index("Grade") + 1
-                        ex_grade = str(examiner_row.get("Grade", "")).strip().upper()
-                        cur_grade = str(download_df.loc[row_idx, "Grade"]).strip().upper()
-
-                        if ex_grade in GRADE_RANKS and cur_grade in GRADE_RANKS:
-                            cell = worksheet.cell(row=excel_row_num, column=grade_col_idx)
-                            if GRADE_RANKS[cur_grade] > GRADE_RANKS[ex_grade]:
-                                cell.font = dark_green_font
-                            elif GRADE_RANKS[cur_grade] < GRADE_RANKS[ex_grade]:
-                                cell.font = red_font
-
-                    # Total Marks Obtained Formatting
-                    if "Total Marks Obtained" in download_df.columns:
-                        tot_obt_col_idx = cols.index("Total Marks Obtained") + 1
-                        ex_tot_str = str(examiner_row.get("Total Marks Obtained", "")).strip()
-                        cur_tot_str = str(download_df.loc[row_idx, "Total Marks Obtained"]).strip()
-
-                        if ex_tot_str != "" and cur_tot_str != "":
-                            cell = worksheet.cell(row=excel_row_num, column=tot_obt_col_idx)
-                            try:
-                                ex_tot = float(ex_tot_str)
-                                cur_tot = float(cur_tot_str)
-                                if cur_tot > ex_tot:
-                                    cell.font = dark_green_font
-                                elif cur_tot < ex_tot:
-                                    cell.font = red_font
-                            except (ValueError, TypeError):
-                                pass
-
-                    # Change % Formatting
-                    if "Change %" in download_df.columns:
-                        chg_col_idx = cols.index("Change %") + 1
-                        chg_str = str(download_df.loc[row_idx, "Change %"]).strip()
-
-                        if chg_str != "":
-                            cell = worksheet.cell(row=excel_row_num, column=chg_col_idx)
-                            try:
-                                chg_val = float(chg_str)
-                                if chg_val > 0:
-                                    cell.font = dark_green_font
-                                elif chg_val < 0:
-                                    cell.font = red_font
-                            except (ValueError, TypeError):
-                                pass
-
-                # Thick bottom border per student group
-                last_row_idx = group.index[-1] + 2
-                for c_idx in range(1, worksheet.max_column + 1):
-                    cell = worksheet.cell(row=last_row_idx, column=c_idx)
-                    cell.border = Border(left=thin_side, right=thin_side, top=cell.border.top, bottom=medium_side)
-
-        # Apply interactive pop-up Data Validation message if paper is eligible for 100% Moderation
+        # Interactive pop-up Data Validation message if this paper is eligible for 100% Moderation.
         _, _, _, is_eligible = compute_moderation_10pct_metrics(df)
         add_sheet_popup_validation(worksheet, is_eligible)
 
-        # Auto-size columns / Apply fixed width 15
-        for col in worksheet.columns:
-            col_name = str(col[0].value).strip()
-            col_letter = get_column_letter(col[0].column)
-            if col_name in fixed_15_cols:
-                worksheet.column_dimensions[col_letter].width = 15
-            else:
-                max_len = 0
-                for cell in col:
-                    if cell.value is not None:
-                        max_len = max(max_len, len(str(cell.value)))
-                worksheet.column_dimensions[col_letter].width = max(max_len + 3, 10)
+        # Auto-size columns, except the GMR/Change % block which gets a fixed width of 15.
+        _autosize_or_fixed_width_columns(worksheet, fixed_width_cols=fixed_15_cols, fixed_width=15)
 
     return buffer.getvalue()
 
@@ -1074,10 +1165,10 @@ def create_consolidated_multi_sheet_excel(dfs_list):
     with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
         for idx, (df, orig_name) in enumerate(dfs_list, start=1):
             download_df = process_data_for_download(df, include_all_usertypes=True)
-            
+
+            # Ensure sheet names are unique within the workbook (Excel forbids duplicates).
             base_sheet_name = get_sheet_name_for_df(df, idx)
             sheet_name = base_sheet_name
-            
             counter = 1
             while sheet_name in used_sheet_names:
                 sheet_name = f"{base_sheet_name[:28]}_{counter}"
@@ -1091,177 +1182,36 @@ def create_consolidated_multi_sheet_excel(dfs_list):
             worksheet.freeze_panes = "F2"
             worksheet.row_dimensions[1].height = 30
 
-            thin_side = Side(style="thin", color="000000")
-            medium_side = Side(style="medium", color="000000")
-            thin_border = Border(left=thin_side, right=thin_side, top=thin_side, bottom=thin_side)
-
-            center_wrap_align = Alignment(horizontal="center", vertical="center", wrap_text=True)
-            center_align = Alignment(horizontal="center", vertical="center")
-            
-            grey_fill = PatternFill(start_color="D9D9D9", end_color="D9D9D9", fill_type="solid")
             mod_fill = PatternFill(start_color="E2EFDA", end_color="E2EFDA", fill_type="solid")
-
             dark_green_font = Font(color="006100", bold=True)
             red_font = Font(color="FF4500", bold=True)
 
             cols = download_df.columns.tolist()
-            center_col_indices = []
 
-            fixed_15_cols = [
-                "Semester Total Max Marks", "Internal Marks", 
+            fixed_15_cols = {
+                "Semester Total Max Marks", "Internal Marks",
                 "Total Max Marks", "Total Marks Obtained", "Grade", "Change %"
-            ]
-
-            align_center_col_names = [
-                "SrNo", "Subject code", "Grade", "Internal Marks", 
+            }
+            align_center_col_names = {
+                "SrNo", "Subject code", "Grade", "Internal Marks",
                 "Total Max Marks", "Semester Total Max Marks", "Total Marks Obtained", "Change %"
-            ]
+            }
 
-            for col_idx, col_name in enumerate(cols, start=1):
-                if col_name in align_center_col_names:
-                    center_col_indices.append(col_idx)
-
-            if "SAP ID" in cols and "TotalObtainedScore" in cols:
-                sap_idx = cols.index("SAP ID") + 1
-                tot_idx = cols.index("TotalObtainedScore") + 1
-                for i in range(sap_idx, tot_idx + 1):
-                    center_col_indices.append(i)
-
-            center_col_indices = set(center_col_indices)
+            center_col_indices = _center_column_indices(cols, align_center_col_names)
             total_score_col_idx = cols.index("TotalObtainedScore") + 1 if "TotalObtainedScore" in cols else None
             user_type_col_idx = cols.index("UserType") if "UserType" in cols else None
 
-            # Basic styling & Moderator Light Green Fill
-            for row in worksheet.iter_rows(min_row=1, max_row=worksheet.max_row, min_col=1, max_col=worksheet.max_column):
-                row_idx = row[0].row - 2
-                is_moderator_row = False
-                if row_idx >= 0 and user_type_col_idx is not None and row_idx < len(download_df):
-                    u_type = str(download_df.iloc[row_idx].get("UserType", "")).strip().lower()
-                    is_moderator_row = (u_type == "moderator")
+            # Same three styling passes as to_excel_bytes_formatted(), applied per-sheet.
+            _apply_grid_styling(
+                worksheet, cols, center_col_indices, total_score_col_idx,
+                download_df=download_df, user_type_col_idx=user_type_col_idx, moderator_fill=mod_fill,
+            )
+            _apply_change_highlighting_and_group_borders(worksheet, download_df, cols, dark_green_font, red_font)
 
-                for cell in row:
-                    cell.border = thin_border
-                    
-                    if cell.row == 1:
-                        cell.font = Font(bold=True)
-                        cell.fill = grey_fill
-                        cell.alignment = center_wrap_align
-                    else:
-                        if is_moderator_row:
-                            cell.fill = mod_fill
-                        if total_score_col_idx and cell.column == total_score_col_idx:
-                            cell.font = Font(bold=True)
-
-                    if cell.row > 1 and cell.column in center_col_indices:
-                        cell.alignment = center_align
-
-            # Conditional Formatting & Student Group Borders
-            if "UserType" in download_df.columns and "SAP ID" in download_df.columns:
-                question_cols = [c for c in download_df.columns if c not in FIXED_COLUMNS and c not in COLUMNS_TO_DROP_FORMATTED]
-                
-                for sap_id, group in download_df.groupby("SAP ID", dropna=False):
-                    examiner_rows = group[group["UserType"] == "Examiner"]
-                    if examiner_rows.empty:
-                        continue
-                    examiner_row = examiner_rows.iloc[0]
-
-                    for row_idx in group.index:
-                        if str(download_df.loc[row_idx, "UserType"]).strip() == "Examiner":
-                            continue
-
-                        excel_row_num = row_idx + 2
-
-                        for q_col in question_cols:
-                            if q_col not in download_df.columns:
-                                continue
-                            col_idx = cols.index(q_col) + 1
-                            ex_val_str = str(examiner_row[q_col]).strip()
-                            cur_val_str = str(download_df.loc[row_idx, q_col]).strip()
-
-                            if ex_val_str == "" or ex_val_str.upper() == "NA":
-                                continue
-
-                            cell = worksheet.cell(row=excel_row_num, column=col_idx)
-
-                            if cur_val_str == "" or cur_val_str.upper() == "NA":
-                                cell.font = red_font
-                                continue
-
-                            try:
-                                ex_val = float(ex_val_str)
-                                cur_val = float(cur_val_str)
-                                if cur_val > ex_val:
-                                    cell.font = dark_green_font
-                                elif cur_val < ex_val:
-                                    cell.font = red_font
-                            except (ValueError, TypeError):
-                                pass
-
-                        if "Grade" in download_df.columns:
-                            grade_col_idx = cols.index("Grade") + 1
-                            ex_grade = str(examiner_row.get("Grade", "")).strip().upper()
-                            cur_grade = str(download_df.loc[row_idx, "Grade"]).strip().upper()
-
-                            if ex_grade in GRADE_RANKS and cur_grade in GRADE_RANKS:
-                                cell = worksheet.cell(row=excel_row_num, column=grade_col_idx)
-                                if GRADE_RANKS[cur_grade] > GRADE_RANKS[ex_grade]:
-                                    cell.font = dark_green_font
-                                elif GRADE_RANKS[cur_grade] < GRADE_RANKS[ex_grade]:
-                                    cell.font = red_font
-
-                        if "Total Marks Obtained" in download_df.columns:
-                            tot_obt_col_idx = cols.index("Total Marks Obtained") + 1
-                            ex_tot_str = str(examiner_row.get("Total Marks Obtained", "")).strip()
-                            cur_tot_str = str(download_df.loc[row_idx, "Total Marks Obtained"]).strip()
-
-                            if ex_tot_str != "" and cur_tot_str != "":
-                                cell = worksheet.cell(row=excel_row_num, column=tot_obt_col_idx)
-                                try:
-                                    ex_tot = float(ex_tot_str)
-                                    cur_tot = float(cur_tot_str)
-                                    if cur_tot > ex_tot:
-                                        cell.font = dark_green_font
-                                    elif cur_tot < ex_tot:
-                                        cell.font = red_font
-                                except (ValueError, TypeError):
-                                    pass
-
-                        if "Change %" in download_df.columns:
-                            chg_col_idx = cols.index("Change %") + 1
-                            chg_str = str(download_df.loc[row_idx, "Change %"]).strip()
-
-                            if chg_str != "":
-                                cell = worksheet.cell(row=excel_row_num, column=chg_col_idx)
-                                try:
-                                    chg_val = float(chg_str)
-                                    if chg_val > 0:
-                                        cell.font = dark_green_font
-                                    elif chg_val < 0:
-                                        cell.font = red_font
-                                except (ValueError, TypeError):
-                                    pass
-
-                    # Thick bottom border per student group
-                    last_row_idx = group.index[-1] + 2
-                    for c_idx in range(1, worksheet.max_column + 1):
-                        cell = worksheet.cell(row=last_row_idx, column=c_idx)
-                        cell.border = Border(left=thin_side, right=thin_side, top=cell.border.top, bottom=medium_side)
-
-            # Apply interactive pop-up Data Validation message if paper is eligible for 100% Moderation
             _, _, _, is_eligible = compute_moderation_10pct_metrics(df)
             add_sheet_popup_validation(worksheet, is_eligible)
 
-            for col in worksheet.columns:
-                col_name = str(col[0].value).strip()
-                col_letter = get_column_letter(col[0].column)
-                if col_name in fixed_15_cols:
-                    worksheet.column_dimensions[col_letter].width = 15
-                else:
-                    max_len = 0
-                    for cell in col:
-                        if cell.value is not None:
-                            max_len = max(max_len, len(str(cell.value)))
-                    worksheet.column_dimensions[col_letter].width = max(max_len + 3, 10)
+            _autosize_or_fixed_width_columns(worksheet, fixed_width_cols=fixed_15_cols, fixed_width=15)
 
     return buffer.getvalue()
 
@@ -1283,7 +1233,7 @@ def show():
     st.title("📝 Questionwise Checker")
     st.caption("Upload password-protected or unprotected Excel files.")
 
-    # Side-by-side Upload Controls
+    # Side-by-side Upload Controls.
     col_up1, col_up2 = st.columns(2)
 
     with col_up1:
@@ -1300,9 +1250,9 @@ def show():
         )
 
     if not uploaded_files:
-        return
+        return  # Nothing to process yet - wait for the user to upload at least one Questionwise file.
 
-    # Load GMR File if present
+    # Load GMR File if present (optional - the tool still works without it, just without GMR columns).
     gmr_df = None
     if gmr_file is not None:
         with st.spinner("Loading GMR Excel..."):
@@ -1312,10 +1262,11 @@ def show():
             else:
                 st.warning("⚠️ Could not load GMR Excel file.")
 
-    processed_outputs_clean = []
-    dfs_for_multi_sheet = []
+    processed_outputs_clean = []   # (filename, bytes) pairs for the bulk ZIP download.
+    dfs_for_multi_sheet = []       # (DataFrame, original filename) pairs for the consolidated workbook.
 
-    # Process each uploaded Questionwise file independently
+    # Process each uploaded Questionwise file independently - one file's error
+    # shouldn't stop the others from being processed (see the try/except below).
     for idx, uploaded_file in enumerate(uploaded_files, start=1):
         st.markdown("---")
         st.subheader(f"📁 File {idx}: {uploaded_file.name}")
@@ -1330,7 +1281,7 @@ def show():
 
             st.caption(f"Opened successfully using: {used_password}")
 
-            # Clean and Sort
+            # Clean and Sort.
             df = clean_and_sort(df)
 
             if df.empty:
@@ -1341,16 +1292,16 @@ def show():
                 st.error(f"Missing required 'PRNNumber' or 'UserType' columns in {uploaded_file.name}.")
                 continue
 
-            # Apply GMR Lookup Match & Change % Calculation
+            # Apply GMR Lookup Match & Change % Calculation.
             df = apply_gmr_lookup(df, gmr_df)
             df = calculate_moderator_change_pct(df)
             df = reorder_gmr_columns(df)
-            
+
             dfs_for_multi_sheet.append((df, uploaded_file.name))
 
             question_columns = [col for col in df.columns if col not in FIXED_COLUMNS]
 
-            # Summary statistics
+            # --- Summary statistics ---
             total_students = df["PRNNumber"].nunique()
             moderation_count = count_reviewers(df, "Moderator")
             reval1_count = count_reviewers(df, "Reval 1")
@@ -1362,7 +1313,7 @@ def show():
 
             mod_cnt, cnt_gt_10, ratio_gt_10, is_eligible = compute_moderation_10pct_metrics(df)
 
-            # 5 Summary Cards Grid
+            # --- 5 Summary Cards Grid ---
             col1, col2, col3, col4, col5 = st.columns(5)
 
             with col1:
@@ -1398,10 +1349,10 @@ def show():
                 )
 
             with col5:
-                # 5th Card: Change % Metrics
+                # 5th Card: Change % Metrics.
                 pct_str = f"{ratio_gt_10 * 100:.1f}%"
                 color_style = "color:#FF4500;" if is_eligible else "color:#9ACD32;"
-                
+
                 st.markdown(
                     f"""
                     <div style="background-color:#1E293B;padding:12px;border-radius:8px;color:white;border:1px solid #334155;">
@@ -1419,7 +1370,7 @@ def show():
 
             st.subheader(build_paper_info(df))
 
-            # Filter preview subsets
+            # --- Filter preview subsets ---
             no_attendance_hidden_columns = PREVIEW_HIDDEN_COLUMNS + ["MarkAttendance"]
 
             review_prns = df[
@@ -1427,6 +1378,7 @@ def show():
             ]["PRNNumber"].unique()
             review_df = df[df["PRNNumber"].isin(review_prns)].copy()
 
+            # Students where ANY reviewer's TotalObtainedScore actually differs from the Examiner's.
             changed_prns = []
             if "TotalObtainedScore" in df.columns and "UserType" in df.columns:
                 for prn, group in df.groupby("PRNNumber", dropna=False, sort=False):
@@ -1439,16 +1391,16 @@ def show():
                                 rev_score = float(rev_row["TotalObtainedScore"])
                                 if rev_score != ex_score:
                                     changed_prns.append(prn)
-                                    break
+                                    break  # One differing reviewer is enough to flag this student.
                         except (TypeError, ValueError):
-                            continue
+                            continue  # Non-numeric score - can't determine "changed", skip this student.
 
             changes_df = df[df["PRNNumber"].isin(changed_prns)].copy() if changed_prns else pd.DataFrame()
 
-            # Display Tabs
+            # --- Display Tabs ---
             tab1, tab2, tab3 = st.tabs([
-                "📋 All Data Preview", 
-                "🔍 Moderation / Revaluation Cases Only", 
+                "📋 All Data Preview",
+                "🔍 Moderation / Revaluation Cases Only",
                 "⚡ Changes Only"
             ])
 
@@ -1470,16 +1422,16 @@ def show():
                 else:
                     st.info("No score changes detected between examiner and reviewers.")
 
-            # Generate individual Excel Outputs
+            # --- Generate individual Excel Outputs ---
             out_bytes_clean = to_excel_bytes(df)
             out_bytes_fmt = to_excel_bytes_formatted(df)
             out_filename = generate_output_filename(df, idx)
             out_filename_fmt = generate_output_filename(df, idx, prefix="Formatted_")
-            
-            # Save original clean outputs for original bulk download ZIP
+
+            # Save original clean outputs for the bulk-download ZIP.
             processed_outputs_clean.append((out_filename, out_bytes_clean))
 
-            # Side-by-Side Individual File Download Buttons
+            # Side-by-Side Individual File Download Buttons.
             dl_col1, dl_col2 = st.columns(2)
             with dl_col1:
                 st.download_button(
@@ -1499,16 +1451,17 @@ def show():
                 )
 
         except Exception as error:
+            # Isolate failures per-file so one bad upload doesn't block the rest of the batch.
             st.error(f"Error processing file {uploaded_file.name}: {error}")
 
-    # Bulk Download Options
+    # --- Bulk Download Options ---
     if processed_outputs_clean:
         st.markdown("---")
         st.header("📦 Bulk Download Options")
-        
+
         bulk_col1, bulk_col2 = st.columns(2)
 
-        # 1. Original ZIP File Download (Clean Files)
+        # 1. Original ZIP File Download (Clean Files).
         with bulk_col1:
             zip_filename = f"Questionwise_Processed_{datetime.now().strftime('%d-%m-%y_%H%M%S')}.zip"
             zip_bytes = create_zip_file(processed_outputs_clean)
@@ -1521,7 +1474,7 @@ def show():
                 key="dl_zip_all"
             )
 
-        # 2. Consolidated Multi-Sheet Excel Download
+        # 2. Consolidated Multi-Sheet Excel Download (only worth offering for 2+ files).
         with bulk_col2:
             if len(dfs_for_multi_sheet) > 1:
                 multi_sheet_bytes = create_consolidated_multi_sheet_excel(dfs_for_multi_sheet)
