@@ -900,12 +900,12 @@ def to_excel_bytes_formatted(df):
 
         fixed_15_cols = [
             "Semester Total Max Marks", "Internal Marks", 
-            "Total Max Marks", "Total Marks Obtained", "Grade", "Change %", "Email"
+            "Total Max Marks", "Total Marks Obtained", "Grade", "Change %"
         ]
 
         align_center_col_names = [
             "SrNo", "Subject code", "Grade", "Internal Marks", 
-            "Total Max Marks", "Semester Total Max Marks", "Total Marks Obtained", "Change %", "Email"
+            "Total Max Marks", "Semester Total Max Marks", "Total Marks Obtained", "Change %"
         ]
 
         for col_idx, col_name in enumerate(cols, start=1):
@@ -1109,12 +1109,12 @@ def create_consolidated_multi_sheet_excel(dfs_list):
 
             fixed_15_cols = [
                 "Semester Total Max Marks", "Internal Marks", 
-                "Total Max Marks", "Total Marks Obtained", "Grade", "Change %", "Email"
+                "Total Max Marks", "Total Marks Obtained", "Grade", "Change %"
             ]
 
             align_center_col_names = [
                 "SrNo", "Subject code", "Grade", "Internal Marks", 
-                "Total Max Marks", "Semester Total Max Marks", "Total Marks Obtained", "Change %", "Email"
+                "Total Max Marks", "Semester Total Max Marks", "Total Marks Obtained", "Change %"
             ]
 
             for col_idx, col_name in enumerate(cols, start=1):
