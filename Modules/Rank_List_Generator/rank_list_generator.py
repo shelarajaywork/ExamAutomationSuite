@@ -193,7 +193,7 @@ def generate_word_report(df_combined, college_name, academic_year):
     for prog in programs:
         prog_df = df_combined[df_combined['Program Name'] == prog]
         total_students = len(prog_df)
-        top_count = max(1, math.ceil(total_students * 0.05))
+        top_count = max(1, math.floor(total_students * 0.05 + 0.5))
         
         # Banner Row (0.9 cm height)
         banner_row = table.add_row()
@@ -488,7 +488,7 @@ def show():
             for prog in df_combined['Program Name'].unique():
                 prog_df = df_combined[df_combined['Program Name'] == prog]
                 tot = len(prog_df)
-                top = max(1, round(tot * 0.05))
+                top = max(1, math.floor(tot * 0.05 + 0.5))
                 summary_data.append({
                     "Program Name": prog,
                     "Total Students": tot,

@@ -87,6 +87,24 @@ except Exception as import_error:
 else:
     _cdg_import_error_message = None
 
+# Import Data Analysis module tool
+try:
+    from Modules.Data_Analysis.data_analysis import show as data_analysis
+except Exception as import_error:
+    data_analysis = None
+    _da_import_error_message = str(import_error)
+else:
+    _da_import_error_message = None
+
+# Import Merge Files module tool
+try:
+    from Modules.Merge_Files.merge_files import show as merge_files
+except Exception as import_error:
+    merge_files = None
+    _mf_import_error_message = str(import_error)
+else:
+    _mf_import_error_message = None
+
 
 # --------------------
 # Page Configuration
@@ -128,6 +146,7 @@ tools_list = [
     "🎓 Convocation Data Generator",
     "🔍 Duplicate Checker",
     "📊 Result Analysis",
+    "📈 Data Analysis",
     "🧹 Data Cleaner",
     "🔗 Merge Files",
     "☁️ SharePoint Import",
@@ -184,6 +203,10 @@ if st.session_state.selected_tool == "🏠 Dashboard":
         {
             "name": "📊 Result Analysis",
             "desc": "Analyze pass/fail statistics, subject performance, and score distributions.",
+        },
+        {
+            "name": "📈 Data Analysis",
+            "desc": "Upload Student Master Data, Gracing, GMR, or Moderation reports and view KPI & chart dashboards.",
         },
         {
             "name": "🧹 Data Cleaner",
@@ -337,6 +360,22 @@ elif st.session_state.selected_tool == "📊 Result Analysis":
     st.info("Tool under development")
 
 # --------------------
+# Data Analysis
+# --------------------
+elif st.session_state.selected_tool == "📈 Data Analysis":
+
+    if data_analysis is not None:
+        data_analysis()
+    else:
+        st.title("📈 Data Analysis")
+        st.error(
+            "This tool could not be loaded due to an import error:\n\n"
+            f"`{_da_import_error_message}`\n\n"
+            "Check that `Modules/Data_Analysis/data_analysis.py` exists, defines a `show()` function, "
+            "and that `plotly` is installed (add it to requirements.txt)."
+        )
+
+# --------------------
 # Data Cleaner
 # --------------------
 elif st.session_state.selected_tool == "🧹 Data Cleaner":
@@ -349,8 +388,15 @@ elif st.session_state.selected_tool == "🧹 Data Cleaner":
 # --------------------
 elif st.session_state.selected_tool == "🔗 Merge Files":
 
-    st.title("🔗 Merge Files")
-    st.info("Tool under development")
+    if merge_files is not None:
+        merge_files()
+    else:
+        st.title("🔗 Merge Files")
+        st.error(
+            "This tool could not be loaded due to an import error:\n\n"
+            f"`{_mf_import_error_message}`\n\n"
+            "Check that `Modules/Merge_Files/merge_files.py` exists and defines a `show()` function."
+        )
 
 # --------------------
 # SharePoint Import
