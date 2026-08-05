@@ -8,18 +8,23 @@ import streamlit as st
 
 # Distinct soft pastel hex colors for common-module groups
 PALETTE_HEX = [
-    "FFF2CC",  # Soft Yellow
-    "D9EAD3",  # Soft Green
-    "C9DAF8",  # Soft Blue
-    "F4CCCC",  # Soft Red
-    "EAD1DC",  # Soft Pink
-    "D9D2E9",  # Soft Purple
-    "FCE5CD",  # Soft Orange
-    "D0E0E3",  # Soft Cyan
-    "E2EFDA",  # Light Sage Green
-    "FCE4D6",  # Light Peach
-    "FFF2CC",  # Light Butter
-    "E2D0F4",  # Light Lavender
+    "6ECDDB",  # Pastel Ocean
+    "FFB347",  # Pastel Orange
+    "EBCCFF",  # Pastel Mauve
+    "B1C086",  # Pastel Avocado
+    "E99FAA",  # Pastel Rouge
+    "A4D8D8",  # Pastel Cyan
+    "CFAC94",  # Pastel Cinnamon
+    "AFC0EA",  # Pastel Denim
+    "D1FEB8",  # Pastel Lime
+    "F6B8D0",  # Pastel Rose
+    "DBDBDC",  # Pastel Silver
+    "FFA38C",  # Pastel Coral
+    "A5E3E0",  # Pastel Blue green
+    "FFDDB3",  # Pastel Caramel
+    "B0E9D5",  # Pastel Aquamarine
+    "FFA4A9",  # Pastel Tulip
+    "D0E9C0",  # Pastel Pistachio
 ]
 
 # ===================== HELPER FUNCTIONS =====================
