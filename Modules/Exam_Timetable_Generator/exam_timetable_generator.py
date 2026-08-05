@@ -167,6 +167,196 @@ def generate_time_options():
     return times
 
 
+# ===================== RE-EXAMINATION: DATA MERGE (ZREEXAM_REPORT + ZACAD_REPORT) =====================
+
+def _normalize_header(h) -> str:
+    """Normalises a column header for robust, whitespace/punctuation/case-insensitive
+    matching (e.g. 'School  Name', 'Is GR Applicable?', 'Exam mode' all normalise
+    to a consistent key)."""
+    s = str(h).strip().lower()
+    s = re.sub(r"[^a-z0-9]+", "", s)
+    return s
+
+
+def _find_column(columns, exact_candidates, prefix_candidates=None):
+    """Finds the actual column name in `columns` matching one of the normalized
+    exact_candidates. Falls back to a normalized-prefix match, which is useful for
+    headers that get truncated by the source system (e.g. source system exports
+    'Appraisal Descriptio' instead of 'Appraisal Description')."""
+    norm_map = {}
+    for c in columns:
+        norm_map.setdefault(_normalize_header(c), c)
+
+    for cand in exact_candidates:
+        if cand in norm_map:
+            return norm_map[cand]
+
+    if prefix_candidates:
+        for norm, orig in norm_map.items():
+            for prefix in prefix_candidates:
+                if norm.startswith(prefix):
+                    return orig
+    return None
+
+
+def normalize_reexam_acad_year(val) -> str:
+    """Extracts just the year portion from Re-exam Applications List 'Acad. Year'
+    values such as 'Acad .Year 2025-2026' -> '2025'."""
+    match = re.search(r"(\d{4})", str(val))
+    return match.group(1) if match else str(val).strip()
+
+
+def _clean_acad_report_year(val) -> str:
+    """Normalises the Academic Report's 'Current Academic Year' value to a bare
+    year string for key-matching (handles values read as int, float, or text)."""
+    try:
+        return str(int(float(val))).strip()
+    except (ValueError, TypeError):
+        return str(val).strip().upper()
+
+
+def build_reexam_merged_dataset(reexam_df: pd.DataFrame, acad_df: pd.DataFrame):
+    """Builds the merged, validated dataset needed to generate a Re-examination
+    Timetable from the Re-exam Applications List [ZREEXAM_REPORT] and the
+    Academic Report [ZACAD_REPORT].
+
+    Steps:
+      1. Filters the Re-exam Applications List to GR Applicable = 'YES' and
+         Appraisal Description = 'Sem Actual'.
+      2. Filters the Academic Report to Exam Mode = 'WRIT' and
+         Is GR Applicable? = 'Y'.
+      3. Normalises the Re-exam List's Acad. Year to just its year portion.
+      4. Builds a lookup key (Prog Code/Abbr + Module Code/Abbr + Session + Year)
+         on both sides and uses it to fetch School Name, Credit, Exam Mode, and
+         Exam Duration from the Academic Report for every Re-exam List record.
+
+    Returns (merged_df, error_message):
+      - merged_df has one row per filtered Re-exam Applications List record, with
+        an 'Incomplete Data' column ('Yes' when the lookup key could not be
+        matched in the Academic Report, 'No' otherwise). Unmatched fields are
+        left blank rather than raising an error, so every record is preserved
+        and visible.
+      - error_message is a string describing a fatal problem (e.g. a required
+        column could not be located in either file), or None on success.
+    """
+    # ---- Resolve Re-exam Applications List columns ----
+    r_prog_code = _find_column(reexam_df.columns, ["progcode"])
+    r_prog_name = _find_column(reexam_df.columns, ["progname"])
+    r_module_code = _find_column(reexam_df.columns, ["modulecode"])
+    r_module_name = _find_column(reexam_df.columns, ["modulename"])
+    r_student_number = _find_column(reexam_df.columns, ["studentnumber"])
+    r_roll_number = _find_column(reexam_df.columns, ["rollnumber"])
+    r_student_name = _find_column(reexam_df.columns, ["studentname"])
+    r_acad_year = _find_column(reexam_df.columns, ["acadyear"])
+    r_acad_session = _find_column(reexam_df.columns, ["acadsession"])
+    r_gr_applicable = _find_column(reexam_df.columns, ["grapplicable"])
+    r_appraisal_desc = _find_column(
+        reexam_df.columns, ["appraisaldescription"], prefix_candidates=["appraisaldescri"]
+    )
+
+    missing_reexam = []
+    for label, col in [
+        ("Prog. Code", r_prog_code), ("Prog. Name", r_prog_name),
+        ("Module code", r_module_code), ("Module name", r_module_name),
+        ("Student number", r_student_number), ("Roll number", r_roll_number),
+        ("Student name", r_student_name), ("Acad. Year", r_acad_year),
+        ("Acad. Session", r_acad_session), ("GR Applicable", r_gr_applicable),
+        ("Appraisal Description", r_appraisal_desc),
+    ]:
+        if not col:
+            missing_reexam.append(label)
+
+    # ---- Resolve Academic Report columns ----
+    a_school = _find_column(acad_df.columns, ["schoolname"])
+    a_prog_abbr = _find_column(acad_df.columns, ["programabbreviation"])
+    a_ay = _find_column(acad_df.columns, ["currentacademicyear"])
+    a_session = _find_column(acad_df.columns, ["currentsession"])
+    a_mod_abbr = _find_column(acad_df.columns, ["moduleabbreviation"])
+    a_credit = _find_column(acad_df.columns, ["credit"])
+    a_gr_applicable = _find_column(acad_df.columns, ["isgrapplicable"])
+    a_exam_mode = _find_column(acad_df.columns, ["exammode"])
+    a_exam_duration = _find_column(acad_df.columns, ["examduration"])
+
+    missing_acad = []
+    for label, col in [
+        ("School Name", a_school), ("Program Abbreviation", a_prog_abbr),
+        ("Current Academic Year", a_ay), ("Current Session", a_session),
+        ("Module Abbreviation", a_mod_abbr), ("Credit", a_credit),
+        ("Is GR Applicable?", a_gr_applicable), ("Exam Mode", a_exam_mode),
+        ("Exam Duration", a_exam_duration),
+    ]:
+        if not col:
+            missing_acad.append(label)
+
+    if missing_reexam or missing_acad:
+        parts = []
+        if missing_reexam:
+            parts.append(f"Re-exam Applications List is missing: {', '.join(missing_reexam)}")
+        if missing_acad:
+            parts.append(f"Academic Report is missing: {', '.join(missing_acad)}")
+        return None, " | ".join(parts)
+
+    # ---- Filter source data per the required business rules ----
+    reexam_f = reexam_df[
+        (reexam_df[r_gr_applicable].astype(str).str.strip().str.upper() == "YES") &
+        (reexam_df[r_appraisal_desc].astype(str).str.strip().str.upper() == "SEM ACTUAL")
+    ].copy()
+
+    acad_f = acad_df[
+        (acad_df[a_exam_mode].astype(str).str.strip().str.upper() == "WRIT") &
+        (acad_df[a_gr_applicable].astype(str).str.strip().str.upper() == "Y")
+    ].copy()
+
+    if reexam_f.empty:
+        return pd.DataFrame(), None
+
+    # ---- Build lookup keys: Prog Code/Abbr + Module Code/Abbr + Session + Year ----
+    reexam_f["_Normalized Acad Year"] = reexam_f[r_acad_year].apply(normalize_reexam_acad_year)
+    reexam_f["_lookup_key"] = (
+        reexam_f[r_prog_code].astype(str).str.strip().str.upper() + "|" +
+        reexam_f[r_module_code].astype(str).str.strip().str.upper() + "|" +
+        reexam_f[r_acad_session].astype(str).str.strip().str.upper() + "|" +
+        reexam_f["_Normalized Acad Year"]
+    )
+
+    acad_f["_lookup_key"] = (
+        acad_f[a_prog_abbr].astype(str).str.strip().str.upper() + "|" +
+        acad_f[a_mod_abbr].astype(str).str.strip().str.upper() + "|" +
+        acad_f[a_session].astype(str).str.strip().str.upper() + "|" +
+        acad_f[a_ay].apply(_clean_acad_report_year)
+    )
+
+    # Keep the first match only, in case of duplicate keys on the Academic Report side
+    acad_lookup = acad_f.drop_duplicates(subset="_lookup_key", keep="first").set_index("_lookup_key")
+
+    # ---- Merge: fetch School Name, Credit, Exam Mode, and Exam Duration for every record ----
+    merged_rows = []
+    for _, r in reexam_f.iterrows():
+        key = r["_lookup_key"]
+        match = acad_lookup.loc[key] if key in acad_lookup.index else None
+        incomplete = match is None
+
+        merged_rows.append({
+            "School Name": match[a_school] if match is not None else "",
+            "Program Abbreviation": str(r[r_prog_code]).strip(),
+            "Program Name": str(r[r_prog_name]).strip(),
+            "Current Academic Year": r["_Normalized Acad Year"],
+            "Current Session": str(r[r_acad_session]).strip(),
+            "Module Abbreviation": str(r[r_module_code]).strip(),
+            "Module Description": str(r[r_module_name]).strip(),
+            "Credit": match[a_credit] if match is not None else "",
+            "Student Number": str(r[r_student_number]).strip(),
+            "Student Roll Number": str(r[r_roll_number]).strip(),
+            "Student Name": str(r[r_student_name]).strip(),
+            "Exam Mode": match[a_exam_mode] if match is not None else "",
+            "Exam Duration": match[a_exam_duration] if match is not None else "",
+            "Incomplete Data": "Yes" if incomplete else "No",
+        })
+
+    merged_df = pd.DataFrame(merged_rows)
+    return merged_df, None
+
+
 # ===================== CORE SCHEDULING ALGORITHM =====================
 
 def generate_timetable(
@@ -627,7 +817,7 @@ def main():
             exam_start_date = st.date_input(
                 "Exam Start Date:",
                 value=datetime.date.today(),
-                format="DD-MM-YYYY",
+                format="DD/MM/YYYY",
                 help="Select the starting date for the examination schedule."
             )
 
@@ -769,87 +959,160 @@ def main():
     # --- CONDITIONAL DATA PROCESSING SECTIONS ---
     if uploaded_files:
         try:
-            df_list = [pd.read_excel(file) for file in uploaded_files]
-            df_input = pd.concat(df_list, ignore_index=True)
-            
-            st.success(f"Successfully loaded {len(uploaded_files)} file(s) with a total of {len(df_input)} rows.")
+            incomplete_df = None
 
-            with st.expander("Preview Combined Data"):
-                st.dataframe(df_input.head(10))
+            if not is_reexam:
+                # ---- Regular Examination: unchanged from the original working logic ----
+                df_list = [pd.read_excel(file) for file in uploaded_files]
+                df_input = pd.concat(df_list, ignore_index=True)
 
-            if st.button("🚀 Generate Timetable", type="primary"):
-                with st.spinner("Building conflict graph and calculating schedules..."):
-                    result_df, common_module_color_map = generate_timetable(
-                        df=df_input,
-                        is_reexam=is_reexam,
-                        start_date=exam_start_date,
-                        start_time_str=exam_start_time_str,
-                        fuzzy_threshold=fuzzy_threshold,
-                        manual_module_map=manual_module_map,
-                        excluded_dates=excluded_dates
+                st.success(f"Successfully loaded {len(uploaded_files)} file(s) with a total of {len(df_input)} rows.")
+
+            else:
+                # ---- Re-Examination: merge the Re-exam Applications List with the Academic Report ----
+                if not reexam_list_files or not acad_report_files:
+                    st.warning(
+                        "Please upload both the Re-exam Applications List [ZREEXAM_REPORT] and the "
+                        "Academic Report [ZACAD_REPORT] to proceed."
+                    )
+                    df_input = pd.DataFrame()
+                else:
+                    reexam_raw_df = pd.concat(
+                        [pd.read_excel(f) for f in reexam_list_files], ignore_index=True
+                    )
+                    acad_raw_df = pd.concat(
+                        [pd.read_excel(f) for f in acad_report_files], ignore_index=True
                     )
 
-                if result_df is not None and not result_df.empty:
-                    st.success("Timetable generated successfully!")
-                    
-                    st.subheader(f"Generated Schedule ({exam_type})")
-                    st.dataframe(result_df, use_container_width=True)
+                    merged_df, merge_error = build_reexam_merged_dataset(reexam_raw_df, acad_raw_df)
 
-                    # Export to Excel with custom formatting
-                    output_bytes = io.BytesIO()
-                    with pd.ExcelWriter(output_bytes, engine="openpyxl") as writer:
-                        sheet_name = "Re-Examination" if is_reexam else "Regular Examination"
-                        result_df.to_excel(writer, index=False, sheet_name=sheet_name)
-                        
-                        workbook = writer.book
-                        worksheet = writer.sheets[sheet_name]
-                        
-                        # Freeze top header row
-                        worksheet.freeze_panes = "A2"
-                        
-                        from openpyxl.styles import Font, PatternFill
-                        
-                        header_font = Font(bold=True)
-                        header_fill = PatternFill(start_color="D3D3D3", end_color="D3D3D3", fill_type="solid")
-                        
-                        for col_num in range(1, len(result_df.columns) + 1):
-                            cell = worksheet.cell(row=1, column=col_num)
-                            cell.font = header_font
-                            cell.fill = header_fill
-
-                        # Apply Short Date format (DD-MM-YYYY) to 'Exam Date' column
-                        date_col_idx = result_df.columns.get_loc("Exam Date") + 1
-                        for row_num in range(2, len(result_df) + 2):
-                            cell = worksheet.cell(row=row_num, column=date_col_idx)
-                            if cell.value:
-                                cell.number_format = "DD-MM-YYYY"
-
-                        # Apply Color-Coding for Common Modules in Main Output Sheet
-                        if common_module_color_map:
-                            desc_col_idx = result_df.columns.get_loc("Module Description") + 1
-                            for row_num in range(2, len(result_df) + 2):
-                                cell = worksheet.cell(row=row_num, column=desc_col_idx)
-                                mod_val = str(cell.value).strip() if cell.value else ""
-                                if mod_val in common_module_color_map:
-                                    fill_hex = common_module_color_map[mod_val]
-                                    cell.fill = PatternFill(start_color=fill_hex, end_color=fill_hex, fill_type="solid")
-
-                        # Add the pivot-style "Timetable" worksheet with color-coding and "--" empty slots
-                        build_timetable_sheet(workbook, result_df, common_module_color_map)
-
-                    # Dynamic Output File Name
-                    curr_date_str = datetime.date.today().strftime("%d-%m-%Y")
-                    if not is_reexam:
-                        file_name = f"Regular Examination Timetable {curr_date_str}.xlsx"
+                    if merge_error:
+                        st.error(f"Could not process the uploaded files: {merge_error}")
+                        df_input = pd.DataFrame()
+                    elif merged_df.empty:
+                        st.warning(
+                            "No records matched the required filters (GR Applicable = YES and "
+                            "Appraisal Description = Sem Actual in the Re-exam Applications List)."
+                        )
+                        df_input = pd.DataFrame()
                     else:
-                        file_name = f"Re-examination Timetable {curr_date_str}.xlsx"
-                    
-                    st.download_button(
-                        label="📥 Download Timetable Excel",
-                        data=output_bytes.getvalue(),
-                        file_name=file_name,
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                    )
+                        incomplete_df = merged_df[merged_df["Incomplete Data"] == "Yes"].reset_index(drop=True)
+                        df_input = (
+                            merged_df[merged_df["Incomplete Data"] == "No"]
+                            .drop(columns=["Incomplete Data"])
+                            .reset_index(drop=True)
+                        )
+
+                        summary_msg = (
+                            f"Successfully processed {len(reexam_list_files)} Re-exam Applications List "
+                            f"file(s) and {len(acad_report_files)} Academic Report file(s): "
+                            f"{len(df_input)} record(s) ready for scheduling"
+                        )
+                        if not incomplete_df.empty:
+                            summary_msg += f", {len(incomplete_df)} flagged as Incomplete Data."
+                        else:
+                            summary_msg += "."
+                        st.success(summary_msg)
+
+                        if not incomplete_df.empty:
+                            st.warning(
+                                f"⚠️ {len(incomplete_df)} record(s) from the Re-exam Applications List could "
+                                "not be matched with a corresponding Academic Report record (missing or "
+                                "unmatched Prog. Code + Module code + Acad. Session + Acad. Year key). "
+                                "These records are flagged as **Incomplete Data**, excluded from the "
+                                "generated timetable, and listed below for review. They are also included "
+                                "in a separate 'Incomplete Data' sheet in the downloaded workbook."
+                            )
+                            with st.expander(f"⚠️ View Incomplete Data ({len(incomplete_df)} record(s))"):
+                                st.dataframe(incomplete_df, use_container_width=True)
+
+            if not df_input.empty:
+                with st.expander("Preview Combined Data"):
+                    st.dataframe(df_input.head(10))
+
+                if st.button("🚀 Generate Timetable", type="primary"):
+                    with st.spinner("Building conflict graph and calculating schedules..."):
+                        result_df, common_module_color_map = generate_timetable(
+                            df=df_input,
+                            is_reexam=is_reexam,
+                            start_date=exam_start_date,
+                            start_time_str=exam_start_time_str,
+                            fuzzy_threshold=fuzzy_threshold,
+                            manual_module_map=manual_module_map,
+                            excluded_dates=excluded_dates
+                        )
+
+                    if result_df is not None and not result_df.empty:
+                        st.success("Timetable generated successfully!")
+                        
+                        st.subheader(f"Generated Schedule ({exam_type})")
+                        st.dataframe(result_df, use_container_width=True)
+
+                        # Export to Excel with custom formatting
+                        output_bytes = io.BytesIO()
+                        with pd.ExcelWriter(output_bytes, engine="openpyxl") as writer:
+                            sheet_name = "Re-Examination" if is_reexam else "Regular Examination"
+                            result_df.to_excel(writer, index=False, sheet_name=sheet_name)
+                            
+                            workbook = writer.book
+                            worksheet = writer.sheets[sheet_name]
+                            
+                            # Freeze top header row
+                            worksheet.freeze_panes = "A2"
+                            
+                            from openpyxl.styles import Font, PatternFill
+                            
+                            header_font = Font(bold=True)
+                            header_fill = PatternFill(start_color="D3D3D3", end_color="D3D3D3", fill_type="solid")
+                            
+                            for col_num in range(1, len(result_df.columns) + 1):
+                                cell = worksheet.cell(row=1, column=col_num)
+                                cell.font = header_font
+                                cell.fill = header_fill
+
+                            # Apply Short Date format (DD-MM-YYYY) to 'Exam Date' column
+                            date_col_idx = result_df.columns.get_loc("Exam Date") + 1
+                            for row_num in range(2, len(result_df) + 2):
+                                cell = worksheet.cell(row=row_num, column=date_col_idx)
+                                if cell.value:
+                                    cell.number_format = "DD-MM-YYYY"
+
+                            # Apply Color-Coding for Common Modules in Main Output Sheet
+                            if common_module_color_map:
+                                desc_col_idx = result_df.columns.get_loc("Module Description") + 1
+                                for row_num in range(2, len(result_df) + 2):
+                                    cell = worksheet.cell(row=row_num, column=desc_col_idx)
+                                    mod_val = str(cell.value).strip() if cell.value else ""
+                                    if mod_val in common_module_color_map:
+                                        fill_hex = common_module_color_map[mod_val]
+                                        cell.fill = PatternFill(start_color=fill_hex, end_color=fill_hex, fill_type="solid")
+
+                            # Add the pivot-style "Timetable" worksheet with color-coding and "--" empty slots
+                            build_timetable_sheet(workbook, result_df, common_module_color_map)
+
+                            # Include unmatched Re-exam Applications List records for transparency
+                            if is_reexam and incomplete_df is not None and not incomplete_df.empty:
+                                incomplete_df.to_excel(writer, index=False, sheet_name="Incomplete Data")
+                                incomplete_ws = writer.sheets["Incomplete Data"]
+                                incomplete_ws.freeze_panes = "A2"
+                                for col_num in range(1, len(incomplete_df.columns) + 1):
+                                    cell = incomplete_ws.cell(row=1, column=col_num)
+                                    cell.font = header_font
+                                    cell.fill = header_fill
+
+                        # Dynamic Output File Name
+                        curr_date_str = datetime.date.today().strftime("%d-%m-%Y")
+                        if not is_reexam:
+                            file_name = f"Regular Examination Timetable {curr_date_str}.xlsx"
+                        else:
+                            file_name = f"Re-examination Timetable {curr_date_str}.xlsx"
+                        
+                        st.download_button(
+                            label="📥 Download Timetable Excel",
+                            data=output_bytes.getvalue(),
+                            file_name=file_name,
+                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                        )
 
         except Exception as e:
             st.error(f"Error processing files: {e}")
