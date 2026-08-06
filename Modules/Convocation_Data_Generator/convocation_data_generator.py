@@ -52,8 +52,15 @@ TARGET_COLUMNS = [
     "COLL_NO", "COLL_NAME", "COLL_NAMEM", "STUDLASTNAME", "STUDFIRSTNAME",
     "STUDMIDDDLENAME", "STUDMOTHERNAME", "NAME", "NAME_MARAT", "SEX", "ABBR",
     "CLASS", "CGPA", "MCLASS", "SUB1", "SUB1_NAME", "SUB1_NAMEM", "SUB2", "SUB2_NAME",
-    "SUB2_NAMEM", "DEGNM", "MDEGNM", "SUBDEGNM", "MSUBDEGNM", "MONTH", "MMONTH"
+    "SUB2_NAMEM", "DEGNM", "MDEGNM", "SUBDEGNM", "MSUBDEGNM", "MONTH", "MMONTH",
+    "CGPA Source File"
 ]
+
+# Internal-only column name used while merging MKCL files to remember which
+# uploaded MKCL Report file each row's CGPA value came from. This is never
+# shown to the user directly -- it is copied into the "CGPA Source File"
+# output column and then dropped from any intermediate/exception views.
+_CGPA_SOURCE_FILE_INTERNAL_COL = "__CGPA_SOURCE_FILE__"
 
 MKCL_SOURCE_MAPPING = {
     "Student Number": "SEAT_NO",
@@ -439,7 +446,14 @@ def process_data(mkcl_files, student_lookup, college_choice, progress_callback=N
             total_mkcl_raw_rows += len(df)
 
             df.columns = [str(c).replace("\xa0", " ").strip() for c in df.columns]
-            
+
+            # Remember which uploaded MKCL Report file each row came from,
+            # so the CGPA value's source file can be reported later. Set
+            # before filtering so the tag stays aligned row-for-row as
+            # rows get dropped below.
+            source_file_name = getattr(file, "name", str(file))
+            df[_CGPA_SOURCE_FILE_INTERNAL_COL] = source_file_name
+
             # 1. Convocation Number filter: must be blank/null/empty
             conv_col = next((c for c in df.columns if c.lower() == "convocation number"), None)
             if conv_col:
@@ -498,7 +512,9 @@ def process_data(mkcl_files, student_lookup, college_choice, progress_callback=N
         else:
             unmatched_count += 1
             deg_names.append("")
-            unmatched_rows.append(row.to_dict())
+            unmatched_row_dict = row.to_dict()
+            unmatched_row_dict.pop(_CGPA_SOURCE_FILE_INTERNAL_COL, None)
+            unmatched_rows.append(unmatched_row_dict)
 
         if progress_callback and (row_idx % progress_interval == 0 or row_idx == total_match_rows):
             progress_callback("match", row_idx / total_match_rows)
@@ -518,6 +534,9 @@ def process_data(mkcl_files, student_lookup, college_choice, progress_callback=N
 
     out_df["DEGNM"] = merged_mkcl["DEGNM"].astype(str).str.strip()
     out_df["PROGTYPE"] = "DEGREE"
+
+    if _CGPA_SOURCE_FILE_INTERNAL_COL in merged_mkcl.columns:
+        out_df["CGPA Source File"] = merged_mkcl[_CGPA_SOURCE_FILE_INTERNAL_COL].astype(str).str.strip()
 
     if college_choice == "Narsee Monjee College of Commerce & Economics (Empowered Autonomous)":
         out_df["COLL_NO"] = "205"
@@ -570,6 +589,9 @@ def generate_formatted_excel(df: pd.DataFrame, progress_callback=None) -> bytes:
 
     font_regular = Font(name="Times New Roman", size=11, bold=False)
     font_header = Font(name="Times New Roman", size=11, bold=True)
+    # "CGPA Source File" column: italic font with grey font color, so users
+    # can see at a glance which MKCL Report file each CGPA value came from.
+    font_cgpa_source_file = Font(name="Times New Roman", size=11, italic=True, color="808080")
     header_fill = PatternFill(start_color="D9D9D9", end_color="D9D9D9", fill_type="solid")
     
     header_align = Alignment(horizontal="center", vertical="center", wrap_text=False)
@@ -593,9 +615,18 @@ def generate_formatted_excel(df: pd.DataFrame, progress_callback=None) -> bytes:
     for row_values in df.itertuples(index=False):
         ws.append(list(row_values))
 
+    cgpa_source_file_col_idx = (
+        list(df.columns).index("CGPA Source File") + 1
+        if "CGPA Source File" in df.columns else None
+    )
+
     for row in ws.iter_rows(min_row=2, max_row=ws.max_row, min_col=1, max_col=ws.max_column):
         for cell in row:
-            cell.font = font_regular
+            cell.font = (
+                font_cgpa_source_file
+                if cgpa_source_file_col_idx is not None and cell.column == cgpa_source_file_col_idx
+                else font_regular
+            )
             cell.border = cell_border
             if cell.column_letter in ["A", "B", "E", "G", "H", "Q", "AE"]:
                 cell.alignment = center_align
@@ -798,7 +829,16 @@ def show():
                 st.error("❌ No valid output records generated. Please verify your filter criteria or uploaded files.")
             else:
                 st.subheader("Final Processed Data Preview")
-                st.dataframe(final_df, use_container_width=True)
+                if "CGPA Source File" in final_df.columns:
+                    styler = final_df.style
+                    style_fn = getattr(styler, "map", None) or styler.applymap
+                    preview_df = style_fn(
+                        lambda _: "font-style: italic; color: grey;",
+                        subset=["CGPA Source File"]
+                    )
+                else:
+                    preview_df = final_df
+                st.dataframe(preview_df, use_container_width=True)
 
                 excel_data = generate_formatted_excel(
                     final_df,
