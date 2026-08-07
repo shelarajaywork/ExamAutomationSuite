@@ -1,5 +1,6 @@
-[ui]
-hideTopBar = true
-
 [client]
 showErrorDetails = false
+toolbarMode = "minimal"
+
+[ui]
+hideTopBar = true

@@ -115,6 +115,26 @@ st.set_page_config(
     layout="wide",
 )
 
+import streamlit as st
+
+st.set_page_config(page_title="Exam Timetable Generator", layout="wide")
+
+# Hide header, main menu, footer, and viewer badge ("Hosted by Streamlit")
+hide_streamlit_style = """
+    <style>
+    #MainMenu {visibility: hidden;}
+    footer {visibility: hidden;}
+    header {visibility: hidden;}
+    .viewerBadge_container__1S-5D, .viewerBadge_link__1S-5D, [data-testid="stStatusWidget"] {
+        display: none !important;
+    }
+    div[class*="viewerBadge"] {
+        display: none !important;
+    }
+    </style>
+"""
+st.markdown(hide_streamlit_style, unsafe_allow_html=True)
+
 # --------------------
 # Shared Session State
 # --------------------
