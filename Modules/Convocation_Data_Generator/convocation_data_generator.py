@@ -14,22 +14,12 @@ import streamlit as st
 # ==========================================
 # OPTIONAL DEPENDENCY: deep_translator
 # ==========================================
-# The plugin/module loader that scans for show()/main() has to *import*
-# this file first. A top-level `from deep_translator import GoogleTranslator`
-# means: if that package isn't installed in the hosting environment, the
-# import blows up before show() is ever discovered. To avoid that, the
-# translator is created lazily (only the first time it's actually needed)
-# and any import/init failure is caught instead of crashing the module.
 _translator = None
 _translator_unavailable = False
 
 
 def _get_translator():
-    """Lazily create and cache the GoogleTranslator instance.
-
-    Returns None (and remembers the failure) if deep_translator is not
-    installed or fails to initialize, instead of raising.
-    """
+    """Lazily create and cache the GoogleTranslator instance."""
     global _translator, _translator_unavailable
     if _translator is not None:
         return _translator
@@ -48,7 +38,7 @@ def _get_translator():
 # 1. REQUIRED OUTPUT COLUMNS SPECIFICATION
 # ==========================================
 TARGET_COLUMNS = [
-    "LOTNO", "CONVID", "FACULTY", "PRNERN", "PROGTYPE", "APPL_NO", "SEAT_NO",
+    "LOTNO", "CONVID", "FACULTY", "PRNERN", "APAAR ID", "PROGTYPE", "APPL_NO", "SEAT_NO",
     "COLL_NO", "COLL_NAME", "COLL_NAMEM", "STUDLASTNAME", "STUDFIRSTNAME",
     "STUDMIDDDLENAME", "STUDMOTHERNAME", "NAME", "NAME_MARAT", "SEX", "ABBR",
     "CLASS", "CGPA", "MCLASS", "SUB1", "SUB1_NAME", "SUB1_NAMEM", "SUB2", "SUB2_NAME",
@@ -56,10 +46,6 @@ TARGET_COLUMNS = [
     "CGPA Source File"
 ]
 
-# Internal-only column name used while merging MKCL files to remember which
-# uploaded MKCL Report file each row's CGPA value came from. This is never
-# shown to the user directly -- it is copied into the "CGPA Source File"
-# output column and then dropped from any intermediate/exception views.
 _CGPA_SOURCE_FILE_INTERNAL_COL = "__CGPA_SOURCE_FILE__"
 
 MKCL_SOURCE_MAPPING = {
@@ -76,11 +62,6 @@ MKCL_SOURCE_MAPPING = {
 # 2. ROBUST DATA CLEANING & MATCHING HELPERS
 # ==========================================
 def sanitize_key(val) -> str:
-    """
-    Solves the Excel XLOOKUP mismatch by coercing integers, floats,
-    text strings, scientific notation, and non-breaking spaces into 
-    a single clean, uniform string key.
-    """
     if pd.isna(val) or val is None:
         return ""
     
@@ -99,30 +80,10 @@ def sanitize_key(val) -> str:
 
 
 # ==========================================
-# NAME_MARAT: Google Translate (deep_translator), robust + patient
+# NAME_MARAT & MMONTH TRANSLITERATION
 # ==========================================
-# Primary path is deep_translator's GoogleTranslator, since it produces far
-# more natural/correct Marathi renderings of names than a purely mechanical
-# phonetic mapping. It's made robust with generous retries and backoff --
-# it's fine for this to take a while, since correctness matters more than
-# speed here. The offline phonetic converter below is kept only as a last
-# resort, used solely if Google Translate is completely unreachable (e.g.
-# deep_translator isn't installed, or every retry fails), so NAME_MARAT is
-# still never left blank.
 @lru_cache(maxsize=4096)
 def _translate_cached(clean_name: str) -> str:
-    """Cached Google Translate lookup so repeated names across rows only
-    hit the API once.
-
-    Retries with exponential backoff (up to ~1 minute of total waiting
-    across attempts) before giving up, since the free Google Translate
-    endpoint used by deep_translator occasionally times out or
-    rate-limits a single call even when the service is otherwise fine.
-    We deliberately favor patience over speed here: getting the correct
-    Marathi name is worth the extra seconds. Returns "" only if every
-    attempt fails, in which case the caller falls back to the offline
-    transliterator so NAME_MARAT is still populated.
-    """
     translator = _get_translator()
     if translator is None:
         return ""
@@ -140,6 +101,8 @@ def _translate_cached(clean_name: str) -> str:
             time.sleep(backoff_seconds)
             backoff_seconds = min(backoff_seconds * 2, 15.0)
     return ""
+
+
 _OFFLINE_VOWELS_INDEPENDENT = [
     ("aa", "आ"), ("ee", "ई"), ("oo", "ऊ"), ("ai", "ऐ"), ("au", "औ"),
     ("a", "अ"), ("i", "इ"), ("u", "उ"), ("e", "ए"), ("o", "ओ"),
@@ -161,13 +124,11 @@ _OFFLINE_CONSONANTS = [
 
 
 def _offline_transliterate_word(word: str) -> str:
-    """Phonetically converts a single alphabetic English word/name into
-    Devanagari using a greedy longest-match consonant/vowel mapping."""
     w = word.lower()
     n = len(w)
     i = 0
     out = []
-    pending_consonant = None  # Devanagari consonant awaiting a vowel matra
+    pending_consonant = None
 
     def flush_pending():
         if pending_consonant is not None:
@@ -176,7 +137,6 @@ def _offline_transliterate_word(word: str) -> str:
     while i < n:
         matched = False
 
-        # Try consonant matches first (longest match wins)
         for length in (3, 2, 1):
             chunk = w[i:i + length]
             for latin, dev in _OFFLINE_CONSONANTS:
@@ -191,7 +151,6 @@ def _offline_transliterate_word(word: str) -> str:
         if matched:
             continue
 
-        # Try vowel matches
         for length in (2, 1):
             chunk = w[i:i + length]
             for latin, dev in _OFFLINE_VOWELS_MATRA:
@@ -212,13 +171,9 @@ def _offline_transliterate_word(word: str) -> str:
         if matched:
             continue
 
-        # Unrecognized character (digits, punctuation, apostrophes, etc.)
-        # -- skip it but keep any pending consonant so we don't lose it.
         i += 1
 
     if pending_consonant is not None:
-        # Word ends on a bare consonant: attach halant (virama) since the
-        # inherent schwa is silent at the end of transliterated names.
         out.append(pending_consonant + "्")
 
     return "".join(out)
@@ -226,12 +181,9 @@ def _offline_transliterate_word(word: str) -> str:
 
 @lru_cache(maxsize=4096)
 def _offline_transliterate_cached(clean_name: str) -> str:
-    """Cached offline transliteration for a full name (handles multiple
-    space-separated words, e.g. first/middle/last name)."""
     words = [w for w in re.split(r"\s+", clean_name.strip()) if w]
     converted = []
     for word in words:
-        # Preserve non-alphabetic tokens as-is (e.g. initials with dots).
         alpha_only = re.sub(r"[^A-Za-z]", "", word)
         if not alpha_only:
             converted.append(word)
@@ -241,19 +193,6 @@ def _offline_transliterate_cached(clean_name: str) -> str:
 
 
 def transliterate_name_to_marathi(name_str: str) -> str:
-    """
-    Converts an English student name into Marathi Devanagari script.
-
-    Primary path: deep_translator's GoogleTranslator, called with generous
-    retries/backoff so transient timeouts or rate-limiting don't cause a
-    blank result -- it's fine for this to take a bit longer, we'd rather
-    wait than get a wrong or empty answer.
-
-    Fallback: if Google Translate is unavailable or every retry fails
-    (e.g. no network, deep_translator not installed), an offline
-    rule-based phonetic transliterator is used instead, purely so
-    NAME_MARAT is never left blank.
-    """
     if pd.isna(name_str) or not str(name_str).strip():
         return ""
     clean_name = str(name_str).strip()
@@ -266,12 +205,6 @@ def transliterate_name_to_marathi(name_str: str) -> str:
 
 
 def derive_faculty(degnm: str) -> str:
-    """
-    Derive Faculty based on keywords/patterns in DEGNM (case-insensitive):
-    - Commerce & Management: COMMERCE, Management, Finance, Economics, B.Com, BCom
-    - Science & Technology: SCIENCE, BSc, B.Sc, B.Sc.
-    - Humanities: ARTS, B.A.
-    """
     if pd.isna(degnm) or not str(degnm).strip():
         return ""
     
@@ -281,11 +214,11 @@ def derive_faculty(degnm: str) -> str:
     if re.search(commerce_pattern, degnm_str):
         return "Commerce & Management"
         
-    science_pattern = r'(?i)\b(science|artificial|intelligent|data|b\.?sc\.?|m\.?sc\.?)\b'
+    science_pattern = r'(?i)\b(science|artificial|intelligent|biochemistry|data|technology|b\.?sc\.?|m\.?sc\.?)\b'
     if re.search(science_pattern, degnm_str):
         return "Science & Technology"
         
-    Humanities_pattern = r'(?i)\b(arts|entertainment|media|film|b\.?a\.?|m\.?a\.?)\b'
+    Humanities_pattern = r'(?i)\b(arts|entertainment|media|multimedia|film|television|advertising|b\.?a\.?|m\.?a\.?)\b'
     if re.search(Humanities_pattern, degnm_str):
         return "Humanities"
         
@@ -293,11 +226,6 @@ def derive_faculty(degnm: str) -> str:
 
 
 def derive_subdegnm(degnm: str) -> str:
-    """
-    Derive SUBDEGNM based on degree level:
-    - Master/Masters/begins with 'M' -> 'Two Year Degree Course'
-    - Bachelor/Bachelors/begins with 'B' -> 'Three Year Degree Course'
-    """
     if pd.isna(degnm) or not str(degnm).strip():
         return ""
     
@@ -311,7 +239,6 @@ def derive_subdegnm(degnm: str) -> str:
 
 
 def map_gender(val) -> str:
-    """Convert Gender values to SEX: Male = 1 and Female = 2."""
     if pd.isna(val):
         return ""
     
@@ -329,10 +256,10 @@ MARATHI_DIGIT_MAP = {
 }
 
 
-def convert_cgpa_to_marathi(val) -> str:
+def convert_digits_to_marathi(val) -> str:
     """
-    Convert a CGPA value's digits into Marathi (Devanagari) numerals.
-    e.g. 7.84 -> ७.८४. Non-digit characters (like '.') are preserved as-is.
+    Convert English digits in a string into Marathi (Devanagari) numerals.
+    e.g. MARCH 2026 / मार्च 2026 -> मार्च २०२६
     """
     if pd.isna(val) or not str(val).strip():
         return ""
@@ -342,7 +269,6 @@ def convert_cgpa_to_marathi(val) -> str:
 
 
 def format_class_grade(val) -> str:
-    """Format CLASS grade values (e.g., "'A' Grade", "'B+' Grade")."""
     if pd.isna(val) or not str(val).strip():
         return ""
     
@@ -357,7 +283,6 @@ def format_class_grade(val) -> str:
 # 3. DYNAMIC MASTER LOOKUP MAP CREATION
 # ==========================================
 def find_priority_column(columns, keyword_groups):
-    """Finds the best-matching column from a list of priority keyword groups."""
     cols_lower = {c: c.lower() for c in columns}
     for keywords in keyword_groups:
         for c in columns:
@@ -370,11 +295,7 @@ def find_priority_column(columns, keyword_groups):
 def build_master_lookup(master_files, progress_callback=None):
     """
     Reads all uploaded Student Master Data files across all sheets.
-    Builds Student Number -> Program Name dictionary.
-
-    progress_callback, if provided, is called as progress_callback(fraction)
-    with fraction in [0, 1] after each master file finishes processing. It is
-    purely optional and does not change any existing behavior when omitted.
+    Builds Student Number -> {"program": ..., "abc_id": ...} dictionary.
     """
     student_lookup = {}
     master_records_count = 0
@@ -407,12 +328,28 @@ def build_master_lookup(master_files, progress_callback=None):
             if not prog_col and len(df_master.columns) >= 204:
                 prog_col = df_master.columns[203]
 
+            abc_col = find_priority_column(
+                df_master.columns,
+                [
+                    ["abc id"], ["abc_id"], ["abcid"],
+                    ["apaar id"], ["apaar_id"], ["apaarid"],
+                    ["abc id/apaar id"], ["abc"]
+                ]
+            )
+
             if stu_col and prog_col:
                 for _, row in df_master.iterrows():
                     key = sanitize_key(row[stu_col])
                     prog_val = row[prog_col]
+                    abc_val = str(row[abc_col]).strip() if (abc_col and pd.notna(row[abc_col])) else ""
+                    if abc_val.lower() == "nan":
+                        abc_val = ""
+
                     if key and pd.notna(prog_val) and str(prog_val).strip():
-                        student_lookup[key] = str(prog_val).strip()
+                        student_lookup[key] = {
+                            "program": str(prog_val).strip(),
+                            "abc_id": abc_val
+                        }
 
         if progress_callback:
             progress_callback(file_idx / total_master_files)
@@ -424,17 +361,6 @@ def build_master_lookup(master_files, progress_callback=None):
 # 4. CORE ETL & MERGE PROCESSING
 # ==========================================
 def process_data(mkcl_files, student_lookup, college_choice, progress_callback=None):
-    """
-    Merges MKCL files across sheets, performs Python lookup for DEGNM,
-    applies dynamic row filtering (Convocation Number blank, CGPA and all existing 
-    SEM_GPA columns present), eliminates duplicate rows, and sorts by SEAT_NO.
-
-    progress_callback, if provided, is called as
-    progress_callback(stage, fraction) where stage is "read" (reading/filtering
-    the MKCL files) or "match" (matching each student against the master
-    lookup), and fraction is in [0, 1] for that stage. Purely optional and
-    does not change any existing behavior when omitted.
-    """
     mkcl_dfs = []
     total_mkcl_raw_rows = 0
     total_mkcl_files = len(mkcl_files) or 1
@@ -447,10 +373,6 @@ def process_data(mkcl_files, student_lookup, college_choice, progress_callback=N
 
             df.columns = [str(c).replace("\xa0", " ").strip() for c in df.columns]
 
-            # Remember which uploaded MKCL Report file each row came from,
-            # so the CGPA value's source file can be reported later. Set
-            # before filtering so the tag stays aligned row-for-row as
-            # rows get dropped below.
             source_file_name = getattr(file, "name", str(file))
             df[_CGPA_SOURCE_FILE_INTERNAL_COL] = source_file_name
 
@@ -466,12 +388,50 @@ def process_data(mkcl_files, student_lookup, college_choice, progress_callback=N
             else:
                 df = df.iloc[0:0]
 
-            # 3. Dynamic Semester GPA filter: All present SEM X_GPA columns must contain a value
+            # 3. GPA Filtering (Aware of Lateral Admission at Sem 3 or Sem 5)
+            student_re_col = next((c for c in df.columns if c.lower() == "student re"), None)
+            sem3_gpa_col = next((c for c in df.columns if c.lower() == "sem 3_gpa"), None)
+            sem4_gpa_col = next((c for c in df.columns if c.lower() == "sem 4_gpa"), None)
+            sem5_gpa_col = next((c for c in df.columns if c.lower() == "sem 5_gpa"), None)
+            sem6_gpa_col = next((c for c in df.columns if c.lower() == "sem 6_gpa"), None)
+
             target_sem_gpas = ["SEM 1_GPA", "SEM 2_GPA", "SEM 3_GPA", "SEM 4_GPA", "SEM 5_GPA", "SEM 6_GPA"]
-            for sem_gpa_name in target_sem_gpas:
-                sem_col = next((c for c in df.columns if c.lower() == sem_gpa_name.lower()), None)
-                if sem_col:
-                    df = df[df[sem_col].notna() & (df[sem_col].astype(str).str.strip() != "")]
+
+            def row_passes_gpa_filter(row):
+                re_val = str(row[student_re_col]).strip() if (student_re_col and pd.notna(row[student_re_col])) else ""
+                is_lateral = "lateral admission" in re_val.lower()
+
+                if is_lateral:
+                    # For Lateral Admission (Admitted directly in Semester 3 or Semester 5):
+                    # 1) SEM 5_GPA and SEM 6_GPA must be populated
+                    val5 = str(row[sem5_gpa_col]).strip() if (sem5_gpa_col and pd.notna(row[sem5_gpa_col])) else ""
+                    val6 = str(row[sem6_gpa_col]).strip() if (sem6_gpa_col and pd.notna(row[sem6_gpa_col])) else ""
+                    if not val5 or not val6 or val5.lower() == "nan" or val6.lower() == "nan":
+                        return False
+
+                    # 2) Check Sem 3 & Sem 4 GPAs:
+                    val3 = str(row[sem3_gpa_col]).strip() if (sem3_gpa_col and pd.notna(row[sem3_gpa_col])) else ""
+                    val4 = str(row[sem4_gpa_col]).strip() if (sem4_gpa_col and pd.notna(row[sem4_gpa_col])) else ""
+                    
+                    if val3.lower() == "nan": val3 = ""
+                    if val4.lower() == "nan": val4 = ""
+
+                    # If one of Sem 3 or Sem 4 GPA is present, both must be present
+                    if bool(val3) != bool(val4):
+                        return False
+
+                    return True
+                else:
+                    # Standard student: All present SEM X_GPA columns must contain a value
+                    for sem_gpa_name in target_sem_gpas:
+                        sem_col = next((c for c in df.columns if c.lower() == sem_gpa_name.lower()), None)
+                        if sem_col:
+                            val = str(row[sem_col]).strip() if pd.notna(row[sem_col]) else ""
+                            if not val or val.lower() == "nan":
+                                return False
+                    return True
+
+            df = df[df.apply(row_passes_gpa_filter, axis=1)]
 
             if not df.empty:
                 mkcl_dfs.append(df)
@@ -491,6 +451,7 @@ def process_data(mkcl_files, student_lookup, college_choice, progress_callback=N
     matched_count = 0
     unmatched_count = 0
     deg_names = []
+    apaar_ids = []
     unmatched_rows = []
 
     stu_num_col = next((c for c in merged_mkcl.columns if "student number" in c.lower()), None)
@@ -498,20 +459,20 @@ def process_data(mkcl_files, student_lookup, college_choice, progress_callback=N
         stu_num_col = merged_mkcl.columns[0]
 
     total_match_rows = len(merged_mkcl) or 1
-    # Update roughly 50 times across the loop rather than every row, to keep
-    # the UI responsive without adding per-row overhead.
     progress_interval = max(1, total_match_rows // 50)
 
     for row_idx, (idx, row) in enumerate(merged_mkcl.iterrows(), start=1):
         stu_id = sanitize_key(row[stu_num_col]) if stu_num_col else ""
-        prog_name = student_lookup.get(stu_id, "")
+        student_info = student_lookup.get(stu_id)
 
-        if prog_name:
+        if student_info:
             matched_count += 1
-            deg_names.append(prog_name)
+            deg_names.append(student_info.get("program", ""))
+            apaar_ids.append(student_info.get("abc_id", ""))
         else:
             unmatched_count += 1
             deg_names.append("")
+            apaar_ids.append("")
             unmatched_row_dict = row.to_dict()
             unmatched_row_dict.pop(_CGPA_SOURCE_FILE_INTERNAL_COL, None)
             unmatched_rows.append(unmatched_row_dict)
@@ -520,6 +481,7 @@ def process_data(mkcl_files, student_lookup, college_choice, progress_callback=N
             progress_callback("match", row_idx / total_match_rows)
 
     merged_mkcl["DEGNM"] = deg_names
+    merged_mkcl["APAAR ID"] = apaar_ids
 
     out_df = pd.DataFrame(columns=TARGET_COLUMNS)
 
@@ -532,35 +494,45 @@ def process_data(mkcl_files, student_lookup, college_choice, progress_callback=N
     if prn_col:
         out_df["PRNERN"] = merged_mkcl[prn_col].apply(sanitize_key)
 
+    out_df["APAAR ID"] = merged_mkcl["APAAR ID"].astype(str).str.strip()
     out_df["DEGNM"] = merged_mkcl["DEGNM"].astype(str).str.strip()
-    out_df["PROGTYPE"] = "DEGREE"
+    out_df["PROGTYPE"] = "Degree"
 
     if _CGPA_SOURCE_FILE_INTERNAL_COL in merged_mkcl.columns:
         out_df["CGPA Source File"] = merged_mkcl[_CGPA_SOURCE_FILE_INTERNAL_COL].astype(str).str.strip()
 
-    if college_choice == "Narsee Monjee College of Commerce & Economics (Empowered Autonomous)":
+    if college_choice == "Mithibai College":
+            out_df["COLL_NO"] = "132"
+            out_df["COLL_NAME"] = "Shri Vile Parle Kelvani Mandal's Mithibai College of Arts, Chauhan Institute of Science and Amrutben Jivanlal College of Commerce and Economics (Autonomous)"
+            out_df["COLL_NAMEM"] = "श्री विलेपार्ले केळवणी संचालित, मिठीबाई कॉलेज ऑफ आर्टस्, चौहान इन्स्टिटयूट ऑफ सायन्स अँन्ड अमृतबेन जीवनलाल कॉलेज ऑफ कॉमर्स अँन्ड इकॉनॉमिक्स (स्वायत्त)"
+
+    elif college_choice == "Narsee Monjee College":
         out_df["COLL_NO"] = "205"
         out_df["COLL_NAME"] = "Narsee Monjee College of Commerce & Economics (Empowered Autonomous)"
-    else:
+        out_df["COLL_NAMEM"] = "नरसी मोनजी कॉलेज ऑफ कॉमर्स आणि इकोनॉमिक्स (स्वायत्त)"
+
+    elif college_choice == "UPG College":
         out_df["COLL_NO"] = "598"
-        out_df["COLL_NAME"] = "UPG College of Arts, Science & Commerce (AUTONOMOUS)"
+        out_df["COLL_NAME"] = "UPG College of Arts, Science & Commerce (Autonomous)"
+        out_df["COLL_NAMEM"] = "उषा प्रविण गांधी कॉलेज ऑफ आर्टस्, सायन्स अँन्ड कॉमर्स (स्वायत्त)"
 
     out_df["SEX"] = out_df["SEX"].apply(map_gender)
     out_df["CLASS"] = out_df["CLASS"].apply(format_class_grade)
-    out_df["MCLASS"] = out_df["CGPA"].apply(convert_cgpa_to_marathi)
+    out_df["MCLASS"] = out_df["CGPA"].apply(convert_digits_to_marathi)
     out_df["FACULTY"] = out_df["DEGNM"].apply(derive_faculty)
     out_df["SUBDEGNM"] = out_df["DEGNM"].apply(derive_subdegnm)
 
-    # Transliterate NAME column to Marathi for NAME_MARAT
+    out_df["MONTH"] = out_df["MONTH"].astype(str).str.replace(",", " ").str.strip()
+    out_df["MONTH"] = out_df["MONTH"].replace("nan", "")
+
+    # Transliterate MONTH to Marathi and convert digits to Marathi numerals
+    out_df["MMONTH"] = out_df["MONTH"].apply(transliterate_name_to_marathi).apply(convert_digits_to_marathi)
     out_df["NAME_MARAT"] = out_df["NAME"].apply(transliterate_name_to_marathi)
 
     out_df = out_df.fillna("").astype(str).replace("nan", "")
     out_df = out_df[TARGET_COLUMNS]
 
-    # Deduplicate rows in the output dataset
     out_df = out_df.drop_duplicates().reset_index(drop=True)
-
-    # Sort output dataframe by SEAT_NO
     out_df = out_df.sort_values(by="SEAT_NO", ascending=True).reset_index(drop=True)
 
     unmatched_df = pd.DataFrame(unmatched_rows)
@@ -574,12 +546,6 @@ def process_data(mkcl_files, student_lookup, college_choice, progress_callback=N
 # 5. OPENPYXL EXCEL GENERATION & STYLING
 # ==========================================
 def generate_formatted_excel(df: pd.DataFrame, progress_callback=None) -> bytes:
-    """Generates formatted Excel workbook with default row height 20.
-
-    progress_callback, if provided, is called as progress_callback(fraction)
-    with fraction in [0, 1] as the workbook is built. Purely optional and
-    does not change any existing behavior when omitted.
-    """
     wb = openpyxl.Workbook()
     
     # SHEET 1: Convocation Data
@@ -589,8 +555,6 @@ def generate_formatted_excel(df: pd.DataFrame, progress_callback=None) -> bytes:
 
     font_regular = Font(name="Times New Roman", size=11, bold=False)
     font_header = Font(name="Times New Roman", size=11, bold=True)
-    # "CGPA Source File" column: italic font with grey font color, so users
-    # can see at a glance which MKCL Report file each CGPA value came from.
     font_cgpa_source_file = Font(name="Times New Roman", size=11, italic=True, color="808080")
     header_fill = PatternFill(start_color="D9D9D9", end_color="D9D9D9", fill_type="solid")
     
@@ -628,12 +592,11 @@ def generate_formatted_excel(df: pd.DataFrame, progress_callback=None) -> bytes:
                 else font_regular
             )
             cell.border = cell_border
-            if cell.column_letter in ["A", "B", "E", "G", "H", "Q", "AE"]:
+            if cell.column_letter in ["A", "B", "E", "F", "H", "I", "R", "AF"]:
                 cell.alignment = center_align
             else:
                 cell.alignment = left_align
 
-    # Set row height to 20 for Sheet 1
     for r in range(1, ws.max_row + 1):
         ws.row_dimensions[r].height = 20
 
@@ -698,7 +661,6 @@ def generate_formatted_excel(df: pd.DataFrame, progress_callback=None) -> bytes:
                 else:
                     cell.alignment = center_align
 
-    # Set row height to 20 for Sheet 2
     for r in range(1, ws_stats.max_row + 1):
         ws_stats.row_dimensions[r].height = 20
 
@@ -728,7 +690,6 @@ def generate_formatted_excel(df: pd.DataFrame, progress_callback=None) -> bytes:
 # 6. MODULE ENTRY POINT FOR STREAMLIT ROUTING
 # ==========================================
 def show():
-    """Main UI layout function called by app.py routing."""
     st.title("📄 Convocation Data Generator")
     st.markdown(
         "Upload **MKCL Reports** and **Student Master Data** files. The app automatically handles "
@@ -736,7 +697,6 @@ def show():
         "and generates formatted convocation reports."
     )
 
-    # 3-Column horizontal single-line layout for controls & uploaders
     col1, col2, col3 = st.columns(3)
 
     with col1:
@@ -744,8 +704,9 @@ def show():
         college_option = st.selectbox(
             "Select College",
             options=[
-                "Narsee Monjee College of Commerce & Economics (Empowered Autonomous)",
-                "UPG College of Arts, Science & Commerce (AUTONOMOUS)"
+                "Mithibai College",
+                "Narsee Monjee College",
+                "UPG College"                
             ],
             label_visibility="collapsed"
         )
@@ -770,7 +731,6 @@ def show():
 
     process_ready = bool(mkcl_files and master_files)
 
-    # Button and its live progress indicator sit side-by-side.
     btn_col, progress_col = st.columns([1, 2])
     with btn_col:
         process_btn = st.button("🚀 Process & Generate Convocation File", type="primary", disabled=not process_ready)
@@ -782,9 +742,6 @@ def show():
 
     if process_btn and process_ready:
         try:
-            # Overall progress is split across weighted stages so the bar next
-            # to the button moves smoothly and in real time as large files /
-            # multiple uploads are processed.
             STAGE_RANGES = {
                 "master": (0, 30, "📚 Building Student Master Lookup Map"),
                 "read": (30, 60, "📥 Reading & Filtering MKCL Reports"),
@@ -864,7 +821,6 @@ def show():
             st.exception(e)
 
 
-# Alias main to show for flexibility
 main = show
 
 if __name__ == "__main__":
