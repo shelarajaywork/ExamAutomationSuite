@@ -1105,8 +1105,8 @@ def main():
                         "Treat Module Descriptions as common when similarity is at least:",
                         min_value=50,
                         max_value=100,
-                        value=75,
-                        step=5,
+                        value=100,
+                        step=1,
                         format="%d%%",
                         help=(
                             "100% requires an exact match (current/default behaviour). Lower this to "
