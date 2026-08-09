@@ -47,26 +47,46 @@ def canonical_subject(s: str) -> str:
     return t.strip()
 
 
-def cluster_canonical_subjects(canon_subjects, threshold: float) -> dict:
-    """Groups canonical subject strings that are similar to each other into the same cluster."""
+def cluster_canonical_subjects(canon_subjects, threshold: float, canon_students: dict = None) -> dict:
+    """Groups canonical subject strings that are similar to each other into the same cluster.
+
+    Subjects that share at least one enrolled student are NEVER merged into the same cluster,
+    even when their text similarity meets/exceeds the threshold. Two modules with a common
+    student are genuinely different exams for that student (e.g. "Synthetic Organic Chemistry"
+    vs "Synthetic And Sustainable Organic Chemistry") - merging them into one cluster/node would
+    schedule both on the same day/time, causing a real clash for that student. `canon_students`
+    maps each canonical subject string to the set of student identifiers enrolled in it, and is
+    used purely to veto such unsafe merges; it does not affect merges between subjects that
+    don't share any students.
+    """
+    canon_students = canon_students or {}
+
     if threshold >= 1.0:
         return {s: s for s in canon_subjects}
 
     representatives = []
+    rep_students = {}  # representative -> union of student sets merged into its cluster so far
     mapping = {}
     for subj in sorted(canon_subjects):
+        subj_students = canon_students.get(subj, set())
         best_ratio = 0.0
         best_rep = None
         for rep in representatives:
+            # Never merge into a representative's cluster if doing so would put a shared
+            # student into two different exams on the same day - irrespective of similarity.
+            if subj_students and rep_students.get(rep) and (subj_students & rep_students[rep]):
+                continue
             ratio = SequenceMatcher(None, subj, rep).ratio()
             if ratio > best_ratio:
                 best_ratio = ratio
                 best_rep = rep
         if best_rep is not None and best_ratio >= threshold:
             mapping[subj] = best_rep
+            rep_students.setdefault(best_rep, set()).update(subj_students)
         else:
             representatives.append(subj)
             mapping[subj] = subj
+            rep_students[subj] = set(subj_students)
     return mapping
 
 
@@ -370,15 +390,20 @@ def generate_timetable(
                 manual_map_clean[k_clean] = v_clean
 
     canon_subject_pool = set()
+    canon_to_students = {}  # canonical subject (pre-clustering) -> set of enrolled student ids
     for _, row in df.iterrows():
         subject_raw = str(row[c_sub]).strip()
         if not subject_raw:
             continue
         if subject_raw.upper() in manual_map_clean:
             continue
-        canon_subject_pool.add(canonical_subject(subject_raw))
+        base_canon = canonical_subject(subject_raw)
+        canon_subject_pool.add(base_canon)
+        stud_val = str(row[c_stud]).strip() if pd.notna(row[c_stud]) else ""
+        if stud_val:
+            canon_to_students.setdefault(base_canon, set()).add(stud_val)
 
-    fuzzy_cluster_map = cluster_canonical_subjects(canon_subject_pool, fuzzy_threshold)
+    fuzzy_cluster_map = cluster_canonical_subjects(canon_subject_pool, fuzzy_threshold, canon_to_students)
 
     def effective_canon(subject_text: str) -> str:
         raw_key = str(subject_text).strip().upper()
@@ -567,11 +592,24 @@ def generate_timetable(
 
 # ===================== TIMETABLE (PIVOT-STYLE) SHEET =====================
 
-def build_timetable_sheet(workbook, result_df: pd.DataFrame, common_module_color_map: dict = None):
+def build_timetable_sheet(
+    workbook,
+    result_df: pd.DataFrame,
+    common_module_color_map: dict = None,
+    exam_type: str = "",
+    exam_start_date: datetime.date = None,
+    show_academic_years: bool = True,
+    show_student_count: bool = True,
+):
     """Adds a 'Timetable' worksheet to the given workbook in a pivot-style layout.
-    Header Row 2 displays Current Session (Semester) and merges across consecutive
-    columns belonging to the same School + Semester. Header Rows 3 and 4 display
-    Program Abbreviation and Program Name as individual cells."""
+    Header Row 2 displays Current Session (Semester) - suffixed with the selected
+    Examination Type and the month/year of the Exam Start Date, e.g.
+    "Semester III - Regular Examination - October 2026" - and merges across
+    consecutive columns belonging to the same School + Semester. Header Rows 3 and 4
+    display Program Abbreviation and Program Name as individual cells. Each Module
+    Description cell can optionally also show that module's Current Academic Year
+    value(s) (show_academic_years) and/or its total Students count
+    (show_student_count), per the Timetable Sheet Display Options checkboxes."""
     from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
     from openpyxl.utils import get_column_letter
 
@@ -638,19 +676,39 @@ def build_timetable_sheet(workbook, result_df: pd.DataFrame, common_module_color
         if not mod_desc:
             continue
         dur_seconds = parse_duration_to_seconds(r.get("Exam Duration", ""))
-        cell_map.setdefault(mk, [])
-        existing_descs = [m[0] for m in cell_map[mk]]
-        if mod_desc not in existing_descs:
-            cell_map[mk].append((mod_desc, dur_seconds))
+
+        try:
+            students_val = int(r.get("Students", 0))
+        except (ValueError, TypeError):
+            students_val = 0
+
+        cell_map.setdefault(mk, {})
+        if mod_desc not in cell_map[mk]:
+            cell_map[mk][mod_desc] = {"dur": dur_seconds, "ay": set(), "students": 0}
+
+        # Current Academic Year may already be a comma-separated list (Re-Examination
+        # combines multiple academic years for the same module into one cell).
+        ay_raw = str(r.get("Current Academic Year", "")).strip()
+        for ay_part in ay_raw.split(","):
+            ay_part = ay_part.strip()
+            if ay_part:
+                cell_map[mk][mod_desc]["ay"].add(ay_part)
+
+        # Sum students across any duplicate rows for the same module in the same cell
+        # (e.g. separate cohorts of the same module within one program/date/time slot).
+        cell_map[mk][mod_desc]["students"] += students_val
 
     ws.cell(row=1, column=DATE_COL, value="Exam Date")
     ws.cell(row=1, column=TIME_COL, value="Time")
     ws.merge_cells(start_row=1, start_column=DATE_COL, end_row=HEADER_ROWS, end_column=DATE_COL)
     ws.merge_cells(start_row=1, start_column=TIME_COL, end_row=HEADER_ROWS, end_column=TIME_COL)
 
+    session_suffix_parts = [p for p in [exam_type, exam_start_date.strftime("%B %Y") if exam_start_date else ""] if p]
+    session_suffix = " - " + " - ".join(session_suffix_parts) if session_suffix_parts else ""
+
     for idx, (school, session, prog_abbr, prog_name) in enumerate(col_keys):
         col_num = DATA_COL_START + idx
-        ws.cell(row=2, column=col_num, value=session)
+        ws.cell(row=2, column=col_num, value=f"{session}{session_suffix}")
         ws.cell(row=3, column=col_num, value=prog_abbr)
         ws.cell(row=4, column=col_num, value=prog_name)
 
@@ -718,15 +776,23 @@ def build_timetable_sheet(workbook, result_df: pd.DataFrame, common_module_color
 
         for c_idx, (school, session, prog_abbr, prog_name) in enumerate(col_keys):
             col_num = DATA_COL_START + c_idx
-            mods = cell_map.get((exam_date, time_val, school, session, prog_abbr, prog_name), [])
-            
+            mods = cell_map.get((exam_date, time_val, school, session, prog_abbr, prog_name), {})
+
             if mods:
-                sorted_mods = sorted(mods, key=lambda m: m[1], reverse=True)
-                value = " / \n".join(m[0] for m in sorted_mods)
-                
+                sorted_mods = sorted(mods.items(), key=lambda kv: kv[1]["dur"], reverse=True)
+                lines = []
+                for m_desc, info in sorted_mods:
+                    extras = []
+                    if show_academic_years and info["ay"]:
+                        extras.append(", ".join(sorted(info["ay"])))
+                    if show_student_count:
+                        extras.append(str(info["students"]))
+                    line = f"{m_desc}\n({' | '.join(extras)})" if extras else m_desc
+                    lines.append(line)
+                value = " / \n".join(lines)
+
                 if common_module_color_map:
-                    for m in sorted_mods:
-                        m_desc = m[0]
+                    for m_desc, _info in sorted_mods:
                         if m_desc in common_module_color_map:
                             cell_fill_map[(row_num, col_num)] = common_module_color_map[m_desc]
                             break
@@ -1085,6 +1151,29 @@ def main():
                         f"Please use DD-MM-YYYY format: {', '.join(invalid_holiday_lines)}"
                     )
 
+                st.markdown("**Timetable Sheet Display Options**")
+                tt_opt_col1, tt_opt_col2 = st.columns(2)
+                with tt_opt_col1:
+                    show_academic_years = st.checkbox(
+                        "Show Academic Years",
+                        value=True,
+                        help=(
+                            "Show each module's Current Academic Year value(s) alongside its name in "
+                            "every Timetable sheet cell."
+                        ),
+                        key="show_academic_years_chk"
+                    )
+                with tt_opt_col2:
+                    show_student_count = st.checkbox(
+                        "Show Student Count",
+                        value=True,
+                        help=(
+                            "Show each module's total Students count alongside its name in every "
+                            "Timetable sheet cell."
+                        ),
+                        key="show_student_count_chk"
+                    )
+
                 st.markdown("**Manual Common Module Mapping**")
                 st.caption(
                     "If the common modules have variations in module descriptions across programs/colleges, "
@@ -1255,7 +1344,12 @@ def main():
                                         cell.fill = PatternFill(start_color=fill_hex, end_color=fill_hex, fill_type="solid")
 
                             # Add the pivot-style "Timetable" worksheet
-                            build_timetable_sheet(workbook, result_df, common_module_color_map)
+                            build_timetable_sheet(
+                                workbook, result_df, common_module_color_map,
+                                exam_type=exam_type, exam_start_date=exam_start_date,
+                                show_academic_years=show_academic_years,
+                                show_student_count=show_student_count
+                            )
 
                             # Add the "Analysis" worksheet
                             build_analysis_sheet(workbook, result_df)
@@ -1286,6 +1380,203 @@ def main():
 
         except Exception as e:
             st.error(f"Error processing files: {e}")
+
+    st.divider()
+
+    render_help_section()
+
+
+def render_help_section():
+    """
+    Renders a collapsible 'Tool Description / Help' section. Collapsed by
+    default (expanded=False) - it only opens when the user clicks it. Purely
+    documentation; no processing logic lives here.
+    """
+    with st.expander("ℹ️ Tool Description / Help - click to expand", expanded=False):
+        st.markdown(
+            """
+### 1. Purpose of the Tool
+The Exam Timetable Generator builds a clash-free examination schedule from student-module
+enrolment data. It groups students by the modules they're enrolled in, treats any two modules
+shared by at least one common student as a scheduling conflict, and uses a graph-coloring
+algorithm to assign each module a day so that no student is ever scheduled for two exams on
+the same day. It supports both **Regular Examination** and **Re-Examination** scheduling, and
+exports a fully formatted, multi-sheet Excel workbook (raw schedule, pivot-style Timetable
+view, and a summary Analysis sheet).
+
+---
+### 2. Required Input Files & Formats
+**Regular Examination** - one or more Excel files (`.xlsx`, `.xls`) exported as
+**[ZACAD_REPORT]** ("All Subjects Students Data"), each row representing one student's
+enrolment in one module. Required columns (matched flexibly by name/casing/spacing):
+`Module Description`, `Student Number`, `Program Name`, `School Name`,
+`Current Academic Year`, `Current Session`, `Exam Duration`. Optional columns
+`Program Abbreviation`, `Module Abbreviation`, `Credit`, and `Student NA` (rows are filtered
+to `WRIT` if present) are used when available.
+
+**Re-Examination** - two separate sets of files are required together:
+- **Re-exam Applications List [ZREEXAM_REPORT]** - student-level re-exam applications. Needs
+  `Prog. Code`, `Prog. Name`, `Module code`, `Module name`, `Student number`, `Roll number`,
+  `Student name`, `Acad. Year`, `Acad. Session`, `GR Applicable`, `Appraisal Description`.
+- **Academic Report [ZACAD_REPORT]** - the master module/credit reference data. Needs
+  `School Name`, `Program Abbreviation`, `Current Academic Year`, `Current Session`,
+  `Module Abbreviation`, `Credit`, `Is GR Applicable?`, `Exam Mode`, `Exam Duration`.
+
+Both file types can be uploaded as multiple files each; all files of the same type are
+concatenated before processing.
+
+---
+### 3. Description of All Upload/Configuration Options
+- **Select Examination Type** - toggles between Regular Examination and Re-Examination, which
+  changes which file uploader(s) are shown and how records are merged/filtered.
+- **Exam Start Date** - the first calendar date exams may be scheduled on; scheduling always
+  moves forward in time from this date.
+- **Exam Start Time** - a fixed daily start time (07:00 AM-03:00 PM, 30-minute steps) used for
+  every exam's time slot; end time is derived by adding that module's Exam Duration.
+- **Upload All Subjects Students Data files [ZACAD_REPORT]** *(Regular only)* - the enrolment
+  data described above.
+- **Upload Re-exam Applications List [ZREEXAM_REPORT]** / **Upload Acad Report
+  [ZACAD_REPORT]** *(Re-Examination only)* - the two file sets merged together (see Matching
+  Logic below).
+- **Advanced Scheduling Options (optional)**:
+  - **Common Module Matching (similarity slider)** - at 100% (default-equivalent), only
+    modules with identical descriptions are grouped together. Lowering it clusters module
+    descriptions that are textually similar (e.g. "Business Law" vs "Business Laws") using
+    fuzzy string matching, so near-duplicate module names are scheduled on the same day/slot.
+    Two modules are never clustered together, regardless of similarity score, if they share
+    at least one enrolled student - since merging them would schedule two different exams for
+    that student at the same day/time (see Grouping, Clustering & Other Calculations below).
+  - **Additional Non-Working Days** - a free-text box, one date per line in `DD-MM-YYYY`
+    format, listing public/institutional holidays to skip when assigning exam dates. Sundays
+    are always skipped automatically regardless of this list. Unparseable lines are flagged
+    with a warning and ignored.
+  - **Timetable Sheet Display Options** - two checkboxes, both ticked by default:
+    - **Show Academic Years** - when ticked, each module's Current Academic Year value(s) are
+      shown alongside its name in every Timetable sheet cell.
+    - **Show Student Count** - when ticked, each module's total Students count is shown
+      alongside its name in every Timetable sheet cell.
+  - **Manual Common Module Mapping** - an editable table for explicitly pairing exact module
+    description strings (as they appear in the uploaded file) to a shared "Common Group
+    Name", overriding the automatic fuzzy clustering for those specific modules.
+
+---
+### 4. Matching Logic Between Re-Exam Applications List & Academic Report
+Records are merged using a composite key of **Program Abbreviation/Code + Module Abbreviation/
+Code + Session + Academic Year** (all upper-cased and stripped), built independently on each
+file using its own column names, then matched against each other. The Re-exam Applications
+List is first filtered to rows where `GR Applicable = YES` and `Appraisal Description = SEM
+ACTUAL`; the Academic Report is filtered to `Exam Mode = WRIT` and `Is GR Applicable? = Y`.
+Any Re-exam Applications List row whose key finds no match in the filtered Academic Report is
+flagged **Incomplete Data** and excluded from scheduling (see Validation Rules below).
+
+---
+### 5. Conditions & Filters Applied During Processing
+- Rows missing a Module Description or Student Number are dropped.
+- Where a `Student NA` column is present, only rows marked `WRIT` are kept.
+- (Re-Examination) Only `GR Applicable = YES` + `Appraisal Description = SEM ACTUAL`
+  applications, matched against `Exam Mode = WRIT` + `Is GR Applicable? = Y` academic
+  records, are scheduled.
+
+---
+### 6. Grouping, Clustering & Other Calculations
+- **Canonical subject name** - each Module Description is normalized (uppercased, language
+  suffixes like "IN ENGLISH" removed, trailing Roman numerals I/II/III trimmed, whitespace
+  collapsed) so that level/variant labels don't accidentally split or merge modules.
+- **Fuzzy clustering** - canonical names are clustered using text-similarity ratio against the
+  similarity threshold set in Advanced Scheduling Options; a name only joins an existing
+  cluster if its similarity to that cluster's representative meets the threshold **and** the
+  two share no enrolled student in common. A shared student always blocks the merge, however
+  high the similarity score, so two genuinely different modules (e.g. "Synthetic Organic
+  Chemistry" vs "Synthetic And Sustainable Organic Chemistry") are never forced onto the same
+  day/slot just because a fuzzy match grouped their names together.
+- **Manual mapping** - always takes priority over automatic canonicalisation/clustering for
+  any module description explicitly listed in the mapping table.
+- **Conflict graph & day assignment** - one graph node per canonical module (+ session +
+  duration); an edge is added between two nodes whenever at least one student is enrolled in
+  both. A DSATUR greedy graph-coloring algorithm assigns each node a "color" (day slot) such
+  that no two connected nodes share a color, guaranteeing no student has two exams the same
+  day. Colors are then mapped to actual calendar dates starting from the Exam Start Date,
+  automatically skipping Sundays and any configured holiday dates.
+- **Exam Duration / Time** - parsed from `HH:MM`/`HH:MM:SS` text (or a numeric hour count) into
+  seconds, then combined with the fixed Exam Start Time to produce a display time range (e.g.
+  "10:00 AM - 12:00 PM", shown as "10:00 am to 12:00 noon" on the Timetable sheet).
+- **Common module identification & colour-coding** - a canonical module is treated as
+  "common" (shared across programs/colleges) if it maps from more than one raw description, or
+  appears against more than one Program Name, or has more than one enrolment row. Each common
+  module group is assigned a distinct pastel colour from a fixed palette, applied as a cell
+  fill on its Module Description cells throughout the output.
+
+---
+### 7. Re-Examination vs Regular Examination Processing Logic
+- **Regular Examination** rows are grouped per School + Program + Academic Year + Module +
+  Credit combination, each becoming its own output row with its own student count.
+- **Re-Examination** rows are grouped per School + Program + Session + Module + Credit +
+  Duration combination (Academic Years for that group are combined into one comma-separated
+  cell), since re-exam applicants for the same module can span multiple academic years.
+- Both modes ultimately produce the same output column layout: School Name, Program
+  Abbreviation, Program Name, Current Session, Module Abbreviation, Module Description,
+  Current Academic Year, Credit, Students, Exam Duration, Exam Date, Time, Day.
+
+---
+### 8. Validation Rules & the "Incomplete Data" Sheet *(Re-Examination only)*
+Any Re-exam Applications List record that cannot be matched to a corresponding Academic
+Report record (via the composite key above) is flagged **Incomplete Data**, shown in an
+on-screen warning + expandable preview, excluded from the generated timetable, and written to
+a separate **"Incomplete Data"** sheet in the downloaded workbook for manual follow-up.
+
+---
+### 9. Output Excel Workbook - Sheets & Contents
+- **"Regular Examination" / "Re-Examination"** (main data sheet) - one row per scheduled
+  module/program/college combination with the columns listed in section 7. Header row is
+  bold with a grey fill and frozen; `Exam Date` is formatted `DD-MM-YYYY`; Module Description
+  cells for common (shared) modules are filled with their assigned pastel colour.
+- **"Timetable"** - a pivot-style grid: rows are Exam Date + Time (sorted by date, then by
+  longest duration, then by time), columns are School → Session → Program Abbreviation →
+  Program Name (merged header cells across rows 1-4), and each cell lists the module(s)
+  scheduled for that program at that date/time. Row 2 shows Current Session suffixed with the
+  selected Examination Type and the month/year of Exam Start Date, e.g. "Semester III - Regular
+  Examination - October 2026". Each module's name in a cell is optionally followed, on the next
+  line, by its Current Academic Year value(s) and/or total Students count in parentheses -
+  e.g. "Communication Skills I" on one line and "(2025 | 2)" on the next - per the Timetable
+  Sheet Display Options checkboxes (both on by default). Thick borders mark day boundaries;
+  common modules keep their colour-coding.
+- **"Analysis"** - a summary grid (School → Session columns, with a Total column per school)
+  showing module/enrolment counts per day/time slot, for a quick at-a-glance load check.
+- **"Incomplete Data"** *(Re-Examination only, when applicable)* - the unmatched Re-exam
+  Applications List records described in section 8.
+
+---
+### 10. Preview Sections Shown On-Screen
+- **Preview Combined Data** - the first 10 rows of the combined/merged input, before
+  scheduling, so you can sanity-check the uploaded files were read correctly.
+- **⚠️ View Incomplete Data** *(Re-Examination only)* - an expandable table of any unmatched
+  applications, shown before you generate the timetable.
+- **Generated Schedule** - the full scheduled output table, shown on-screen immediately after
+  clicking "🚀 Generate Timetable", matching the main sheet of the downloaded workbook.
+
+---
+### 11. Downloadable Output
+- **📥 Download Timetable Excel** - the complete workbook described in section 9, named
+  `Regular Examination Timetable DD-MM-YYYY.xlsx` or `Re-examination Timetable
+  DD-MM-YYYY.xlsx` depending on the selected exam type, using today's date.
+
+---
+### 12. Assumptions & Processing Workflow
+1. Select the examination type and set the start date/time and any advanced options.
+2. Upload the required file(s) for that exam type.
+3. The tool loads and combines the files (for Re-Examination, merges the Applications List
+   against the Academic Report and flags unmatched rows as Incomplete Data).
+4. Click **🚀 Generate Timetable** to build the conflict graph, run the day-assignment
+   algorithm, and produce the scheduled output.
+5. Review the on-screen schedule, then download the formatted multi-sheet Excel workbook.
+
+**Assumptions**: column names in uploaded files may vary in casing/spacing/prefix and are
+matched flexibly rather than requiring an exact header match; a student is uniquely identified
+by Student Number within a file; two modules are only treated as a scheduling conflict if they
+share at least one enrolled student in common.
+            """
+        )
+
 
 if __name__ == "__main__":
     main()

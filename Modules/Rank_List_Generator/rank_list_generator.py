@@ -20,8 +20,8 @@ import streamlit as st
 
 COLLEGE_FULL_NAMES = {
     "Mithibai College": "Mithibai College of Arts, Chauhan Institute of Science & Amrutben Jivanlal College of Commerce and Economics (Autonomous)",
-    "N. M. College": "Narsee Monjee College of Commerce and Economics (Empowered Autonomous)",
-    "U.P.G. College": "Usha Pravin Gandhi College of Arts, Science and Commerce (Autonomous)"
+    "Narsee Monjee College": "Narsee Monjee College of Commerce and Economics (Empowered Autonomous)",
+    "Usha Pravin Gandhi College": "Usha Pravin Gandhi College of Arts, Science and Commerce (Autonomous)"
 }
 
 
@@ -410,7 +410,7 @@ def show():
     cfg_col1, cfg_col2, cfg_col3 = st.columns([2, 1, 1])
     
     with cfg_col1:
-        college_options = ["", "Mithibai College", "N. M. College", "U.P.G. College"]
+        college_options = ["", "Mithibai College", "Narsee Monjee College", "Usha Pravin Gandhi College"]
         selected_college_short = st.selectbox("Select College Name", options=college_options, index=0)
         
         college_name_full = COLLEGE_FULL_NAMES.get(selected_college_short, selected_college_short)

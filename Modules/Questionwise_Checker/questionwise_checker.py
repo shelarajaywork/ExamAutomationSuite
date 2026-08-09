@@ -12,8 +12,10 @@ This Streamlit tool helps exam staff:
 2. Optionally upload a GMR Excel file to match records by PRN/Student Number 
    and Subject Code/Modulecode to fetch 'Internal Marks' (Internal Total Obtained),
    'Total Max Marks' (from Composite AGR type), 'Semester Total Max Marks' (from 
-   Semester Total AGR type), calculate 'Total Marks Obtained', and derive 'Grade' 
-   dynamically based on percentage criteria.
+   Semester Total AGR type), 'Semester Marks' (Grades value from "Semester Total 
+   Marks" AGR type rows - shown only on Moderator rows, or on an Examiner row 
+   with no corresponding Moderator record), calculate 'Total Marks Obtained', 
+   and derive 'Grade' dynamically based on percentage criteria.
 3. Clean the raw export (remove blank/footer rows, drop unused columns).
 4. Sort records so each student's rows appear in a fixed order:
    Examiner -> Moderator -> Reval 1 -> Reval 2.
@@ -76,6 +78,7 @@ FIXED_COLUMNS = [
     "MarkAttendance",
     "Email",
     "Semester Total Max Marks",
+    "Semester Marks",
     "Internal Marks",
     "Total Max Marks",
     "Total Marks Obtained",
@@ -99,6 +102,7 @@ COLUMNS_TO_DROP_STANDARD = [
     "Internal Marks",
     "Total Max Marks",
     "Semester Total Max Marks",
+    "Semester Marks",
     "Total Marks Obtained",
     "Change %",
 ]
@@ -142,13 +146,13 @@ USER_TYPE_ORDER = {
 # tables (see highlight_rows/style_preview) to visually distinguish
 # Moderator/Reval rows from the Examiner row above them.
 ROW_COLOURS = {
-    "Moderator": "background-color:#032E15;",
+    "Moderator": "background-color:#143d22;color:#ffffff;",  # Explicit white text for high contrast in light & dark mode
     "Reval 1": "background-color:#162456;color:white;",
     "Reval 2": "background-color:#290245;color:white;",
 }
 
-INCREASE_STYLE = "color:#9ACD32;font-weight:bold;"  # mark went up / grade improved
-DECREASE_STYLE = "color:#FF4500;font-weight:bold;"  # mark went down / grade degraded
+INCREASE_STYLE = "color:#00E676;font-weight:bold;"  # Bright green: mark went up / grade improved
+DECREASE_STYLE = "color:#FF4500;font-weight:bold;"  # Red: mark went down / grade degraded
 
 # Ordinal rank of each grade letter, used purely for comparison (e.g. did a
 # reviewer's Grade rank higher or lower than the Examiner's Grade).
@@ -311,6 +315,7 @@ def apply_gmr_lookup(df, gmr_df):
     df["Internal Marks"] = ""
     df["Total Max Marks"] = ""
     df["Semester Total Max Marks"] = ""
+    df["Semester Marks"] = ""
     df["Total Marks Obtained"] = ""
     df["Grade"] = ""
 
@@ -363,6 +368,41 @@ def apply_gmr_lookup(df, gmr_df):
         sem_total_max_map = dict(zip(sem_total_df["LookupKey"], sem_total_df["MAX Marks"]))
     df["Semester Total Max Marks"] = df_key.map(sem_total_max_map).fillna("")
 
+    # 3b. Fetch Semester Marks (Grades column) from GMR rows whose AGR type
+    # contains "Semester Total Marks" (e.g. "Semester Total Marks(60 )"),
+    # using the same PRN + Subject code matching key as the other lookups above.
+    # The looked-up value is only ever KEPT on:
+    #   (a) every Moderator row, and
+    #   (b) an Examiner row whose student+module combination has NO
+    #       corresponding Moderator row.
+    # All other rows (Examiner rows that DO have a Moderator row, plus any
+    # Reval 1 / Reval 2 rows) are left blank.
+    sem_marks_df = gmr_clean[
+        gmr_clean["AGR type"].astype(str).str.contains("Semester Total Marks", case=False, na=False)
+    ]
+    sem_marks_map = dict(zip(sem_marks_df["LookupKey"], sem_marks_df["Grades"]))
+    raw_semester_marks = df_key.map(sem_marks_map).fillna("")
+
+    if "UserType" in df.columns and "PRNNumber" in df.columns and "Subject Name-Subject code" in df.columns:
+        module_key = (
+            df["PRNNumber"].astype(str).str.strip() +
+            "||" +
+            df["Subject Name-Subject code"].astype(str).str.strip()
+        )
+        moderator_module_keys = set(
+            module_key[df["UserType"].astype(str).str.strip() == "Moderator"]
+        )
+
+        def keep_semester_marks(idx):
+            u_type = str(df.loc[idx, "UserType"]).strip()
+            if u_type == "Moderator":
+                return raw_semester_marks.loc[idx]
+            if u_type == "Examiner" and module_key.loc[idx] not in moderator_module_keys:
+                return raw_semester_marks.loc[idx]
+            return ""
+
+        df["Semester Marks"] = [keep_semester_marks(i) for i in df.index]
+
     # 4. Calculate Total Marks Obtained = TotalObtainedScore (exam script) + Internal Marks (GMR).
     def compute_total_obtained(row):
         tot_score = row.get("TotalObtainedScore", "")
@@ -374,7 +414,9 @@ def apply_gmr_lookup(df, gmr_df):
             val_tot = 0.0
 
         try:
-            val_int = float(str(int_marks).strip())
+            # Clean leading '+' and whitespace before parsing Internal Marks into a float
+            cleaned_int_marks = re.sub(r"^\+\s*", "", str(int_marks).strip())
+            val_int = float(cleaned_int_marks)
         except (ValueError, TypeError):
             val_int = 0.0
 
@@ -476,11 +518,12 @@ def calculate_moderator_change_pct(df):
 def reorder_gmr_columns(df):
     """
     Reorders GMR and calculated columns right after TotalObtainedScore in the exact sequence:
-    Semester Total Max Marks, Internal Marks, Total Max Marks, Total Marks Obtained, Grade, Change %, Email
+    Semester Total Max Marks, Semester Marks, Internal Marks, Total Max Marks, Total Marks Obtained, Grade, Change %, Email
     """
     df = df.copy()
     target_tail = [
         "Semester Total Max Marks",
+        "Semester Marks",
         "Internal Marks",
         "Total Max Marks",
         "Total Marks Obtained",
@@ -573,8 +616,11 @@ def format_value(value):
     if text == "" or text.upper() == "NA" or text.upper() == "NAN":
         return "" if text == "" else "NA"
 
+    # Clean leading '+' for formatting display if present
+    cleaned_text = re.sub(r"^\+\s*", "", text)
+
     try:
-        number = float(text)
+        number = float(cleaned_text)
         # Show whole numbers without a trailing ".0" (e.g. "8" not "8.0"),
         # but keep decimals for fractional marks (e.g. "7.5").
         if number.is_integer():
@@ -676,6 +722,28 @@ def highlight_rows(data, question_columns):
                                 styles.loc[idx, "Change %"] += DECREASE_STYLE
                         except (ValueError, TypeError):
                             pass
+
+    # Pass 3: Semester Marks vs TotalObtainedScore comparison - light green cell
+    # fill if they match, light red if they don't. Only applies to rows where
+    # Semester Marks was actually populated (Moderator rows, or Examiner rows
+    # with no corresponding Moderator record - see apply_gmr_lookup).
+    if "Semester Marks" in data.columns and "TotalObtainedScore" in data.columns:
+        for idx in data.index:
+            sem_val_str = str(data.loc[idx, "Semester Marks"]).strip()
+            if sem_val_str == "" or sem_val_str.upper() == "NA":
+                continue
+
+            tot_val_str = str(data.loc[idx, "TotalObtainedScore"]).strip()
+            try:
+                sem_val = float(re.sub(r"^\+\s*", "", sem_val_str))
+                tot_val = float(tot_val_str)
+            except (ValueError, TypeError):
+                continue
+
+            if sem_val == tot_val:
+                styles.loc[idx, "Semester Marks"] += "background-color:#C6EFCE;color:#000000;"
+            else:
+                styles.loc[idx, "Semester Marks"] += "background-color:#ff0000;color:#ffff00;"
 
     # TotalObtainedScore is always bold, regardless of row type, for quick scanning.
     if "TotalObtainedScore" in data.columns:
@@ -856,13 +924,6 @@ def add_sheet_popup_validation(worksheet, is_eligible):
 # --------------------------------------------------
 # Shared Excel-styling helpers
 # --------------------------------------------------
-# The three export builders below (to_excel_bytes, to_excel_bytes_formatted,
-# create_consolidated_multi_sheet_excel) all need the same handful of styling
-# building blocks - a thin border, deciding which columns to center-align,
-# auto-sizing/fixing column widths, painting the header row, and (for the
-# two "formatted" exports) the green/red change-highlighting + student
-# borders. Pulling these out avoids keeping three near-identical ~150 line
-# copies of the same openpyxl code in sync by hand.
 
 def _thin_border():
     """Returns a Border with a thin black line on all four sides."""
@@ -952,7 +1013,30 @@ def _apply_grid_styling(worksheet, cols, center_col_indices, total_score_col_idx
                 cell.alignment = center_align
 
 
-def _apply_change_highlighting_and_group_borders(worksheet, download_df, cols, dark_green_font, red_font):
+def _apply_header_highlight_fills(worksheet, cols, orange_header_cols, dark_grey_header_cols):
+    """
+    Overrides the default grey header-row fill (set by _apply_grid_styling)
+    for specific header cells only:
+      - `orange_header_cols` get a medium orange, 60% lighter fill (FCE4D6)
+      - `dark_grey_header_cols` get a 35% darker grey fill (999999)
+    Only row 1 (the header row) is touched; font/border/alignment set
+    elsewhere are left untouched.
+    """
+    orange_fill = PatternFill(start_color="FCE4D6", end_color="FCE4D6", fill_type="solid")
+    dark_grey_fill = PatternFill(start_color="999999", end_color="999999", fill_type="solid")
+
+    for col_name in orange_header_cols:
+        if col_name in cols:
+            col_idx = cols.index(col_name) + 1
+            worksheet.cell(row=1, column=col_idx).fill = orange_fill
+
+    for col_name in dark_grey_header_cols:
+        if col_name in cols:
+            col_idx = cols.index(col_name) + 1
+            worksheet.cell(row=1, column=col_idx).fill = dark_grey_fill
+
+
+def _apply_change_highlighting_and_group_borders(worksheet, download_df, cols, bright_green_font, red_font):
     """
     For every student (grouped by 'SAP ID'), compares each reviewer row
     (Moderator / Reval 1 / Reval 2) against that student's Examiner row and:
@@ -1004,7 +1088,7 @@ def _apply_change_highlighting_and_group_borders(worksheet, download_df, cols, d
                     ex_val = float(ex_val_str)
                     cur_val = float(cur_val_str)
                     if cur_val > ex_val:
-                        cell.font = dark_green_font
+                        cell.font = bright_green_font
                     elif cur_val < ex_val:
                         cell.font = red_font
                 except (ValueError, TypeError):
@@ -1019,7 +1103,7 @@ def _apply_change_highlighting_and_group_borders(worksheet, download_df, cols, d
                 if ex_grade in GRADE_RANKS and cur_grade in GRADE_RANKS:
                     cell = worksheet.cell(row=excel_row_num, column=grade_col_idx)
                     if GRADE_RANKS[cur_grade] > GRADE_RANKS[ex_grade]:
-                        cell.font = dark_green_font
+                        cell.font = bright_green_font
                     elif GRADE_RANKS[cur_grade] < GRADE_RANKS[ex_grade]:
                         cell.font = red_font
 
@@ -1035,7 +1119,7 @@ def _apply_change_highlighting_and_group_borders(worksheet, download_df, cols, d
                         ex_tot = float(ex_tot_str)
                         cur_tot = float(cur_tot_str)
                         if cur_tot > ex_tot:
-                            cell.font = dark_green_font
+                            cell.font = bright_green_font
                         elif cur_tot < ex_tot:
                             cell.font = red_font
                     except (ValueError, TypeError):
@@ -1051,7 +1135,7 @@ def _apply_change_highlighting_and_group_borders(worksheet, download_df, cols, d
                     try:
                         chg_val = float(chg_str)
                         if chg_val > 0:
-                            cell.font = dark_green_font
+                            cell.font = bright_green_font
                         elif chg_val < 0:
                             cell.font = red_font
                     except (ValueError, TypeError):
@@ -1062,6 +1146,37 @@ def _apply_change_highlighting_and_group_borders(worksheet, download_df, cols, d
         for c_idx in range(1, worksheet.max_column + 1):
             cell = worksheet.cell(row=last_row_idx, column=c_idx)
             cell.border = Border(left=thin_side, right=thin_side, top=cell.border.top, bottom=medium_side)
+
+
+def _apply_semester_marks_highlighting(worksheet, download_df, cols, green_fill, red_fill):
+    """
+    For every row where 'Semester Marks' is populated (Moderator rows, or an
+    Examiner row with no corresponding Moderator record), compares it against
+    that same row's TotalObtainedScore and fills the cell:
+      - light green if Semester Marks == TotalObtainedScore
+      - light red if Semester Marks != TotalObtainedScore
+    Rows where Semester Marks is blank are left untouched.
+    """
+    if "Semester Marks" not in download_df.columns or "TotalObtainedScore" not in download_df.columns:
+        return
+
+    sem_col_idx = cols.index("Semester Marks") + 1
+
+    for row_idx in download_df.index:
+        sem_val_str = str(download_df.loc[row_idx, "Semester Marks"]).strip()
+        if sem_val_str == "" or sem_val_str.upper() == "NA":
+            continue
+
+        tot_val_str = str(download_df.loc[row_idx, "TotalObtainedScore"]).strip()
+        try:
+            sem_val = float(re.sub(r"^\+\s*", "", sem_val_str))
+            tot_val = float(tot_val_str)
+        except (ValueError, TypeError):
+            continue
+
+        excel_row_num = row_idx + 2  # +1 for header row, +1 for 1-based Excel rows.
+        cell = worksheet.cell(row=excel_row_num, column=sem_col_idx)
+        cell.fill = green_fill if sem_val == tot_val else red_fill
 
 
 def to_excel_bytes(df):
@@ -1097,9 +1212,10 @@ def to_excel_bytes(df):
 def to_excel_bytes_formatted(df):
     """
     Formatted output Excel containing ALL UserTypes, GMR columns, Change %,
-    center alignment, fixed width 15 for GMR/Change %/Email columns, row height 30 for header with wrap text,
-    darker green text (#006100), light green fill (#E2EFDA) for Moderator rows, thick bottom border per student, 
-    F2 freeze pane, conditional formatting, and interactive Data Validation pop-up if eligible.
+    center alignment, fixed width 10 for GMR/Change %/Email columns, row height 30 for header with wrap text,
+    bright green text (#00B050), light green fill (#E2EFDA) for Moderator rows, thick bottom border per student, 
+    F2 freeze pane, conditional formatting, medium-orange (60% lighter) GMR/Change % header cells,
+    35%-darker-grey TotalObtainedScore header cell, and interactive Data Validation pop-up if eligible.
     """
     download_df = process_data_for_download(df, include_all_usertypes=True)
     buffer = io.BytesIO()
@@ -1116,17 +1232,19 @@ def to_excel_bytes_formatted(df):
         worksheet.row_dimensions[1].height = 30
 
         mod_fill = PatternFill(start_color="E2EFDA", end_color="E2EFDA", fill_type="solid")
-        dark_green_font = Font(color="006100", bold=True)  # Darker green than the preview's #9ACD32 - more legible on white Excel cells.
+        bright_green_font = Font(color="00B050", bold=True)  # Standard Excel bright green for high visibility
         red_font = Font(color="FF4500", bold=True)
+        sem_marks_green_fill = PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid")
+        sem_marks_red_fill = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")
 
         cols = download_df.columns.tolist()
 
-        fixed_15_cols = {
-            "Semester Total Max Marks", "Internal Marks",
+        fixed_10_cols = {
+            "Semester Total Max Marks", "Semester Marks", "Internal Marks",
             "Total Max Marks", "Total Marks Obtained", "Grade", "Change %"
         }
         align_center_col_names = {
-            "SrNo", "Subject code", "Grade", "Internal Marks",
+            "SrNo", "Subject code", "Grade", "Internal Marks", "Semester Marks",
             "Total Max Marks", "Semester Total Max Marks", "Total Marks Obtained", "Change %"
         }
 
@@ -1141,14 +1259,21 @@ def to_excel_bytes_formatted(df):
         )
 
         # Green/red change highlighting + thick per-student borders.
-        _apply_change_highlighting_and_group_borders(worksheet, download_df, cols, dark_green_font, red_font)
+        _apply_change_highlighting_and_group_borders(worksheet, download_df, cols, bright_green_font, red_font)
+
+        # Semester Marks vs TotalObtainedScore match/mismatch cell fill.
+        _apply_semester_marks_highlighting(worksheet, download_df, cols, sem_marks_green_fill, sem_marks_red_fill)
+
+        # Header cell fills: GMR/Change % columns -> medium orange (60% lighter);
+        # TotalObtainedScore -> 35% darker grey.
+        _apply_header_highlight_fills(worksheet, cols, fixed_10_cols, {"TotalObtainedScore"})
 
         # Interactive pop-up Data Validation message if this paper is eligible for 100% Moderation.
         _, _, _, is_eligible = compute_moderation_10pct_metrics(df)
         add_sheet_popup_validation(worksheet, is_eligible)
 
-        # Auto-size columns, except the GMR/Change % block which gets a fixed width of 15.
-        _autosize_or_fixed_width_columns(worksheet, fixed_width_cols=fixed_15_cols, fixed_width=15)
+        # Auto-size columns, except the GMR/Change % block which gets a fixed width of 10.
+        _autosize_or_fixed_width_columns(worksheet, fixed_width_cols=fixed_10_cols, fixed_width=10)
 
     return buffer.getvalue()
 
@@ -1157,7 +1282,9 @@ def create_consolidated_multi_sheet_excel(dfs_list):
     """
     Clubs all processed dataframes into a single Excel workbook 
     with separate sheets named by Subject Name-Subject code containing ALL UserTypes,
-    Change %, center alignment, F2 freeze pane, thick student borders, and interactive pop-up message if eligible.
+    Change %, center alignment, fixed width 10 for GMR/Change %/Email columns, F2 freeze pane,
+    thick student borders, medium-orange (60% lighter) GMR/Change % header cells, 35%-darker-grey
+    TotalObtainedScore header cell, and interactive pop-up message if eligible.
     """
     buffer = io.BytesIO()
     used_sheet_names = set()
@@ -1183,17 +1310,19 @@ def create_consolidated_multi_sheet_excel(dfs_list):
             worksheet.row_dimensions[1].height = 30
 
             mod_fill = PatternFill(start_color="E2EFDA", end_color="E2EFDA", fill_type="solid")
-            dark_green_font = Font(color="006100", bold=True)
+            bright_green_font = Font(color="00B050", bold=True)  # Standard Excel bright green for high visibility
             red_font = Font(color="FF4500", bold=True)
+            sem_marks_green_fill = PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid")
+            sem_marks_red_fill = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")
 
             cols = download_df.columns.tolist()
 
-            fixed_15_cols = {
-                "Semester Total Max Marks", "Internal Marks",
+            fixed_10_cols = {
+                "Semester Total Max Marks", "Semester Marks", "Internal Marks",
                 "Total Max Marks", "Total Marks Obtained", "Grade", "Change %"
             }
             align_center_col_names = {
-                "SrNo", "Subject code", "Grade", "Internal Marks",
+                "SrNo", "Subject code", "Grade", "Internal Marks", "Semester Marks",
                 "Total Max Marks", "Semester Total Max Marks", "Total Marks Obtained", "Change %"
             }
 
@@ -1201,17 +1330,22 @@ def create_consolidated_multi_sheet_excel(dfs_list):
             total_score_col_idx = cols.index("TotalObtainedScore") + 1 if "TotalObtainedScore" in cols else None
             user_type_col_idx = cols.index("UserType") if "UserType" in cols else None
 
-            # Same three styling passes as to_excel_bytes_formatted(), applied per-sheet.
+            # Same styling passes as to_excel_bytes_formatted(), applied per-sheet.
             _apply_grid_styling(
                 worksheet, cols, center_col_indices, total_score_col_idx,
                 download_df=download_df, user_type_col_idx=user_type_col_idx, moderator_fill=mod_fill,
             )
-            _apply_change_highlighting_and_group_borders(worksheet, download_df, cols, dark_green_font, red_font)
+            _apply_change_highlighting_and_group_borders(worksheet, download_df, cols, bright_green_font, red_font)
+            _apply_semester_marks_highlighting(worksheet, download_df, cols, sem_marks_green_fill, sem_marks_red_fill)
+
+            # Header cell fills: GMR/Change % columns -> medium orange (60% lighter);
+            # TotalObtainedScore -> 35% darker grey.
+            _apply_header_highlight_fills(worksheet, cols, fixed_10_cols, {"TotalObtainedScore"})
 
             _, _, _, is_eligible = compute_moderation_10pct_metrics(df)
             add_sheet_popup_validation(worksheet, is_eligible)
 
-            _autosize_or_fixed_width_columns(worksheet, fixed_width_cols=fixed_15_cols, fixed_width=15)
+            _autosize_or_fixed_width_columns(worksheet, fixed_width_cols=fixed_10_cols, fixed_width=10)
 
     return buffer.getvalue()
 
@@ -1250,7 +1384,11 @@ def show():
         )
 
     if not uploaded_files:
-        return  # Nothing to process yet - wait for the user to upload at least one Questionwise file.
+        # Nothing to process yet - still show the Help section so the user can
+        # read the documentation before uploading anything.
+        st.markdown("---")
+        render_help_section()
+        return  # Wait for the user to upload at least one Questionwise file.
 
     # Load GMR File if present (optional - the tool still works without it, just without GMR columns).
     gmr_df = None
@@ -1356,10 +1494,9 @@ def show():
                 st.markdown(
                     f"""
                     <div style="background-color:#1E293B;padding:12px;border-radius:8px;color:white;border:1px solid #334155;">
-                        <span style="font-size:15px;font-weight:600;">Eligible for 100% Moderation?</span><br/>
-                        <span style="font-size:15px;">Moderators |Change %| > 10%: <b>{cnt_gt_10} / {mod_cnt}</b></span><br/>
-                        <span style="font-size:15px;">Change % (>10%):</span><br/>
-                        <span style="font-size:45px;font-weight:bold;{color_style}">{pct_str}</span>
+                        <span style="font-size:15px;font-weight:600;"> Require 100% Moderation?</span><br/>
+                        <span style="font-size:15px;"> Change % > 10%: <b>{cnt_gt_10} / {mod_cnt}</b></span><br/>                        
+                        <span style="font-size:60px;font-weight:bold;{color_style}">{pct_str}</span>
                     </div>
                     """,
                     unsafe_allow_html=True
@@ -1487,3 +1624,157 @@ def show():
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                     key="dl_multi_sheet_all"
                 )
+
+    # --- Tool Description / Help (collapsed by default) ---
+    st.markdown("---")
+    render_help_section()
+
+
+def render_help_section():
+    """
+    Renders a collapsible 'Tool Description / Help' section at the bottom of
+    the page. Collapsed by default (expanded=False) - it only opens when the
+    user clicks on it. Purely documentation; no processing logic lives here.
+    """
+    with st.expander("ℹ️ Tool Description / Help - click to expand", expanded=False):
+        st.markdown(
+            """
+### 1. Purpose of the Tool
+The Questionwise Checker helps exam cell / evaluation staff process **Questionwise mark-sheet
+exports** from the examination system. It opens password-protected or unprotected Excel files,
+cleans and sorts them, optionally cross-references a **GMR (Grade/Marks Register) Excel file** to
+pull in Internal Marks, Max Marks, Semester Marks and computed Grades, calculates the **Change %**
+introduced by moderation, flags papers that qualify for **100% moderation**, and produces several
+ready-to-use preview tabs and downloadable Excel outputs.
+
+---
+### 2. Required Input Files & Formats
+- **Questionwise Excel/Excels** (`.xlsx`, one or more files) - the raw export from the examination
+  system. May be password-protected (the tool automatically tries a small list of known passwords)
+  or unprotected. Must contain at minimum a `PRNNumber` and `UserType` column after cleaning, plus
+  the standard identifier columns (`SrNo`, `Subject Name-Subject code`, `SubjectName`, `Semester`,
+  `RollNo`, `Name`, `CampusName`, `MarkAttendance`, `Email`, `TotalObtainedScore`) and one column
+  per question (headers like `Q1 (10)` where the number in parentheses is that question's max mark).
+- **GMR Excel** (`.xlsx` / `.xls`, single file, optional) - the Grade/Marks Register export. Must
+  contain `Student Number`, `Modulecode`, `AGR type`, and `Grades` columns for any lookups to run;
+  `MAX Marks` is additionally needed for the Max Marks lookups. If the GMR file is not uploaded, or
+  is missing these columns, the tool still works - the GMR-derived columns are simply left blank.
+
+---
+### 3. Upload Options
+- **Upload Questionwise Excel/Excels** - accepts multiple files at once; each is processed and
+  displayed independently, one section per file, so one bad/corrupt file does not block the rest.
+- **Upload GMR Excel** - a single optional file used to enrich *every* uploaded Questionwise file
+  with Internal Marks, Total Max Marks, Semester Total Max Marks, Semester Marks and Grade.
+
+---
+### 4. Matching Logic Between Questionwise and GMR Files
+Every lookup uses the same composite key: **PRNNumber + Subject Name-Subject code** (Questionwise
+side) matched against **Student Number + Modulecode** (GMR side), both stripped of surrounding
+whitespace and concatenated into a single lookup string. A Questionwise row is only enriched if its
+key finds an exact match in the GMR file.
+
+---
+### 5. Conditions & Filters Applied During Processing
+- Rows with a blank `PRNNumber`, fully-empty rows, and the export's trailing `Count: N` footer row
+  are removed during cleaning.
+- `PRNNumber` is coerced to numeric; any row that isn't a valid number is dropped.
+- Rows are sorted per student in the fixed order **Examiner → Moderator → Reval 1 → Reval 2**.
+
+---
+### 6. Grade, Internal Marks, Internal Total Marks, Semester Marks & Other Lookups
+- **Internal Marks** - `Grades` value from GMR rows where `AGR type` contains "Internal Total".
+- **Total Max Marks** - `MAX Marks` value from GMR rows where `AGR type` contains "Composite ".
+- **Semester Total Max Marks** - `MAX Marks` value from GMR rows where `AGR type` contains
+  "Semester Total".
+- **Semester Marks** *(new)* - `Grades` value from GMR rows where `AGR type` contains "Semester
+  Total Marks" (e.g. `Semester Total Marks(60 )`). Uses the same PRN + Subject code matching key
+  as the other lookups. It is placed immediately after **Semester Total Max Marks** and is only
+  ever populated on:
+  - **every Moderator row**, and
+  - an **Examiner row that has no corresponding Moderator row** for that same student + module.
+
+  If both an Examiner and a Moderator row exist for a student/module, Semester Marks is shown only
+  on the Moderator row; the Examiner row is left blank. Once fetched, Semester Marks is compared to
+  that row's `TotalObtainedScore`: a **match is filled light green**, a **mismatch is filled light
+  red**. This colouring appears in every preview tab and in both the Formatted File and the
+  Consolidated Multi-Sheet Excel - it is intentionally excluded from the Cleaned File and the ZIP
+  of Output Excel Files.
+- **Total Marks Obtained** - `TotalObtainedScore` (exam script) + `Internal Marks` (GMR). If both
+  are blank, this is left blank; otherwise a missing side is treated as 0.
+- **Grade** - derived from `Total Marks Obtained` / `Total Max Marks` as a percentage:
+  O ≥ 90%, A+ ≥ 80%, A ≥ 70%, B+ ≥ 60%, B ≥ 55%, C ≥ 50%, P ≥ 40%, otherwise F.
+
+---
+### 7. Moderator & Examiner Processing Logic
+- Each student's rows are grouped and sorted so Examiner always appears first, followed by
+  Moderator, Reval 1, and Reval 2 (if present).
+- For the **Cleaned File** / **ZIP** export, Reval rows are dropped entirely, and for any student
+  who has a Moderator row, only that Moderator row is kept (the Examiner row is dropped, since the
+  Moderator mark is treated as final). Students with no moderation keep their Examiner row as-is.
+- The **Formatted File** and **Consolidated Multi-Sheet Excel** keep **all** UserTypes
+  (Examiner, Moderator, Reval 1, Reval 2) so the full review trail is visible.
+
+---
+### 8. Change % Calculation & Moderation Analysis
+`Change % = (Moderator TotalObtainedScore − Examiner TotalObtainedScore) / Denominator × 100`,
+recorded only on the Moderator row. The denominator is chosen in priority order: **Semester Total
+Max Marks** (from GMR) → **Total Max Marks** (from GMR) → sum of question max marks parsed from the
+column headers (used only when no GMR file is available). A paper is flagged **"Eligible for 100%
+Moderation"** when more than 50% of Moderator rows show an absolute Change % greater than 10%.
+
+---
+### 9. Conditional Formatting Rules & Colour Meanings
+- **Question marks, Grade, Total Marks Obtained, Change %** (reviewer vs Examiner comparison):
+  bright green text = increased/improved, red text = decreased/dropped, red text = a mark that
+  existed for the Examiner but is missing for the reviewer.
+- **Semester Marks vs TotalObtainedScore**: light green cell fill = values match, light red cell
+  fill = values differ.
+- **Row background** (previews only): Moderator rows are shown on a dark green background, Reval 1
+  on dark blue, Reval 2 on dark purple, for quick visual scanning.
+- **Moderator row fill** (Formatted File / Consolidated Excel only): light green row fill, plus a
+  medium-thickness bottom border marking the end of each student's block.
+- **100% Moderation pop-up**: if a paper is eligible, opening the Excel file and clicking cell A1
+  shows an on-screen alert message.
+
+---
+### 10. Preview Tabs
+- **📋 All Data Preview** - every row of the processed file, fully styled and colour-coded.
+- **🔍 Moderation / Revaluation Cases Only** - only students who have at least one Moderator, Reval
+  1, or Reval 2 row.
+- **⚡ Changes Only** - only students where a reviewer's `TotalObtainedScore` actually differs from
+  the Examiner's.
+
+---
+### 11. Downloadable Outputs
+- **📥 Download Cleaned File** - legacy/simple export. Reval rows removed, Moderator-only rows kept
+  where applicable, GMR columns (Internal Marks, Total/Semester Max Marks, **Semester Marks**,
+  Total Marks Obtained, Grade, Change %) **not included**.
+- **🎨 Download Formatted File** - all UserTypes, all GMR columns including **Semester Marks**,
+  Change %, centered alignment, header freeze, thick per-student borders, green/red highlighting,
+  Semester Marks match/mismatch fill, and the 100% Moderation pop-up if eligible.
+- **📦 Download All Output Excel Files (ZIP)** - one Cleaned File per uploaded Questionwise file,
+  bundled into a single ZIP (Semester Marks **not included**, matching the Cleaned File format).
+- **📊 Download Consolidated Multi-Sheet Excel** - one workbook with a separate sheet per uploaded
+  file (only offered when 2+ files are uploaded), each sheet formatted the same way as the
+  Formatted File, including **Semester Marks**.
+
+---
+### 12. Validation Rules, Assumptions & Processing Workflow
+1. Upload one or more Questionwise files (and optionally a GMR file).
+2. Each file is decrypted (if needed) and loaded.
+3. Rows are cleaned (blank/footer rows removed) and sorted into student order.
+4. If a GMR file was supplied, Internal Marks, Total Max Marks, Semester Total Max Marks, Semester
+   Marks, Total Marks Obtained, and Grade are looked up/calculated; otherwise these columns stay
+   blank.
+5. Change % is calculated for Moderator rows, and GMR/derived columns are reordered directly after
+   `TotalObtainedScore`.
+6. Summary cards, paper info, and the three preview tabs are rendered.
+7. Individual Cleaned/Formatted downloads are generated per file, plus bulk ZIP and Consolidated
+   Multi-Sheet downloads across all uploaded files.
+
+**Assumptions**: a Questionwise file represents a single paper/module; `PRNNumber` uniquely
+identifies a student within that file; non-numeric scores (e.g. "AB", "UFM") are treated as
+absent/unfair-means and excluded from numeric comparisons rather than causing errors.
+            """
+        )

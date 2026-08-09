@@ -388,39 +388,63 @@ def process_data(mkcl_files, student_lookup, college_choice, progress_callback=N
             else:
                 df = df.iloc[0:0]
 
-            # 3. GPA Filtering (Aware of Lateral Admission at Sem 3 or Sem 5)
+            # 3. GPA Filtering (Aware of Lateral Admission & UG vs PG programs)
             student_re_col = next((c for c in df.columns if c.lower() == "student re"), None)
+            stu_num_col = next((c for c in df.columns if "student number" in c.lower()), None)
+            if not stu_num_col and len(df.columns) > 0:
+                stu_num_col = df.columns[0]
+
+            has_sem5_col = any("sem 5" in c.lower() for c in df.columns)
+            has_sem6_col = any("sem 6" in c.lower() for c in df.columns)
+
             sem3_gpa_col = next((c for c in df.columns if c.lower() == "sem 3_gpa"), None)
             sem4_gpa_col = next((c for c in df.columns if c.lower() == "sem 4_gpa"), None)
             sem5_gpa_col = next((c for c in df.columns if c.lower() == "sem 5_gpa"), None)
             sem6_gpa_col = next((c for c in df.columns if c.lower() == "sem 6_gpa"), None)
 
-            target_sem_gpas = ["SEM 1_GPA", "SEM 2_GPA", "SEM 3_GPA", "SEM 4_GPA", "SEM 5_GPA", "SEM 6_GPA"]
+            target_sem_gpas = [c for c in ["SEM 1_GPA", "SEM 2_GPA", "SEM 3_GPA", "SEM 4_GPA", "SEM 5_GPA", "SEM 6_GPA"] if c in df.columns]
 
             def row_passes_gpa_filter(row):
+                stu_key = sanitize_key(row[stu_num_col]) if stu_num_col else ""
+                student_info = student_lookup.get(stu_key, {})
+                prog_name = student_info.get("program", "") if isinstance(student_info, dict) else str(student_info)
+
+                # Post Graduate (PG) programs start with 'M' or have only 4 semesters in the report
+                is_pg = prog_name.strip().upper().startswith("M") or (not has_sem5_col and not has_sem6_col)
+
                 re_val = str(row[student_re_col]).strip() if (student_re_col and pd.notna(row[student_re_col])) else ""
                 is_lateral = "lateral admission" in re_val.lower()
 
                 if is_lateral:
-                    # For Lateral Admission (Admitted directly in Semester 3 or Semester 5):
-                    # 1) SEM 5_GPA and SEM 6_GPA must be populated
-                    val5 = str(row[sem5_gpa_col]).strip() if (sem5_gpa_col and pd.notna(row[sem5_gpa_col])) else ""
-                    val6 = str(row[sem6_gpa_col]).strip() if (sem6_gpa_col and pd.notna(row[sem6_gpa_col])) else ""
-                    if not val5 or not val6 or val5.lower() == "nan" or val6.lower() == "nan":
-                        return False
+                    if is_pg:
+                        # PG Lateral Admission (Admitted directly in Semester 3):
+                        # SEM 3_GPA and SEM 4_GPA must be populated
+                        val3 = str(row[sem3_gpa_col]).strip() if (sem3_gpa_col and pd.notna(row[sem3_gpa_col])) else ""
+                        val4 = str(row[sem4_gpa_col]).strip() if (sem4_gpa_col and pd.notna(row[sem4_gpa_col])) else ""
+                        
+                        if not val3 or not val4 or val3.lower() == "nan" or val4.lower() == "nan":
+                            return False
+                        return True
+                    else:
+                        # UG Lateral Admission (Admitted directly in Semester 3 or Semester 5):
+                        # 1) SEM 5_GPA and SEM 6_GPA must be populated
+                        val5 = str(row[sem5_gpa_col]).strip() if (sem5_gpa_col and pd.notna(row[sem5_gpa_col])) else ""
+                        val6 = str(row[sem6_gpa_col]).strip() if (sem6_gpa_col and pd.notna(row[sem6_gpa_col])) else ""
+                        if not val5 or not val6 or val5.lower() == "nan" or val6.lower() == "nan":
+                            return False
 
-                    # 2) Check Sem 3 & Sem 4 GPAs:
-                    val3 = str(row[sem3_gpa_col]).strip() if (sem3_gpa_col and pd.notna(row[sem3_gpa_col])) else ""
-                    val4 = str(row[sem4_gpa_col]).strip() if (sem4_gpa_col and pd.notna(row[sem4_gpa_col])) else ""
-                    
-                    if val3.lower() == "nan": val3 = ""
-                    if val4.lower() == "nan": val4 = ""
+                        # 2) Check Sem 3 & Sem 4 GPAs:
+                        val3 = str(row[sem3_gpa_col]).strip() if (sem3_gpa_col and pd.notna(row[sem3_gpa_col])) else ""
+                        val4 = str(row[sem4_gpa_col]).strip() if (sem4_gpa_col and pd.notna(row[sem4_gpa_col])) else ""
+                        
+                        if val3.lower() == "nan": val3 = ""
+                        if val4.lower() == "nan": val4 = ""
 
-                    # If one of Sem 3 or Sem 4 GPA is present, both must be present
-                    if bool(val3) != bool(val4):
-                        return False
+                        # If one of Sem 3 or Sem 4 GPA is present, both must be present
+                        if bool(val3) != bool(val4):
+                            return False
 
-                    return True
+                        return True
                 else:
                     # Standard student: All present SEM X_GPA columns must contain a value
                     for sem_gpa_name in target_sem_gpas:
@@ -511,9 +535,9 @@ def process_data(mkcl_files, student_lookup, college_choice, progress_callback=N
         out_df["COLL_NAME"] = "Narsee Monjee College of Commerce & Economics (Empowered Autonomous)"
         out_df["COLL_NAMEM"] = "नरसी मोनजी कॉलेज ऑफ कॉमर्स आणि इकोनॉमिक्स (स्वायत्त)"
 
-    elif college_choice == "UPG College":
+    elif college_choice == "Usha Pravin Gandhi College":
         out_df["COLL_NO"] = "598"
-        out_df["COLL_NAME"] = "UPG College of Arts, Science & Commerce (Autonomous)"
+        out_df["COLL_NAME"] = "Usha Pravin Gandhi College of Arts, Science & Commerce (Autonomous)"
         out_df["COLL_NAMEM"] = "उषा प्रविण गांधी कॉलेज ऑफ आर्टस्, सायन्स अँन्ड कॉमर्स (स्वायत्त)"
 
     out_df["SEX"] = out_df["SEX"].apply(map_gender)
@@ -556,7 +580,10 @@ def generate_formatted_excel(df: pd.DataFrame, progress_callback=None) -> bytes:
     font_regular = Font(name="Times New Roman", size=11, bold=False)
     font_header = Font(name="Times New Roman", size=11, bold=True)
     font_cgpa_source_file = Font(name="Times New Roman", size=11, italic=True, color="808080")
-    header_fill = PatternFill(start_color="D9D9D9", end_color="D9D9D9", fill_type="solid")
+    
+    # Header fills
+    header_fill_default = PatternFill(start_color="D9D9D9", end_color="D9D9D9", fill_type="solid")
+    header_fill_orange = PatternFill(start_color="f1c232", end_color="f1c232", fill_type="solid")  # Light Orange
     
     header_align = Alignment(horizontal="center", vertical="center", wrap_text=False)
     center_align = Alignment(horizontal="center", vertical="center")
@@ -568,11 +595,13 @@ def generate_formatted_excel(df: pd.DataFrame, progress_callback=None) -> bytes:
         top=thin_border_side, bottom=thin_border_side
     )
 
+    orange_header_columns = {"APAAR ID", "CGPA", "CGPA Source File"}
+
     ws.append(list(df.columns))
     for col_idx in range(1, len(df.columns) + 1):
         cell = ws.cell(row=1, column=col_idx)
         cell.font = font_header
-        cell.fill = header_fill
+        cell.fill = header_fill_orange if cell.value in orange_header_columns else header_fill_default
         cell.alignment = header_align
         cell.border = cell_border
 
@@ -624,7 +653,7 @@ def generate_formatted_excel(df: pd.DataFrame, progress_callback=None) -> bytes:
     for col_idx in range(1, len(stats_headers) + 1):
         cell = ws_stats.cell(row=1, column=col_idx)
         cell.font = font_header
-        cell.fill = header_fill
+        cell.fill = header_fill_default
         cell.alignment = header_align
         cell.border = cell_border
 
@@ -706,8 +735,10 @@ def show():
             options=[
                 "Mithibai College",
                 "Narsee Monjee College",
-                "UPG College"                
+                "Usha Pravin Gandhi College"                
             ],
+            index=None,
+            placeholder="Select College",
             label_visibility="collapsed"
         )
 
@@ -729,7 +760,7 @@ def show():
 
     st.markdown("---")
 
-    process_ready = bool(mkcl_files and master_files)
+    process_ready = bool(college_option and mkcl_files and master_files)
 
     btn_col, progress_col = st.columns([1, 2])
     with btn_col:
@@ -738,7 +769,7 @@ def show():
         progress_placeholder = st.empty()
 
     if not process_ready:
-        st.info("💡 Upload at least one MKCL Report file AND one Student Master Data file to enable processing.")
+        st.info("💡 Select a college and upload at least one MKCL Report file AND one Student Master Data file to enable processing.")
 
     if process_btn and process_ready:
         try:
