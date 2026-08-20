@@ -2,22 +2,27 @@
 ==================================================
 EXAM TOOLS - MAIN APP
 ==================================================
-
-PURPOSE
---------------------------------------------------
-This is the entry point of the Streamlit app. It handles:
-  1. Page setup (title, icon, layout).
-  2. The sidebar menu & Dashboard tool cards.
-  3. Routing to the right "page" based on user selection.
-
-The actual logic for each tool lives in its own file inside the
-`Modules/` subfolders.
-==================================================
+Centralized Examination Automation & Analytics Suite
 """
 
 import streamlit as st
 
-# Import Questionwise Checker module tool
+# --------------------
+# Module Imports
+# --------------------
+try:
+    from Modules.CED_Examination_Reports.ced_examination_reports import show as ced_examination_reports
+except Exception:
+    try:
+        from Modules.OSM_Dashboard.osm_dashboard import show as ced_examination_reports
+    except Exception as import_error:
+        ced_examination_reports = None
+        _ced_import_error_message = str(import_error)
+    else:
+        _ced_import_error_message = None
+else:
+    _ced_import_error_message = None
+
 try:
     from Modules.Questionwise_Checker.questionwise_checker import show as questionwise_checker
 except Exception as import_error:
@@ -26,7 +31,6 @@ except Exception as import_error:
 else:
     _qc_import_error_message = None
 
-# Import Letters to Ext. Examiners module tool
 try:
     from Modules.Letters_to_Ext_Exmnrs.letters_to_ext_exmnrs import show as letters_to_ext_examiners
 except Exception as import_error:
@@ -40,7 +44,6 @@ except Exception as import_error:
 else:
     _lte_import_error_message = None
 
-# Import Rank List Generator module tool
 try:
     from Modules.Rank_List_Generator.rank_list_generator import show as rank_list_generator
 except Exception as import_error:
@@ -49,7 +52,32 @@ except Exception as import_error:
 else:
     _rlg_import_error_message = None
 
-# Import Gracing Checker module tool
+try:
+    from Modules.Result_Gazette_to_Excel.result_gazette_to_excel import show as result_gazette_to_excel
+except Exception:
+    try:
+        from Modules.Result_Gazette_to_Excel.result_gazette_to_excel import main as result_gazette_to_excel
+    except Exception as import_error:
+        result_gazette_to_excel = None
+        _rgte_import_error_message = str(import_error)
+    else:
+        _rgte_import_error_message = None
+else:
+    _rgte_import_error_message = None
+
+try:
+    from Modules.Grade_Sheet_to_Excel.grade_sheet_to_excel import show as grade_sheet_to_excel
+except Exception:
+    try:
+        from Modules.Grade_Sheet_to_Excel.grade_sheet_to_excel import main as grade_sheet_to_excel
+    except Exception as import_error:
+        grade_sheet_to_excel = None
+        _gste_import_error_message = str(import_error)
+    else:
+        _gste_import_error_message = None
+else:
+    _gste_import_error_message = None
+
 try:
     from Modules.Gracing_Checker.gracing_checker import show as gracing_checker
 except Exception as import_error:
@@ -58,12 +86,10 @@ except Exception as import_error:
 else:
     _gc_import_error_message = None
 
-# Import Exam Timetable Generator module tool
 try:
     from Modules.Exam_Timetable_Generator.exam_timetable_generator import main as exam_timetable_generator
 except Exception as import_error:
     try:
-        # Fallback if the function inside exam_timetable_generator.py is named `show`
         from Modules.Exam_Timetable_Generator.exam_timetable_generator import show as exam_timetable_generator
     except Exception as import_error_2:
         exam_timetable_generator = None
@@ -73,7 +99,6 @@ except Exception as import_error:
 else:
     _etg_import_error_message = None
 
-# Import Convocation Data Generator module tool
 try:
     from Modules.Convocation_Data_Generator.convocation_data_generator import show as convocation_data_generator
 except Exception as import_error:
@@ -87,7 +112,6 @@ except Exception as import_error:
 else:
     _cdg_import_error_message = None
 
-# Import Data Analysis module tool
 try:
     from Modules.Data_Analysis.data_analysis import show as data_analysis
 except Exception as import_error:
@@ -96,7 +120,6 @@ except Exception as import_error:
 else:
     _da_import_error_message = None
 
-# Import Merge Files module tool
 try:
     from Modules.Merge_Files.merge_files import show as merge_files
 except Exception as import_error:
@@ -110,25 +133,26 @@ else:
 # Page Configuration
 # --------------------
 st.set_page_config(
-    page_title="Exam Tools",
+    page_title="SVKM Exam Tools",
     page_icon="🎓",
     layout="wide",
+    initial_sidebar_state="expanded"
 )
 
-import streamlit as st
-
-st.set_page_config(page_title="Exam Timetable Generator", layout="wide")
-
-# Hide header, main menu, footer, and viewer badge ("Hosted by Streamlit")
+# Custom Styling: Hides Streamlit badges but preserves sidebar collapsed controls
 hide_streamlit_style = """
     <style>
     #MainMenu {visibility: hidden;}
     footer {visibility: hidden;}
-    header {visibility: hidden;}
-    .viewerBadge_container__1S-5D, .viewerBadge_link__1S-5D, [data-testid="stStatusWidget"] {
-        display: none !important;
+    
+    [data-testid="stSidebarCollapsedControl"] {
+        display: block !important;
+        visibility: visible !important;
+        z-index: 100000 !important;
+        color: var(--text-color, #1e3a8a) !important;
     }
-    div[class*="viewerBadge"] {
+    
+    .viewerBadge_container__1S-5D, .viewerBadge_link__1S-5D, [data-testid="stStatusWidget"] {
         display: none !important;
     }
     </style>
@@ -136,33 +160,18 @@ hide_streamlit_style = """
 st.markdown(hide_streamlit_style, unsafe_allow_html=True)
 
 # --------------------
-# Shared Session State
+# Shared Session State & Menu
 # --------------------
-if "students_processed" not in st.session_state:
-    st.session_state.students_processed = 0
-
-if "files_uploaded" not in st.session_state:
-    st.session_state.files_uploaded = 0
-
-if "selected_tool" not in st.session_state:
-    st.session_state.selected_tool = "🏠 Dashboard"
-
-# Synchronize menu selection with session state
-def update_menu():
-    st.session_state.selected_tool = st.session_state.sidebar_radio
-
-# --------------------
-# Sidebar
-# --------------------
-st.sidebar.title("🎓 Exam Tools")
-
 tools_list = [
     "🏠 Dashboard",
+    "📊 OSM Dashboard",
     "📅 Exam Timetable Generator",
     "✅ Gracing Checker",
     "📝 Questionwise Checker",
     "✉️ Letters to Ext. Examiners",
     "🏆 Rank List Generator",
+    "📑 Result Gazette PDF to Excel",
+    "🎓 Grade Sheet to Excel",
     "🎓 Convocation Data Generator",
     "🔍 Duplicate Checker",
     "📊 Result Analysis",
@@ -173,6 +182,17 @@ tools_list = [
     "⚙️ Settings",
 ]
 
+if "selected_tool" not in st.session_state or st.session_state.selected_tool not in tools_list:
+    st.session_state.selected_tool = "🏠 Dashboard"
+
+def update_menu():
+    st.session_state.selected_tool = st.session_state.sidebar_radio
+
+# --------------------
+# Sidebar
+# --------------------
+st.sidebar.title("🎓 Exam Tools")
+
 menu = st.sidebar.radio(
     "Select Tool",
     tools_list,
@@ -182,16 +202,20 @@ menu = st.sidebar.radio(
 )
 
 # --------------------
-# Dashboard Page
+# App Router
 # --------------------
-if st.session_state.selected_tool == "🏠 Dashboard":
 
+# 1. Main Dashboard
+if st.session_state.selected_tool == "🏠 Dashboard":
     st.title("🎓 Examination Automation Suite")
     st.caption("Select a tool below to begin processing examination records.")
     st.markdown("---")
 
-    # Defined tool cards with icons and descriptions
     tools_info = [
+        {
+            "name": "📊 OSM Dashboard",
+            "desc": "Track Online Screen Marking evaluation status, examiner workload, turnaround times, and pending papers.",
+        },
         {
             "name": "📅 Exam Timetable Generator",
             "desc": "Generate clash-free exam timetables for Regular and Re-Examinations using DSATUR graph coloring.",
@@ -211,6 +235,14 @@ if st.session_state.selected_tool == "🏠 Dashboard":
         {
             "name": "🏆 Rank List Generator",
             "desc": "Process student CGPAs across programs to extract top 5% rank holders and export formatted Word documents.",
+        },
+        {
+            "name": "📑 Result Gazette PDF to Excel",
+            "desc": "Extract metadata, course schemes, student result summaries, and subject-level data from PDF gazettes to Excel.",
+        },
+        {
+            "name": "🎓 Grade Sheet to Excel",
+            "desc": "Extract student demographics, multi-semester progression, CA/ESE marks, and grade summaries from individual Grade Sheet PDFs to Excel.",
         },
         {
             "name": "🎓 Convocation Data Generator",
@@ -242,10 +274,8 @@ if st.session_state.selected_tool == "🏠 Dashboard":
         },
     ]
 
-    # Grid layout for Tool Cards (2 cards per row)
     for i in range(0, len(tools_info), 2):
         col1, col2 = st.columns(2)
-        
         with col1:
             tool = tools_info[i]
             with st.container(border=True):
@@ -267,169 +297,130 @@ if st.session_state.selected_tool == "🏠 Dashboard":
                         st.session_state.selected_tool = tool["name"]
                         st.rerun()
 
-# --------------------
-# Exam Timetable Generator
-# --------------------
-elif st.session_state.selected_tool == "📅 Exam Timetable Generator":
+# 2. OSM Dashboard
+elif st.session_state.selected_tool == "📊 OSM Dashboard":
+    if ced_examination_reports is not None:
+        ced_examination_reports()
+    else:
+        st.title("📊 OSM Dashboard")
+        st.error(
+            "This tool could not be loaded due to an import error:\n\n"
+            f"`{_ced_import_error_message}`\n\n"
+            "Ensure that `Modules/CED_Examination_Reports/ced_examination_reports.py` exists "
+            "and defines a `show()` entry point function."
+        )
 
+# 3. Exam Timetable Generator
+elif st.session_state.selected_tool == "📅 Exam Timetable Generator":
     if exam_timetable_generator is not None:
         exam_timetable_generator()
     else:
         st.title("📅 Exam Timetable Generator")
-        st.error(
-            "This tool could not be loaded due to an import error:\n\n"
-            f"`{_etg_import_error_message}`\n\n"
-            "Ensure that `Modules/Exam_Timetable_Generator/exam_timetable_generator.py` exists "
-            "and defines a `main()` or `show()` entry point function."
-        )
+        st.error(f"`{_etg_import_error_message}`")
 
-# --------------------
-# Gracing Checker
-# --------------------
+# 4. Gracing Checker
 elif st.session_state.selected_tool == "✅ Gracing Checker":
-
     if gracing_checker is not None:
         gracing_checker()
     else:
         st.title("✅ Gracing Checker")
-        if _gc_import_error_message:
-            st.info("This tool file (`Modules/Gracing_Checker/gracing_checker.py`) is currently blank or under development.")
-        else:
-            st.error(
-                "This tool could not be loaded due to an import error:\n\n"
-                f"`{_gc_import_error_message}`\n\n"
-                "Check that `Modules/Gracing_Checker/gracing_checker.py` defines a `show()` function."
-            )
+        st.info("This tool is under development.")
 
-# --------------------
-# Questionwise Checker
-# --------------------
+# 5. Questionwise Checker
 elif st.session_state.selected_tool == "📝 Questionwise Checker":
-
     if questionwise_checker is not None:
         questionwise_checker()
     else:
         st.title("📝 Questionwise Checker")
-        st.error(
-            "This tool could not be loaded due to an import error:\n\n"
-            f"`{_qc_import_error_message}`\n\n"
-            "Check that `Modules/Questionwise_Checker/questionwise_checker.py` exists and that "
-            "all its dependencies (see requirements.txt) are installed."
-        )
+        st.error(f"`{_qc_import_error_message}`")
 
-# --------------------
-# Letters to Ext. Examiners
-# --------------------
+# 6. Letters to Ext. Examiners
 elif st.session_state.selected_tool == "✉️ Letters to Ext. Examiners":
-
     if letters_to_ext_examiners is not None:
         letters_to_ext_examiners()
     else:
         st.title("✉️ Letters to Ext. Examiners")
-        st.error(
-            "This tool could not be loaded due to an import error:\n\n"
-            f"`{_lte_import_error_message}`\n\n"
-            "Ensure that `Modules/Letters_to_Ext_Exmnrs/letters_to_ext_exmnrs.py` exists "
-            "and defines a `show()` or `main()` entry point function."
-        )
+        st.error(f"`{_lte_import_error_message}`")
 
-# --------------------
-# Rank List Generator
-# --------------------
+# 7. Rank List Generator
 elif st.session_state.selected_tool == "🏆 Rank List Generator":
-
     if rank_list_generator is not None:
         rank_list_generator()
     else:
         st.title("🏆 Rank List Generator")
+        st.error(f"`{_rlg_import_error_message}`")
+
+# 8. Result Gazette PDF to Excel
+elif st.session_state.selected_tool == "📑 Result Gazette PDF to Excel":
+    if result_gazette_to_excel is not None:
+        result_gazette_to_excel()
+    else:
+        st.title("📑 Result Gazette PDF to Excel")
         st.error(
             "This tool could not be loaded due to an import error:\n\n"
-            f"`{_rlg_import_error_message}`\n\n"
-            "Check that `Modules/Rank_List_Generator/rank_list_generator.py` exists and defines a `show()` function."
+            f"`{_rgte_import_error_message}`\n\n"
+            "Ensure that `Modules/Result_Gazette_to_Excel/result_gazette_to_excel.py` exists "
+            "and defines a `show()` or `main()` entry point function."
         )
 
-# --------------------
-# Convocation Data Generator
-# --------------------
-elif st.session_state.selected_tool == "🎓 Convocation Data Generator":
+# 9. Grade Sheet to Excel
+elif st.session_state.selected_tool == "🎓 Grade Sheet to Excel":
+    if grade_sheet_to_excel is not None:
+        grade_sheet_to_excel()
+    else:
+        st.title("🎓 Grade Sheet to Excel")
+        st.error(
+            "This tool could not be loaded due to an import error:\n\n"
+            f"`{_gste_import_error_message}`\n\n"
+            "Ensure that `Modules/Grade_Sheet_to_Excel/grade_sheet_to_excel.py` exists "
+            "and defines a `show()` or `main()` entry point function."
+        )
 
+# 10. Convocation Data Generator
+elif st.session_state.selected_tool == "🎓 Convocation Data Generator":
     if convocation_data_generator is not None:
         convocation_data_generator()
     else:
         st.title("🎓 Convocation Data Generator")
-        st.error(
-            "This tool could not be loaded due to an import error:\n\n"
-            f"`{_cdg_import_error_message}`\n\n"
-            "Check that `Modules/Convocation_Data_Generator/convocation_data_generator.py` exists and defines a `show()` or `main()` function."
-        )
+        st.error(f"`{_cdg_import_error_message}`")
 
-# --------------------
-# Duplicate Checker
-# --------------------
+# 11. Duplicate Checker
 elif st.session_state.selected_tool == "🔍 Duplicate Checker":
-
     st.title("🔍 Duplicate Checker")
     st.info("Tool under development")
 
-# --------------------
-# Result Analysis
-# --------------------
+# 12. Result Analysis
 elif st.session_state.selected_tool == "📊 Result Analysis":
-
     st.title("📊 Result Analysis")
     st.info("Tool under development")
 
-# --------------------
-# Data Analysis
-# --------------------
+# 13. Data Analysis
 elif st.session_state.selected_tool == "📈 Data Analysis":
-
     if data_analysis is not None:
         data_analysis()
     else:
         st.title("📈 Data Analysis")
-        st.error(
-            "This tool could not be loaded due to an import error:\n\n"
-            f"`{_da_import_error_message}`\n\n"
-            "Check that `Modules/Data_Analysis/data_analysis.py` exists, defines a `show()` function, "
-            "and that `plotly` is installed (add it to requirements.txt)."
-        )
+        st.error(f"`{_da_import_error_message}`")
 
-# --------------------
-# Data Cleaner
-# --------------------
+# 14. Data Cleaner
 elif st.session_state.selected_tool == "🧹 Data Cleaner":
-
     st.title("🧹 Data Cleaner")
     st.info("Tool under development")
 
-# --------------------
-# Merge Files
-# --------------------
+# 15. Merge Files
 elif st.session_state.selected_tool == "🔗 Merge Files":
-
     if merge_files is not None:
         merge_files()
     else:
         st.title("🔗 Merge Files")
-        st.error(
-            "This tool could not be loaded due to an import error:\n\n"
-            f"`{_mf_import_error_message}`\n\n"
-            "Check that `Modules/Merge_Files/merge_files.py` exists and defines a `show()` function."
-        )
+        st.error(f"`{_mf_import_error_message}`")
 
-# --------------------
-# SharePoint Import
-# --------------------
+# 16. SharePoint Import
 elif st.session_state.selected_tool == "☁️ SharePoint Import":
-
     st.title("☁️ SharePoint Import")
     st.info("Tool under development")
 
-# --------------------
-# Settings
-# --------------------
+# 17. Settings
 elif st.session_state.selected_tool == "⚙️ Settings":
-
     st.title("⚙️ Settings")
     st.info("Application settings will appear here")

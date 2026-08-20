@@ -10,3 +10,4 @@ requests
 msal
 reportlab
 plotly
+gdown
