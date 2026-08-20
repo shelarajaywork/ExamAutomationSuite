@@ -11,3 +11,4 @@ msal
 reportlab
 plotly
 gdown
+pdfplumber
