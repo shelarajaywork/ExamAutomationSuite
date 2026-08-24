@@ -293,14 +293,14 @@ def show():
         st.markdown('<div class="portal-header">🎓 Online Screen Marking (OSM) Analytics</div>', unsafe_allow_html=True)
         st.markdown('<div class="portal-sub">Executive Insights, Workload Analytics, SLA Deadlines & Rejection Management</div>', unsafe_allow_html=True)
     with h_col2:
-        if st.button("🔄", help="Sync Fresh Data from Google Drive", key="btn_top_sync_fresh", use_container_width=True):
+        if st.button("Sync", help="Sync Fresh Data from Google Drive", key="btn_top_sync_fresh", use_container_width=True):
             st.cache_data.clear()
             if os.path.exists(LOCAL_DOWNLOAD_DIR):
                 shutil.rmtree(LOCAL_DOWNLOAD_DIR, ignore_errors=True)
             st.rerun()
     with h_col3:
-        if st.button("🏠", help="Return to Main Dashboard", key="btn_top_home_dash", use_container_width=True):
-            st.session_state.selected_tool = "🏠 Dashboard"
+        if st.button("Home", help="Return to Main Dashboard", key="btn_top_home_dash", use_container_width=True):
+            st.session_state.selected_tool = "Dashboard"
             st.rerun()
 
     # Load dataset

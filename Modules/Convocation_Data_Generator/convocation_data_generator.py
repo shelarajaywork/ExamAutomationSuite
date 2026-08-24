@@ -210,20 +210,45 @@ def derive_faculty(degnm: str) -> str:
     
     degnm_str = str(degnm).strip()
     
-    commerce_pattern = r'(?i)\b(commerce|accounting|management|finance|financial|marketing|business|economics|b\.?com|m\.?com)\b'
+    # 1. Science & Technology: Technology, Engineering, Sciences, B.Tech/M.Tech, B.Sc/M.Sc, Computing, AI, Data Science
+    science_pattern = (
+        r'(?i)\b('
+        r'technology|engineering|tech|science|scientific|'
+        r'artificial|intelligent|intelligence|biochemistry|biotechnology|'
+        r'data|analytics|physics|chemistry|botany|zoology|microbiology|'
+        r'mathematics|statistics|information|cyber|robotics|'
+        r'b\.?sc\.?|m\.?sc\.?|b\.?tech\.?|m\.?tech\.?|b\.?e\.?|m\.?e\.?'
+        r')\b'
+    )
+    
+    # 2. Commerce & Management: Commerce, Management, Accounting, Finance, Marketing, B.Com, M.Com, BMS
+    commerce_pattern = (
+        r'(?i)\b('
+        r'commerce|accounting|accountancy|management|finance|financial|'
+        r'marketing|business|banking|insurance|b\.?com\.?|m\.?com\.?|bms'
+        r')\b'
+    )
+    
+    # 3. Humanities: Arts, Media, Mass Communication, Entertainment, Advertising, B.A., M.A.
+    humanities_pattern = (
+        r'(?i)\b('
+        r'arts|humanities|entertainment|media|multimedia|'
+        r'film|television|advertising|journalism|philosophy|'
+        r'sociology|english|gujarati|hindi|marathi|political|'
+        r'b\.?a\.?|m\.?a\.?'
+        r')\b'
+    )
+
+    if re.search(science_pattern, degnm_str):
+        return "Science & Technology"
+
     if re.search(commerce_pattern, degnm_str):
         return "Commerce & Management"
         
-    science_pattern = r'(?i)\b(science|artificial|intelligent|biochemistry|data|technology|b\.?sc\.?|m\.?sc\.?)\b'
-    if re.search(science_pattern, degnm_str):
-        return "Science & Technology"
-        
-    Humanities_pattern = r'(?i)\b(arts|entertainment|media|multimedia|film|television|advertising|b\.?a\.?|m\.?a\.?)\b'
-    if re.search(Humanities_pattern, degnm_str):
+    if re.search(humanities_pattern, degnm_str):
         return "Humanities"
         
     return ""
-
 
 def derive_subdegnm(degnm: str) -> str:
     if pd.isna(degnm) or not str(degnm).strip():
@@ -232,11 +257,10 @@ def derive_subdegnm(degnm: str) -> str:
     degnm_str = str(degnm).strip()
     if re.search(r'\bMASTERS?\b', degnm_str, re.IGNORECASE) or degnm_str.upper().startswith('M'):
         return "Two Year Degree Course"
-    if re.search(r'\bBACHELORS?\b', degnm_str, re.IGNORECASE) or degnm_str.upper().startswith('B'):
+    if re.search(r'\b(BACHELORS?|B\.?E\.?|B\.?TECH)\b', degnm_str, re.IGNORECASE) or degnm_str.upper().startswith('B'):
         return "Three Year Degree Course"
         
     return ""
-
 
 def map_gender(val) -> str:
     if pd.isna(val):
@@ -526,9 +550,9 @@ def process_data(mkcl_files, student_lookup, college_choice, progress_callback=N
         out_df["CGPA Source File"] = merged_mkcl[_CGPA_SOURCE_FILE_INTERNAL_COL].astype(str).str.strip()
 
     if college_choice == "Mithibai College":
-            out_df["COLL_NO"] = "132"
-            out_df["COLL_NAME"] = "Shri Vile Parle Kelvani Mandal's Mithibai College of Arts, Chauhan Institute of Science and Amrutben Jivanlal College of Commerce and Economics (Autonomous)"
-            out_df["COLL_NAMEM"] = "श्री विलेपार्ले केळवणी संचालित, मिठीबाई कॉलेज ऑफ आर्टस्, चौहान इन्स्टिटयूट ऑफ सायन्स अँन्ड अमृतबेन जीवनलाल कॉलेज ऑफ कॉमर्स अँन्ड इकॉनॉमिक्स (स्वायत्त)"
+        out_df["COLL_NO"] = "132"
+        out_df["COLL_NAME"] = "Shri Vile Parle Kelvani Mandal's Mithibai College of Arts, Chauhan Institute of Science and Amrutben Jivanlal College of Commerce and Economics (Autonomous)"
+        out_df["COLL_NAMEM"] = "श्री विलेपार्ले केळवणी संचालित, मिठीबाई कॉलेज ऑफ आर्टस्, चौहान इन्स्टिटयूट ऑफ सायन्स अँन्ड अमृतबेन जीवनलाल कॉलेज ऑफ कॉमर्स अँन्ड इकॉनॉमिक्स (स्वायत्त)"
 
     elif college_choice == "Narsee Monjee College":
         out_df["COLL_NO"] = "205"
@@ -539,6 +563,11 @@ def process_data(mkcl_files, student_lookup, college_choice, progress_callback=N
         out_df["COLL_NO"] = "598"
         out_df["COLL_NAME"] = "Usha Pravin Gandhi College of Arts, Science & Commerce (Autonomous)"
         out_df["COLL_NAMEM"] = "उषा प्रविण गांधी कॉलेज ऑफ आर्टस्, सायन्स अँन्ड कॉमर्स (स्वायत्त)"
+
+    elif college_choice == "Dwarkadas J. Sanghvi College of Engineering":
+        out_df["COLL_NO"] = "421"
+        out_df["COLL_NAME"] = "Shri Vile Parle Kelavani Mandal`s Dwarkadas J. Sanghvi College of Engineering  (Autonomous)"
+        out_df["COLL_NAMEM"] = "श्री विले पार्ले केळवणी मंडळाचे द्वारकादास जे. संघवी कॉलेज ऑफ  इंजिनिअरिंग ( स्वायत्त )"
 
     out_df["SEX"] = out_df["SEX"].apply(map_gender)
     out_df["CLASS"] = out_df["CLASS"].apply(format_class_grade)
@@ -719,7 +748,7 @@ def generate_formatted_excel(df: pd.DataFrame, progress_callback=None) -> bytes:
 # 6. MODULE ENTRY POINT FOR STREAMLIT ROUTING
 # ==========================================
 def show():
-    st.title("📄 Convocation Data Generator")
+    st.title("🎓 Convocation Data Generator")
     st.markdown(
         "Upload **MKCL Reports** and **Student Master Data** files. The app automatically handles "
         "Excel text/number mismatches to fetch degree/program names accurately, standardizes columns, "
@@ -735,7 +764,8 @@ def show():
             options=[
                 "Mithibai College",
                 "Narsee Monjee College",
-                "Usha Pravin Gandhi College"                
+                "Usha Pravin Gandhi College",
+                "Dwarkadas J. Sanghvi College of Engineering"
             ],
             index=None,
             placeholder="Select College",
@@ -835,7 +865,13 @@ def show():
 
                 progress_bar.progress(1.0, text="✅ Complete!  100%")
 
-                college_tag = "NMC" if "Narsee Monjee" in college_option else "UPG"
+                college_tag_map = {
+                    "Mithibai College": "MITHIBAI",
+                    "Narsee Monjee College": "NMC",
+                    "Usha Pravin Gandhi College": "UPG",
+                    "Dwarkadas J. Sanghvi College of Engineering": "DJSCE",
+                }
+                college_tag = college_tag_map.get(college_option, "COLLEGE")
                 current_date_str = datetime.now().strftime("%d-%m-%Y")
                 dynamic_filename = f"Convocation_Data_{college_tag}_{current_date_str}.xlsx"
 
@@ -850,6 +886,67 @@ def show():
             progress_placeholder.progress(0, text="❌ Failed")
             st.error(f"❌ An error occurred during processing: {str(e)}")
             st.exception(e)
+
+    st.markdown("---")
+
+    with st.expander("ℹ️ Tool Description / Help - click to expand"):
+        st.markdown(
+            """
+**What this tool does**
+
+This tool merges **MKCL exam/result reports** with **Student Master Data** files to
+produce a standardized, formatted Convocation Excel file ready for submission.
+
+**Inputs required**
+
+1. **College** — select from the dropdown.
+2. **MKCL Report Files** (`.xlsx` / `.xls`, multiple allowed) — contain student
+   results such as Student Number, Name, Gender, Final Grade, CGPA, and Highest
+   Month of Passing.
+3. **Student Master Data Files** (`.xlsx` / `.xls`, multiple allowed) — contain the
+   Program/Degree Name and Student Number (used to look up ABC/APAAR ID) for each
+   student, across all sheets in the file.
+
+**What happens when you click Process**
+
+- *Building Student Master Lookup* — reads every sheet of every Master Data file
+  and builds a Student Number → Program Name / ABC-APAAR ID map.
+- *Reading & Filtering MKCL Reports* — reads every sheet of every MKCL file and
+  filters out rows without a valid Convocation/CGPA/Grade.
+- *Matching Students & Deriving Data* — matches each MKCL record to its Master
+  Data entry, derives Faculty (Science & Technology / Commerce & Management /
+  Humanities), degree duration, gender codes, and other output fields. Records
+  that can't find a matching program name are collected into an **Exception
+  Report**.
+- *Generating Formatted Excel File* — writes the final standardized data sheet
+  plus a **Statistics** sheet (Male/Female/Total counts per program).
+
+**Marathi (Devanagari) name & month conversion**
+
+- Student names and the passing month are transliterated into Marathi
+  (`NAME_MARAT`, `MMONTH`) using Google Translate when available, with an
+  automatic **offline transliteration fallback** if the online translator is
+  unavailable or the `deep_translator` package isn't installed.
+- Numeric digits in month values are also converted to Devanagari numerals.
+
+**Output**
+
+- A downloadable Excel file named like `Convocation_Data_<COLLEGE>_<DATE>.xlsx`
+  containing the standardized data (matching the required `TARGET_COLUMNS`
+  layout) and a Statistics summary sheet.
+- On-screen summary metrics: Master Records Loaded, MKCL Raw Records, Filtered
+  Records, Program Matches Found, and Unmatched Records — plus a preview table
+  and, if any, an expandable Unmatched Exceptions table.
+
+**Tips**
+
+- All three inputs (college, MKCL files, master files) are required before the
+  **Process & Generate** button becomes active.
+- If a lookup can't find a "Program Name" column by name, it falls back to
+  reading a fixed column position, so keep the Master Data file structure
+  consistent with what this tool expects.
+            """
+        )
 
 
 main = show
