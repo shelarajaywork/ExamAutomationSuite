@@ -13,18 +13,14 @@ PALETTE_HEX = [
     "EBCCFF",  # Pastel Mauve
     "B1C086",  # Pastel Avocado
     "E99FAA",  # Pastel Rouge
-    "A4D8D8",  # Pastel Cyan
     "CFAC94",  # Pastel Cinnamon
     "AFC0EA",  # Pastel Denim
     "D1FEB8",  # Pastel Lime
-    "F6B8D0",  # Pastel Rose
     "DBDBDC",  # Pastel Silver
-    "FFA38C",  # Pastel Coral
-    "A5E3E0",  # Pastel Blue green
-    "FFDDB3",  # Pastel Caramel
-    "B0E9D5",  # Pastel Aquamarine
-    "FFA4A9",  # Pastel Tulip
-    "D0E9C0",  # Pastel Pistachio
+    "FFFFA6",  # Pastel Lemon (Added - Unique Yellow)
+    "E8A7A1",  # Pastel Terracotta (Added - Unique Earthy Red)
+    "F3C6FA",  # Pastel Orchid (Added - Unique Pinkish Purple)
+    "B2F0D0",  # Pastel Mint (Added - Unique Crisp Green)
 ]
 
 # ===================== HELPER FUNCTIONS =====================
