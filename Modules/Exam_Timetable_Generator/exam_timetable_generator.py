@@ -787,7 +787,8 @@ def build_timetable_sheet(
                         extras.append(", ".join(sorted(info["ay"])))
                     if show_student_count:
                         extras.append(str(info["students"]))
-                    line = f"{m_desc}\n({' | '.join(extras)})" if extras else m_desc
+                    display_desc = m_desc.upper()
+                    line = f"{display_desc}\n({' | '.join(extras)})" if extras else display_desc
                     lines.append(line)
                 value = " / \n".join(lines)
 
@@ -1034,6 +1035,150 @@ def build_analysis_sheet(workbook, result_df: pd.DataFrame):
     ws.freeze_panes = "C3"
 
     return ws
+
+
+# ===================== OSM TT FORMAT SHEETS (PER COLLEGE) =====================
+
+# Maps recognizable fragments of a full college/school name (lower-cased) to the
+# short code that should be used everywhere in the OSM TT sheets.
+_COLLEGE_SHORT_NAME_MAP = {
+    "narsee monjee": "NMC",
+    "mithibai": "MBC",
+    "upg": "UPG",
+}
+
+# Preferred left-to-right ordering of the generated sheets.
+_COLLEGE_SHEET_ORDER = ["NMC", "MBC", "UPG"]
+
+
+def _get_college_short_name(school_name) -> str:
+    """Resolves a (possibly long) School Name value to its short college code
+    (e.g. 'Narsee Monjee College of Commerce & Economics' -> 'NMC'). Falls back to
+    the original value (stripped) if no known mapping matches, so unrecognized
+    colleges are still shown rather than dropped."""
+    s = str(school_name).strip()
+    s_lower = s.lower()
+    for fragment, short_name in _COLLEGE_SHORT_NAME_MAP.items():
+        if fragment in s_lower:
+            return short_name
+    return s
+
+
+def build_osm_tt_format_sheet(workbook, result_df: pd.DataFrame):
+    """Adds one 'OSM TT (<CODE>)' worksheet per college to the given workbook - a flat,
+    one-row-per-record export of the scheduled output, sorted by Exam Date (ascending)
+    and remapped to the OSM column naming convention:
+
+        College        <- School Name (shown using its short code, e.g. NMC/MBC/UPG)
+        Date of Exam   <- Exam Date
+        Exam Time      <- Time
+        Prog. Code     <- Program Abbreviation
+        Prog. Name     <- Program Name
+        Acad. Session  <- Current Session
+        Acad. Year     <- Current Academic Year
+        Module code    <- Module Abbreviation
+        Module name    <- Module Description
+        Student Count  <- Students
+
+    Sheets are named per college using short codes, e.g.:
+        Narsee Monjee -> "OSM TT (NMC)"
+        Mithibai      -> "OSM TT (MBC)"
+        UPG           -> "OSM TT (UPG)"
+
+    In each sheet: column headers are centre-aligned; data in Date of Exam, Exam Time,
+    Prog. Code, Acad. Session, Acad. Year and Student Count is centre-aligned; every
+    data cell gets a normal (thin) border; the whole row gets a thick top border
+    wherever the exam date changes; and gridlines are hidden.
+    """
+    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+    from openpyxl.utils import get_column_letter
+
+    if result_df is None or result_df.empty:
+        return []
+
+    osm_columns = [
+        ("College", "School Name"),
+        ("Date of Exam", "Exam Date"),
+        ("Exam Time", "Time"),
+        ("Prog. Code", "Program Abbreviation"),
+        ("Prog. Name", "Program Name"),
+        ("Acad. Session", "Current Session"),
+        ("Acad. Year", "Current Academic Year"),
+        ("Module code", "Module Abbreviation"),
+        ("Module name", "Module Description"),
+        ("Student Count", "Students"),
+    ]
+    center_cols = {"Date of Exam", "Exam Time", "Prog. Code", "Acad. Session", "Acad. Year", "Student Count"}
+    date_col_num = next(i for i, (h, _) in enumerate(osm_columns, start=1) if h == "Date of Exam")
+    num_cols = len(osm_columns)
+
+    header_font = Font(bold=True)
+    header_fill = PatternFill(start_color="D3D3D3", end_color="D3D3D3", fill_type="solid")
+    center_align = Alignment(horizontal="center", vertical="center")
+
+    thin = Side(style="thin", color="000000")
+    thick = Side(style="thick", color="000000")
+    normal_border = Border(left=thin, right=thin, top=thin, bottom=thin)
+    date_change_border = Border(left=thin, right=thin, top=thick, bottom=thin)
+
+    df = result_df.copy()
+    df["_College Short"] = df["School Name"].apply(_get_college_short_name)
+
+    college_codes = sorted(
+        df["_College Short"].dropna().unique().tolist(),
+        key=lambda c: (_COLLEGE_SHEET_ORDER.index(c) if c in _COLLEGE_SHEET_ORDER else len(_COLLEGE_SHEET_ORDER), c),
+    )
+
+    created_sheets = []
+    for college_code in college_codes:
+        college_df = df[df["_College Short"] == college_code].sort_values("Exam Date", ascending=True)
+
+        ws = workbook.create_sheet(f"OSM TT ({college_code})")
+
+        for col_num, (header_name, _) in enumerate(osm_columns, start=1):
+            cell = ws.cell(row=1, column=col_num, value=header_name)
+            cell.font = header_font
+            cell.fill = header_fill
+            cell.alignment = center_align
+            cell.border = normal_border
+
+        prev_date = None
+        row_idx = 2
+        for _, r in college_df.iterrows():
+            current_date = r.get("Exam Date", "") if hasattr(r, "get") else r["Exam Date"]
+            date_changed = prev_date is not None and current_date != prev_date
+            prev_date = current_date
+
+            for col_num, (header_name, source_col) in enumerate(osm_columns, start=1):
+                if header_name == "College":
+                    value = college_code
+                else:
+                    value = r.get(source_col, "") if hasattr(r, "get") else r[source_col]
+                cell = ws.cell(row=row_idx, column=col_num, value=value)
+                if source_col == "Exam Date" and value:
+                    cell.number_format = "DD-MM-YYYY"
+                if header_name in center_cols:
+                    cell.alignment = center_align
+                cell.border = date_change_border if date_changed else normal_border
+
+            row_idx += 1
+
+        ws.freeze_panes = "A2"
+
+        for col_num in range(1, num_cols + 1):
+            col_letter = get_column_letter(col_num)
+            max_len = len(osm_columns[col_num - 1][0])
+            for row_num in range(2, row_idx):
+                val = ws.cell(row=row_num, column=col_num).value
+                if val:
+                    max_len = max(max_len, len(str(val)))
+            ws.column_dimensions[col_letter].width = max(max_len + 5, 15)
+
+        ws.sheet_view.showGridLines = False
+
+        created_sheets.append(ws)
+
+    return created_sheets
 
 
 # ===================== STREAMLIT USER INTERFACE =====================
@@ -1353,6 +1498,9 @@ def main():
 
                             # Add the "Analysis" worksheet
                             build_analysis_sheet(workbook, result_df)
+
+                            # Add the "OSM TT Format" worksheet
+                            build_osm_tt_format_sheet(workbook, result_df)
 
                             # Include unmatched Re-exam Applications List records for transparency
                             if is_reexam and incomplete_df is not None and not incomplete_df.empty:
