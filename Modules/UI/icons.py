@@ -42,6 +42,8 @@ TOOL_ICON_MAP = {
     "Dashboard": "dashboard",
     "OSM Dashboard": "osm",
     "Exam Timetable Generator": "calendar",
+    "Blank Marksheet to PDF": "gazette",
+    "Hall Ticket Verification": "gazette",
     "Gracing Checker": "gracing",
     "Questionwise Checker": "questionwise",
     "Letters to Ext. Examiners": "mail",

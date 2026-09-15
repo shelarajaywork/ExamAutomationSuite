@@ -121,6 +121,18 @@ def format_duration(seconds: int) -> str:
     return f"{hrs:02d}:{mins:02d}:00"
 
 
+def parse_credit_value(val) -> float:
+    """Parses a Credit cell (numeric or numeric-looking string) into a float.
+    Returns None if it can't be parsed, so callers can exclude it from
+    priority averages/maximums rather than treating it as 0."""
+    if val is None or (isinstance(val, str) and not val.strip()):
+        return None
+    try:
+        return float(val)
+    except (TypeError, ValueError):
+        return None
+
+
 def format_time_range(start_time_str: str, duration_seconds: int) -> str:
     """Calculates end time and returns a formatted range '10:00 AM - 12:00 PM'."""
     start_dt = datetime.datetime.strptime(start_time_str, "%I:%M %p")
@@ -411,6 +423,8 @@ def generate_timetable(
     subj_data = {}         
     subj_sem = {}          
     subj_dur = {}          
+    subj_dur_sec = {}      # node_key -> exam duration in seconds (for priority ranking)
+    subj_credits = {}      # node_key -> list of numeric Credit values seen for it
     student_to_nodes = {}  
 
     re_row_students = {}   
@@ -441,6 +455,11 @@ def generate_timetable(
             subj_data[node_key] = {}
             subj_sem[node_key] = sem
             subj_dur[node_key] = dur_fmt
+            subj_dur_sec[node_key] = dur_sec
+
+        credit_num = parse_credit_value(credit_val)
+        if credit_num is not None:
+            subj_credits.setdefault(node_key, []).append(credit_num)
 
         if not is_reexam:
             row_key = f"{prog_abbr}|{prog}|{ay}|{mod_abbr}|{subject}|{credit_val}"
@@ -485,6 +504,38 @@ def generate_timetable(
 
     color_assignment = nx.coloring.greedy_color(G, strategy="DSATUR")
     color_assignment = {node: c + 1 for node, c in color_assignment.items()}
+
+    # ---- REORDER COLOR SLOTS BY EXAM WEIGHT (DURATION, THEN CREDIT) ----
+    # DSATUR only guarantees that nodes sharing a color/slot have zero
+    # students in common - the *number* it assigns to each color is
+    # otherwise arbitrary. Every node stays in exactly the independent set
+    # (color partition) DSATUR put it in - that partitioning is what
+    # guarantees zero clashes - we only relabel the partitions themselves
+    # so that "heavier" partitions (longer exam durations, then higher
+    # credits) get the lower slot numbers, which map_colors_to_dates turns
+    # into the earlier calendar dates (Day 1, Day 2, ...). Since no node
+    # ever moves to a different partition, no clash can be introduced by
+    # this relabeling.
+    partition_nodes = {}
+    for node_key, slot in color_assignment.items():
+        partition_nodes.setdefault(slot, []).append(node_key)
+
+    def _partition_weight(slot):
+        nodes = partition_nodes[slot]
+        durations = [subj_dur_sec.get(n, 0) for n in nodes]
+        credits = [c for n in nodes for c in subj_credits.get(n, [])]
+        max_dur = max(durations) if durations else 0
+        avg_dur = (sum(durations) / len(durations)) if durations else 0
+        max_credit = max(credits) if credits else 0
+        avg_credit = (sum(credits) / len(credits)) if credits else 0
+        # Primary: longest single exam in the slot. Then: average exam
+        # length in the slot. Then: heaviest / average credit as a
+        # tie-breaker among slots with similar durations.
+        return (max_dur, avg_dur, max_credit, avg_credit)
+
+    ranked_slots = sorted(partition_nodes.keys(), key=_partition_weight, reverse=True)
+    slot_rank_map = {old_slot: new_rank for new_rank, old_slot in enumerate(ranked_slots, start=1)}
+    color_assignment = {node: slot_rank_map[slot] for node, slot in color_assignment.items()}
 
     day_date_map = map_colors_to_dates(color_assignment, start_date, excluded_dates=excluded_dates)
 

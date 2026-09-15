@@ -118,6 +118,34 @@ except Exception as import_error:
 else:
     _etg_import_error_message = None
 
+import importlib.util
+try:
+    _bm_spec = importlib.util.spec_from_file_location(
+        "blank_Marksheet_to_pdf",
+        os.path.join(PROJECT_ROOT, "Modules", "Blank Marksheet to PDF", "blank_Marksheet_to_pdf.py"),
+    )
+    _bm_mod = importlib.util.module_from_spec(_bm_spec)
+    _bm_spec.loader.exec_module(_bm_mod)
+    blank_marksheet_to_pdf = getattr(_bm_mod, "show", getattr(_bm_mod, "main", None))
+    _bm_import_error_message = None
+except Exception as import_error:
+    blank_marksheet_to_pdf = None
+    _bm_import_error_message = str(import_error)
+
+try:
+    _ht_spec = importlib.util.spec_from_file_location(
+        "hallticket_verification",
+        os.path.join(PROJECT_ROOT, "Modules", "Hallticket Verification", "hallticket_verification.py"),
+    )
+    _ht_mod = importlib.util.module_from_spec(_ht_spec)
+    _ht_spec.loader.exec_module(_ht_mod)
+    hallticket_verification = getattr(_ht_mod, "show", getattr(_ht_mod, "main", None))
+    _ht_import_error_message = None
+except Exception as import_error:
+    hallticket_verification = None
+    _ht_import_error_message = str(import_error)
+
+
 try:
     from Modules.Convocation_Data_Generator.convocation_data_generator import show as convocation_data_generator
 except Exception as import_error:
@@ -173,6 +201,8 @@ tools_list = [
     "Dashboard",
     "OSM Dashboard",
     "Exam Timetable Generator",
+    "Blank Marksheet to PDF",
+    "Hall Ticket Verification",
     "Gracing Checker",
     "Questionwise Checker",
     "Letters to Ext. Examiners",
@@ -275,6 +305,16 @@ if st.session_state.selected_tool == "Dashboard":
             "name": "Exam Timetable Generator",
             "icon": "calendar",
             "desc": "Generate clash-free exam timetables for Regular and Re-Examinations using DSATUR graph coloring.",
+        },
+        {
+            "name": "Blank Marksheet to PDF",
+            "icon": "gradesheet",
+            "desc": "Convert Excel marksheet files to formatted PDFs via Excel COM automation with optional student list verification.",
+        },
+        {
+            "name": "Hall Ticket Verification",
+            "icon": "gazette",
+            "desc": "Extract student schedules, timetable details, and seating pivot matrices from Hall Ticket PDFs to Excel.",
         },
         {
             "name": "Gracing Checker",
@@ -407,7 +447,33 @@ elif st.session_state.selected_tool == "Exam Timetable Generator":
         st.title("Exam Timetable Generator")
         st.error(f"`{_etg_import_error_message}`")
 
-# 4. Gracing Checker
+# 4. Blank Marksheet to PDF
+elif st.session_state.selected_tool == "Blank Marksheet to PDF":
+    if blank_marksheet_to_pdf is not None:
+        blank_marksheet_to_pdf()
+    else:
+        st.title("Blank Marksheet to PDF")
+        st.error(
+            "This tool could not be loaded due to an import error:\n\n"
+            f"`{_bm_import_error_message}`\n\n"
+            "Ensure that `Modules/Blank Marksheet to PDF/blank_Marksheet_to_pdf.py` exists "
+            "and defines a `show()` or `main()` entry point function."
+        )
+
+# 5. Hall Ticket Verification
+elif st.session_state.selected_tool == "Hall Ticket Verification":
+    if hallticket_verification is not None:
+        hallticket_verification()
+    else:
+        st.title("Hall Ticket Verification")
+        st.error(
+            "This tool could not be loaded due to an import error:\n\n"
+            f"`{_ht_import_error_message}`\n\n"
+            "Ensure that `Modules/Hallticket Verification/hallticket_verification.py` exists "
+            "and defines a `show()` or `main()` entry point function."
+        )
+
+# 6. Gracing Checker
 elif st.session_state.selected_tool == "Gracing Checker":
     if gracing_checker is not None:
         gracing_checker()
