@@ -12,3 +12,4 @@ reportlab
 plotly
 gdown
 pdfplumber
+PyMuPDF
