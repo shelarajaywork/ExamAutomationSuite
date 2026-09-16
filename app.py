@@ -175,6 +175,19 @@ except Exception as import_error:
 else:
     _mf_import_error_message = None
 
+try:
+    _sps_spec = importlib.util.spec_from_file_location(
+        "student_photo_sign",
+        os.path.join(PROJECT_ROOT, "Modules", "Student Photo & Sign", "student_photo_sign.py"),
+    )
+    _sps_mod = importlib.util.module_from_spec(_sps_spec)
+    _sps_spec.loader.exec_module(_sps_mod)
+    student_photo_sign = getattr(_sps_mod, "show", getattr(_sps_mod, "run", getattr(_sps_mod, "main", None)))
+    _sps_import_error_message = None
+except Exception as import_error:
+    student_photo_sign = None
+    _sps_import_error_message = str(import_error)
+
 
 # --------------------
 # Page Configuration
@@ -215,7 +228,7 @@ tools_list = [
     "Data Analysis",
     "Data Cleaner",
     "Merge Files",
-    "SharePoint Import",
+    "Student Photo & Sign",
     "Settings",
 ]
 
@@ -224,8 +237,10 @@ def normalize_tool_name(name: str) -> str:
     if not name:
         return "Dashboard"
     clean = name
-    for emoji in ["🏠", "📊", "📅", "✅", "📝", "✉️", "🏆", "📑", "🎓", "🔍", "📈", "🧹", "🔗", "☁️", "⚙️"]:
+    for emoji in ["🏠", "📊", "📅", "✅", "📝", "✉️", "🏆", "📑", "🎓", "🔍", "📈", "🧹", "🔗", "☁️", "⚙️", "📷", "📋"]:
         clean = clean.replace(emoji, "").strip()
+    if clean == "SharePoint Import":
+        return "Student Photo & Sign"
     return clean if clean in tools_list else "Dashboard"
 
 if "selected_tool" not in st.session_state:
@@ -377,9 +392,9 @@ if st.session_state.selected_tool == "Dashboard":
             "desc": "Combine multiple mark sheets or result exports into a single master sheet.",
         },
         {
-            "name": "SharePoint Import",
-            "icon": "sharepoint",
-            "desc": "Import and sync mark sheets directly from institutional SharePoint drives.",
+            "name": "Student Photo & Sign",
+            "icon": "photo_sign",
+            "desc": "Extract student photos, signatures, and details from Hall Ticket PDFs into formatted Excel workbooks.",
         },
     ]
 
@@ -570,10 +585,18 @@ elif st.session_state.selected_tool == "Merge Files":
         st.title("Merge Files")
         st.error(f"`{_mf_import_error_message}`")
 
-# 16. SharePoint Import
-elif st.session_state.selected_tool == "SharePoint Import":
-    st.title("SharePoint Import")
-    st.info("Tool under development")
+# 16. Student Photo & Sign
+elif st.session_state.selected_tool == "Student Photo & Sign":
+    if student_photo_sign is not None:
+        student_photo_sign()
+    else:
+        st.title("Student Photo & Sign")
+        st.error(
+            "This tool could not be loaded due to an import error:\n\n"
+            f"`{_sps_import_error_message}`\n\n"
+            "Ensure that `Modules/Student Photo & Sign/student_photo_sign.py` exists "
+            "and defines a `run()` or `show()` entry point function."
+        )
 
 # 17. Settings
 elif st.session_state.selected_tool == "Settings":

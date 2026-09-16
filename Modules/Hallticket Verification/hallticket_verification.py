@@ -212,6 +212,7 @@ SLOT_COLS = ["Exam Date", "Start Time", "End Time", "Module Code", "Module Descr
 PIVOT_LEAD_COLS = [
     "Exam Date", "Start Time", "End Time",
     "Program Name", "Academic Session",
+    "Exam Month & Year", "Academic Year",
     "Module Code", "Module Description",
     "Grand Total", "PwD Students",
 ]
@@ -407,49 +408,7 @@ def write_pivot_sheet(worksheet, pivot, room_cols):
             elif idx >= first_room_idx and val:
                 cell.fill = room_fill   # only non-blank room cells tinted
 
-    # ── Grand-total footer row ────────────────────────────────────────────────
-    footer_row = last_data_row + 1
-    # Merge only the pure text-label columns (before Grand Total)
-    label_span_end = min(first_room_idx - 1, total_idx - 1, pwd_idx - 1) - 1
-    label_span_end = max(label_span_end, 1)  # at minimum span col 1 only
-
-    cell = worksheet.cell(row=footer_row, column=1, value="Grand Total")
-    cell.font = Font(bold=True)
-    if label_span_end > 1:
-        worksheet.merge_cells(start_row=footer_row, start_column=1,
-                              end_row=footer_row, end_column=label_span_end)
-    # Style top-left of merge (others are MergedCell, read-only)
-    c1 = worksheet.cell(row=footer_row, column=1)
-    c1.fill   = footer_fill
-    c1.border = border
-
-    # Fill any unmerged label cols between label_span_end and first num col
-    for fill_idx in range(label_span_end + 1, min(total_idx, pwd_idx)):
-        fc = worksheet.cell(row=footer_row, column=fill_idx)
-        fc.fill   = footer_fill
-        fc.border = border
-
-    for idx, name in enumerate(headers, start=1):
-        if name not in num_cols:
-            continue
-        # Skip cells that fall inside the merged region (only col 1 is writable)
-        if label_span_end > 1 and 2 <= idx <= label_span_end:
-            continue
-        letter = get_column_letter(idx)
-        cell   = worksheet.cell(row=footer_row, column=idx)
-        cell.value     = (f"=SUM({letter}4:{letter}{last_data_row})"
-                          if len(pivot) else 0)
-        cell.font      = Font(bold=True)
-        cell.alignment = centre
-        cell.border    = border
-        if idx == pwd_idx:
-            cell.fill = pwd_fill
-        elif idx == total_idx:
-            cell.fill = total_fill
-        elif idx >= first_room_idx:
-            cell.fill = room_fill
-        else:
-            cell.fill = footer_fill
+    # (No Grand Total footer row — pivot ends at the last data row.)
 
     # ── Column widths ─────────────────────────────────────────────────────────
     for idx, name in enumerate(headers, start=1):
@@ -513,7 +472,7 @@ def to_excel(students_df, schedule_df, timetable_df, pivot_df=None, room_cols=No
 # --------------------------------------------------------------------------
 
 def show():
-    st.title("Hall Ticket PDF → Excel")
+    st.title("📄Hall Ticket PDF → Excel")
     st.caption(
         "Upload one or more hall ticket PDFs (one student per page). "
         "Student details and the exam schedule are pulled out into a downloadable workbook."
@@ -552,7 +511,51 @@ def show():
         return
 
     timetable_df = build_timetable(schedule_df)
-    pivot_df, room_cols, _room_label_map = build_pivot(students_df, schedule_df)
+
+    st.subheader("Confirm room numbers")
+    st.caption(
+        "Room numbers are picked up automatically from each hall ticket, but every college "
+        "has its own room-naming convention, so extraction won't always be right. Review the "
+        "codes found below and correct any that are wrong — the corrected values are what "
+        "will be used to build the room columns in the Pivot sheet. (The Students, Exam "
+        "Schedule and Timetable sheets keep the originally extracted room text.)"
+    )
+    unique_rooms = sorted(
+        (r for r in schedule_df["Room"].dropna().unique() if str(r).strip()),
+        key=_room_sort_key,
+    )
+    room_lookup = {}
+    if unique_rooms:
+        room_map_df = pd.DataFrame(
+            {
+                "Extracted Room Code": unique_rooms,
+                "Corrected Room Number": unique_rooms,
+            }
+        )
+        edited_room_map = st.data_editor(
+            room_map_df,
+            hide_index=True,
+            use_container_width=True,
+            column_config={
+                "Extracted Room Code": st.column_config.TextColumn(disabled=True),
+                "Corrected Room Number": st.column_config.TextColumn(
+                    help="Edit this if the room number was extracted incorrectly."
+                ),
+            },
+            key="ht_room_map_editor",
+        )
+        for _, row in edited_room_map.iterrows():
+            code = row["Extracted Room Code"]
+            corrected = str(row["Corrected Room Number"]).strip()
+            room_lookup[code] = corrected if corrected else code
+
+    schedule_df_for_pivot = schedule_df.copy()
+    if room_lookup:
+        schedule_df_for_pivot["Room"] = schedule_df_for_pivot["Room"].map(
+            lambda r: room_lookup.get(r, r)
+        )
+
+    pivot_df, room_cols, _room_label_map = build_pivot(students_df, schedule_df_for_pivot)
 
     col1, col2, col3 = st.columns(3)
     col1.metric("Students", len(students_df))
@@ -592,4 +595,4 @@ main = show
 
 if __name__ == "__main__":
     st.set_page_config(page_title="Hall Ticket Extractor", page_icon="📄", layout="wide")
-    show()
+    show()
