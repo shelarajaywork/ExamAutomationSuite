@@ -1,0 +1,2244 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Examination Gracing Checker Portal</title>
+
+  <!-- Typography: Source Serif 4 (headings, figures) + IBM Plex Sans (interface, ledger data).
+       Both have robust system fallbacks, so the portal still renders correctly offline. -->
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=Source+Serif+4:opsz,wght@8..60,500;8..60,600;8..60,700&display=swap" rel="stylesheet">
+
+  <!-- xlsx-js-style CDN for Excel parsing and styled multi-sheet export -->
+  <script src="https://cdn.jsdelivr.net/npm/xlsx-js-style@1.2.0/dist/xlsx.bundle.js"></script>
+
+  <style>
+    /* ==========================================================================
+       Design tokens
+       Red is reserved exclusively for problems. Steel blue carries structure,
+       ledger cream marks totals, green marks a clean result.
+       ========================================================================== */
+    :root {
+      --ink: #14283C;
+      --ink-soft: #31465B;
+      --text: #1B2733;
+      --muted: #566677;
+      --faint: #8593A2;
+
+      --paper: #EDF0F4;
+      --surface: #FFFFFF;
+      --line: #D6DCE4;
+      --line-strong: #B5BFCB;
+
+      --steel: #1F4E79;
+      --steel-deep: #173B5C;
+      --steel-soft: #E3EAF3;
+
+      --ledger: #FBF3DC;
+      --ledger-line: #E2CF98;
+      --brass: #C9A24B;
+
+      --err: #DC2626;          /* integrity discrepancy fill (also used in Excel export) */
+      --err-ink: #9B1C12;
+      --err-soft: #FDEBE9;
+      --err-tint: #FFF6F5;
+
+      --ok: #17784A;
+      --ok-soft: #E4F3EB;
+
+      --font-sans: 'IBM Plex Sans', system-ui, -apple-system, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+      --font-serif: 'Source Serif 4', Georgia, 'Times New Roman', serif;
+    }
+
+    *, *::before, *::after { box-sizing: border-box; }
+    html { -webkit-text-size-adjust: 100%; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      background: var(--paper);
+      color: var(--text);
+      font: 400 14px/1.5 var(--font-sans);
+      -webkit-font-smoothing: antialiased;
+      text-rendering: optimizeLegibility;
+    }
+    h1, h2, h3, p { margin: 0; }
+    button { font-family: inherit; }
+    :focus-visible { outline: 2px solid var(--steel); outline-offset: 2px; }
+
+    .skip-link {
+      position: absolute; left: -999px; top: 8px; background: #fff; color: var(--ink);
+      padding: 8px 12px; border-radius: 4px; z-index: 100; font-weight: 600;
+    }
+    .skip-link:focus { left: 8px; }
+
+    .wrap { width: 100%; max-width: 1680px; margin: 0 auto; padding: 0 24px; }
+
+    /* ---------- Top bar ---------- */
+    .topbar {
+      background: var(--ink);
+      color: #fff;
+      border-bottom: 3px solid var(--brass);
+    }
+    .topbar-inner {
+      display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between;
+      gap: 12px 24px; padding-top: 18px; padding-bottom: 16px;
+    }
+    .topbar h1 {
+      font-family: var(--font-serif); font-weight: 600; font-size: 25px; line-height: 1.15;
+      letter-spacing: -0.005em;
+    }
+    .topbar p { margin-top: 4px; font-size: 13px; color: #AEBFD1; }
+
+    /* ---------- Buttons ---------- */
+    .btn {
+      display: inline-flex; align-items: center; gap: 8px;
+      padding: 8px 15px; border-radius: 5px; border: 1px solid transparent;
+      font-size: 13px; font-weight: 600; line-height: 1.2; cursor: pointer;
+      transition: background-color .15s, border-color .15s;
+    }
+    .btn-ghost { background: transparent; color: #fff; border-color: rgba(255,255,255,.4); }
+    .btn-ghost:hover { background: rgba(255,255,255,.12); border-color: rgba(255,255,255,.7); }
+    .btn-primary { background: var(--steel); color: #fff; }
+    .btn-primary:hover:not(:disabled) { background: var(--steel-deep); }
+    .btn:disabled { opacity: .45; cursor: not-allowed; }
+
+    /* ---------- Layout ---------- */
+    main { flex: 1 0 auto; padding-top: 24px; padding-bottom: 32px; display: flex; flex-direction: column; gap: 20px; }
+    .panel { background: var(--surface); border: 1px solid var(--line); border-radius: 8px; }
+
+    /* ---------- Upload ---------- */
+    .upload { padding: 20px 24px; display: grid; gap: 16px 32px; grid-template-columns: 1fr; }
+    @media (min-width: 980px) { .upload { grid-template-columns: minmax(0, 1.3fr) minmax(0, 1fr); align-items: center; } }
+    .upload h2 { font-family: var(--font-serif); font-size: 18px; font-weight: 600; color: var(--ink); }
+    .upload p { margin-top: 6px; font-size: 13px; color: var(--muted); max-width: 78ch; }
+    .upload code {
+      font-family: var(--font-sans); font-weight: 600; font-size: 12.5px; color: var(--steel);
+      background: var(--steel-soft); padding: 1px 6px; border-radius: 3px; white-space: nowrap;
+    }
+    .file-input {
+      display: block; width: 100%; font-size: 13px; color: var(--muted);
+      border: 1px dashed var(--line-strong); border-radius: 6px; padding: 10px; background: #F8FAFC; cursor: pointer;
+    }
+    .file-input::file-selector-button {
+      margin-right: 12px; padding: 7px 14px; border: 0; border-radius: 4px;
+      background: var(--steel); color: #fff; font: 600 13px var(--font-sans); cursor: pointer;
+    }
+    .file-input::file-selector-button:hover { background: var(--steel-deep); }
+    .status-msg { margin-top: 10px; font-size: 13px; font-weight: 500; color: var(--muted); }
+    .status-msg.info { color: var(--steel); }
+    .status-msg.ok { color: var(--ok); }
+    .status-msg.err { color: var(--err-ink); font-weight: 600; }
+
+    /* ---------- KPI strip ---------- */
+    .kpi-strip {
+      display: grid; grid-template-columns: repeat(4, 1fr); gap: 1px;
+      background: var(--line); border: 1px solid var(--line); border-radius: 8px; overflow: hidden;
+    }
+    @media (max-width: 960px) { .kpi-strip { grid-template-columns: repeat(2, 1fr); } }
+    @media (max-width: 520px) { .kpi-strip { grid-template-columns: 1fr; } }
+    .kpi { background: var(--surface); padding: 16px 22px 15px; }
+    .kpi-label { font-size: 13px; font-weight: 600; color: var(--ink-soft); }
+    .kpi-value { margin-top: 4px; font-family: var(--font-serif); font-size: 32px; line-height: 1.1; font-weight: 600; color: var(--ink); font-variant-numeric: tabular-nums; }
+    .kpi-note { margin-top: 3px; font-size: 12px; color: var(--faint); }
+
+    /* ---------- Integrity audit panel ---------- */
+    .audit-head { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 12px 24px; padding: 18px 22px 16px; }
+    .audit-head h2 { font-family: var(--font-serif); font-size: 19px; font-weight: 600; color: var(--ink); }
+    .audit-head p { margin-top: 3px; font-size: 13px; color: var(--muted); }
+    .banner { padding: 6px 14px; border-radius: 999px; font-size: 13px; font-weight: 600; border: 1px solid var(--line); background: #F3F5F8; color: var(--muted); }
+    .banner.pass { background: var(--ok-soft); border-color: #A9D8BF; color: var(--ok); }
+    .banner.fail { background: var(--err-soft); border-color: #F2B6B0; color: var(--err-ink); }
+
+    .rules {
+      display: grid; grid-template-columns: repeat(3, 1fr); gap: 1px;
+      background: var(--line); border-top: 1px solid var(--line); border-bottom: 1px solid var(--line);
+    }
+    @media (max-width: 1100px) { .rules { grid-template-columns: repeat(2, 1fr); } }
+    @media (max-width: 680px) { .rules { grid-template-columns: 1fr; } }
+    .rule {
+      display: grid; grid-template-columns: 34px 1fr auto; align-items: center; gap: 12px;
+      padding: 11px 20px; background: var(--surface); border: 0; text-align: left; cursor: pointer; color: var(--text);
+    }
+    .rule:hover { background: #F6F8FB; }
+    .rule-id {
+      display: inline-flex; align-items: center; justify-content: center; width: 34px; height: 26px;
+      border-radius: 4px; background: var(--steel-soft); color: var(--steel); font-size: 12px; font-weight: 700;
+    }
+    .rule-text { font-size: 13px; line-height: 1.3; font-weight: 500; }
+    .rule-sub { display: block; margin-top: 1px; font-size: 11.5px; font-weight: 400; color: var(--faint); }
+    .rule-count {
+      min-width: 38px; text-align: center; padding: 3px 9px; border-radius: 999px;
+      font-size: 13px; font-weight: 700; font-variant-numeric: tabular-nums;
+      background: var(--ok-soft); color: var(--ok);
+    }
+    .rule.has-issues .rule-id { background: var(--err); color: #fff; }
+    .rule.has-issues .rule-count { background: var(--err); color: #fff; }
+    .rule.na .rule-id { background: #EEF1F4; color: var(--faint); }
+    .rule.na .rule-count { background: #EEF1F4; color: var(--faint); font-weight: 600; font-size: 12px; }
+    .audit-note { padding: 12px 22px 14px; font-size: 12.5px; line-height: 1.55; color: var(--muted); background: #FAFBFC; border-radius: 0 0 8px 8px; }
+    .audit-note p + p { margin-top: 4px; }
+
+    /* ---------- Tabs ---------- */
+    .tabs { display: flex; flex-wrap: wrap; gap: 2px; border-bottom: 1px solid var(--line-strong); }
+    .tab-btn {
+      display: inline-flex; align-items: center; gap: 8px; margin-bottom: -1px;
+      padding: 10px 15px; background: none; border: 0; border-bottom: 3px solid transparent;
+      font-size: 13.5px; font-weight: 600; color: var(--muted); cursor: pointer;
+    }
+    .tab-btn:hover { color: var(--ink); }
+    .tab-btn.is-active { color: var(--steel); border-bottom-color: var(--steel); }
+    .pill { padding: 1px 8px; border-radius: 999px; font-size: 12px; font-weight: 700; background: #E7EBF0; color: var(--ink-soft); font-variant-numeric: tabular-nums; }
+    .pill.err { background: var(--err); color: #fff; }
+    .pill.ok { background: var(--ok-soft); color: var(--ok); }
+
+    /* ---------- Toolbar ---------- */
+    .toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: 12px 20px; padding: 12px 16px; margin-top: 14px; }
+    .toolbar label { font-size: 13px; font-weight: 600; color: var(--ink-soft); }
+    .search { display: flex; align-items: center; gap: 10px; flex: 1 1 360px; max-width: 560px; }
+    .search input[type="text"] {
+      flex: 1; min-width: 0; padding: 8px 12px; font: 400 13.5px var(--font-sans); color: var(--text);
+      border: 1px solid var(--line-strong); border-radius: 5px; background: #fff;
+    }
+    .search input[type="text"]:focus { border-color: var(--steel); outline: 2px solid rgba(31,78,121,.2); outline-offset: 0; }
+    .check { display: inline-flex; align-items: center; gap: 8px; cursor: pointer; }
+    .check input { width: 16px; height: 16px; accent-color: var(--err); cursor: pointer; }
+    .toolbar .spacer { flex: 1 1 auto; }
+
+    .legend { display: flex; flex-wrap: wrap; gap: 6px 22px; margin-top: 10px; font-size: 12.5px; color: var(--muted); align-items: center; }
+    .legend-item { display: inline-flex; align-items: center; gap: 8px; }
+    .swatch-fill { width: 26px; height: 16px; border-radius: 3px; background: var(--err); display: inline-block; }
+    .swatch-text { font-weight: 800; color: var(--err); font-size: 14px; line-height: 1; }
+    .swatch-total { width: 26px; height: 16px; border-radius: 3px; background: var(--ledger); border: 1px solid var(--ledger-line); display: inline-block; }
+
+    /* ---------- Tab panels ---------- */
+    .tab-content { display: none; margin-top: 14px; padding: 18px 18px 16px; }
+    .tab-content.is-active { display: block; }
+    .tab-head { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 10px 16px; margin-bottom: 12px; }
+    .tab-head h3 { font-family: var(--font-serif); font-size: 18px; font-weight: 600; color: var(--ink); }
+    .tab-head .tab-sub { margin-top: 2px; font-size: 12.5px; color: var(--muted); }
+    .count-badge { padding: 4px 12px; border-radius: 999px; font-size: 12.5px; font-weight: 600; background: #EEF1F5; color: var(--ink-soft); border: 1px solid var(--line); }
+    .count-badge.warn { background: var(--err-soft); color: var(--err-ink); border-color: #F2B6B0; }
+    .count-badge.good { background: var(--ok-soft); color: var(--ok); border-color: #A9D8BF; }
+    .select {
+      padding: 7px 10px; font: 500 13px var(--font-sans); border: 1px solid var(--line-strong);
+      border-radius: 5px; background: #fff; color: var(--text); max-width: 100%;
+    }
+
+    /* ---------- Ledger tables ---------- */
+    .table-scroll { overflow: auto; max-height: 72vh; border: 1px solid var(--line); border-radius: 6px; background: #fff; }
+    table.ledger {
+      width: 100%; border-collapse: separate; border-spacing: 0;
+      font-size: 13px; line-height: 1.35; font-variant-numeric: tabular-nums;
+    }
+    .ledger th, .ledger td { padding: 7px 10px; border-right: 1px solid var(--line); border-bottom: 1px solid var(--line); vertical-align: middle; }
+    .ledger th:last-child, .ledger td:last-child { border-right: 0; }
+
+    .ledger thead th {
+      position: sticky; z-index: 3; background: #E8EDF3; color: var(--ink);
+      font-weight: 600; font-size: 12.5px; text-align: center; line-height: 1.25;
+      border-bottom: 1px solid var(--line-strong);
+    }
+    .ledger thead tr.group th { top: 0; height: 30px; padding: 0 10px; background: var(--ink); color: #E6EDF5; font-size: 12px; letter-spacing: .01em; border-right-color: #2E4660; }
+    .ledger thead tr.cols th { top: 30px; }
+    .ledger.simple thead th { top: 0; }
+    .ledger thead th.t-left, .ledger thead th.g-left { text-align: left; }
+    .ledger thead th.c-max-h { background: #DCE4EE; }
+
+    .ledger td.t-left { text-align: left; }
+    .ledger td.t-center { text-align: center; }
+    .ledger td.c-sr { text-align: center; color: var(--faint); width: 52px; }
+    .ledger td.c-code { text-align: center; font-weight: 600; color: var(--steel); white-space: nowrap; }
+    .ledger td.c-desc { min-width: 210px; font-weight: 500; }
+    .ledger td.c-num { text-align: center; }
+    .ledger td.c-max { text-align: center; background: #F4F6F9; font-weight: 600; color: var(--ink-soft); }
+    .ledger td.c-grade { text-align: center; font-weight: 700; }
+    .ledger td.c-status { min-width: 170px; color: var(--ink-soft); }
+    .ledger td.c-remarks { min-width: 150px; font-size: 12px; color: var(--muted); }
+    .ledger td.c-findings { min-width: 300px; font-size: 12px; line-height: 1.4; color: var(--err-ink); }
+    .ledger td.c-id { font-weight: 600; }
+
+    .ledger tbody tr:hover td:not(.cell-error):not(.c-max) { background-color: #F3F6FA; }
+
+    /* Existing alert styling: below-40% / AB / UFM / F / unsuccessful => red text */
+    .alert-text { color: var(--err) !important; font-weight: 800 !important; }
+
+    /* NEW: integrity discrepancy => entire cell red */
+    .ledger td.cell-error {
+      background: var(--err) !important; color: #fff !important; font-weight: 700 !important;
+      position: relative; cursor: help;
+    }
+    .ledger td.cell-error::after {
+      content: attr(data-rules); position: absolute; top: 2px; right: 4px;
+      font: 700 9px/1 var(--font-sans); letter-spacing: .03em; color: rgba(255,255,255,.88);
+    }
+    .ledger tr.row-flagged td:not(.cell-error):not(.c-max):not(.c-sr) { background-color: var(--err-tint); }
+    .ledger tr.row-flagged td.c-max { background-color: #F7EFEF; }
+    .ledger tr.row-flagged td.c-sr { background-color: var(--err-tint); box-shadow: inset 4px 0 0 var(--err); color: var(--err-ink); font-weight: 700; }
+
+    .finding { display: block; padding: 1px 0; }
+    .finding b { display: inline-block; min-width: 24px; margin-right: 6px; padding: 0 5px; border-radius: 3px; background: var(--err); color: #fff; font-size: 11px; text-align: center; }
+    .no-finding { color: var(--faint); }
+
+    /* Student header band */
+    .ledger tr.row-student td { background: var(--steel-soft); color: var(--steel); font-weight: 700; border-top: 2px solid var(--steel); border-bottom: 1px solid var(--steel-soft); }
+    .ledger tr.row-student td.c-sr { color: var(--steel); box-shadow: inset 4px 0 0 var(--steel); }
+    .student-line { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 22px; }
+    .student-id { font-size: 13.5px; letter-spacing: .01em; }
+    .student-name { font-family: var(--font-serif); font-size: 15px; font-weight: 600; color: var(--ink); }
+    .student-meta { font-size: 12.5px; font-weight: 500; color: var(--ink-soft); }
+    .badge-err { margin-left: auto; padding: 2px 10px; border-radius: 999px; background: var(--err); color: #fff; font-size: 12px; font-weight: 700; }
+
+    /* Summary (ledger total) band */
+    .ledger tr.row-summary td { background: var(--ledger); color: #000; font-weight: 700; border-top: 1px solid var(--ledger-line); border-bottom: 3px double var(--ink); }
+    .ledger tr.row-summary td.c-sr { color: var(--ink-soft); }
+    .ledger tr.row-summary td.c-max { background: var(--ledger); color: #000; }
+    .ledger tr.row-summary:hover td:not(.cell-error) { background-color: var(--ledger); }
+
+    .empty-cell { padding: 36px 16px !important; text-align: center; color: var(--faint); font-size: 14px; }
+
+    /* Integrity table specifics */
+    .ledger td.rule-cell { min-width: 250px; }
+    .rule-chip { display: inline-block; margin-right: 8px; padding: 0 6px; border-radius: 3px; background: var(--err); color: #fff; font-size: 11.5px; font-weight: 700; }
+    .ledger td.c-detail { min-width: 340px; color: var(--ink-soft); }
+    .ledger td.c-val { font-weight: 700; color: var(--err-ink); text-align: center; white-space: nowrap; }
+    .ledger td.c-exp { font-weight: 700; color: var(--ok); text-align: center; white-space: nowrap; }
+    .ledger td.c-gr { text-align: center; font-weight: 700; color: var(--steel); }
+
+    footer { border-top: 1px solid var(--line); background: var(--surface); padding: 14px 24px; text-align: center; font-size: 12.5px; color: var(--faint); }
+
+    @media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
+    ::-webkit-scrollbar { width: 10px; height: 10px; }
+    ::-webkit-scrollbar-track { background: #EEF1F5; }
+    ::-webkit-scrollbar-thumb { background: #C3CCD7; border-radius: 5px; border: 2px solid #EEF1F5; }
+    ::-webkit-scrollbar-thumb:hover { background: #9AA7B6; }
+  
+  /* ---- Formal report (screen hidden, print visible) ---- */
+  #reportView{display:none}
+  .rp{font-family:Georgia,"Times New Roman",serif;color:#111;max-width:1050px;margin:0 auto;padding:8px 4px}
+  .rp h1{font-size:22px;margin:0 0 2px;text-align:center;letter-spacing:.5px}
+  .rp .rp-sub{text-align:center;color:#444;font-size:13px;margin-bottom:14px;border-bottom:2px solid #111;padding-bottom:10px}
+  .rp h2{font-size:15px;margin:20px 0 8px;border-bottom:1px solid #999;padding-bottom:3px;text-transform:uppercase;letter-spacing:.4px}
+  .rp table{width:100%;border-collapse:collapse;font-size:11.5px;margin-bottom:6px}
+  .rp th,.rp td{border:1px solid #777;padding:4px 6px;text-align:center}
+  .rp th{background:#e9edf2;font-weight:700}
+  .rp td.l,.rp th.l{text-align:left}
+  .rp .meta td{border:none;text-align:left;padding:2px 6px}
+  .rp .verdict{border:2px solid #111;padding:8px 12px;font-size:13px;margin:10px 0;font-weight:700}
+  .rp .verdict.ok{border-color:#166534}.rp .verdict.bad{border-color:#b91c1c}
+  .rp .note{font-size:11.5px;color:#333;margin:4px 0}
+  .rp .sign{display:flex;gap:30px;margin-top:60px;page-break-inside:avoid}
+  .rp .sign div{flex:1;border-top:1px solid #111;padding-top:4px;text-align:center;font-size:12px}
+  .rp tr{page-break-inside:avoid}.rp thead{display:table-header-group}
+  body.show-report #reportView{display:block;padding:16px;background:#fff}
+  body.show-report .topbar,body.show-report main,body.show-report footer,body.show-report .skip-link{display:none!important}
+  .rp-bar{position:sticky;top:0;background:#1f2937;padding:8px 14px;display:flex;gap:10px;justify-content:flex-end;z-index:5}
+  @media print{@page{size:A4 landscape;margin:12mm}.rp-bar{display:none}body.show-report #reportView{padding:0}}
+  </style>
+</head>
+<body>
+  <a class="skip-link" href="#main">Skip to content</a>
+
+  <!-- Top bar -->
+  <header class="topbar">
+    <div class="wrap topbar-inner">
+      <div>
+        <h1>Examination Gracing Checker Portal</h1>
+        <p>Pre/post gracing verification and data-integrity audit for examination result ledgers</p>
+      </div>
+      <button id="loadDemoBtn" type="button" class="btn btn-ghost">Load sample demo data</button>
+    </div>
+  </header>
+
+  <main id="main" class="wrap">
+
+    <!-- Upload -->
+    <section class="panel upload" aria-labelledby="uploadHeading">
+      <div>
+        <h2 id="uploadHeading">Upload examination gracing worksheet</h2>
+        <p>
+          Upload the examination schedule and appraisal report (.xlsx or .xls). The first sheet must include the columns
+          <code>Student Number</code> <code>Module Desc</code> <code>Marks after Gracing</code> and <code>Appraisal Type Code</code>.
+          Every uploaded file is checked automatically against the nine integrity rules below.
+        </p>
+      </div>
+      <div>
+        <input type="file" id="gracingFileInput" accept=".xlsx,.xls" class="file-input" aria-label="Choose examination workbook"/>
+        <div id="uploadStatusMsg" class="status-msg" role="status" aria-live="polite">No file chosen yet.</div>
+      </div>
+    </section>
+
+    <!-- Gracing summary -->
+    <section class="kpi-strip" aria-label="Gracing summary">
+      <div class="kpi">
+        <div class="kpi-label">Total candidates evaluated</div>
+        <div class="kpi-value" id="metricTotalCandidates">0</div>
+        <div class="kpi-note">Unique student enrollments</div>
+      </div>
+      <div class="kpi">
+        <div class="kpi-label">Candidates receiving grace</div>
+        <div class="kpi-value" id="metricGracedCandidates">0</div>
+        <div class="kpi-note">Awarded Sem or Total Grace</div>
+      </div>
+      <div class="kpi">
+        <div class="kpi-label">Total gracing cases</div>
+        <div class="kpi-value" id="metricTotalCases">0</div>
+        <div class="kpi-note">Subject-level mark upgrades</div>
+      </div>
+      <div class="kpi">
+        <div class="kpi-label">Total grace marks awarded</div>
+        <div class="kpi-value" id="metricTotalMarks">0</div>
+        <div class="kpi-note">Sum of awarded bonus points</div>
+      </div>
+    </section>
+
+    <!-- Data integrity audit -->
+    <section class="panel" id="auditPanel" aria-labelledby="auditHeading">
+      <div class="audit-head">
+        <div>
+          <h2 id="auditHeading">Data integrity audit</h2>
+          <p id="auditLead">Upload a workbook to run the nine integrity checks. Select a rule to review its findings.</p>
+        </div>
+        <div id="auditBanner" class="banner">Awaiting data</div>
+      </div>
+      <div id="auditRules" class="rules"></div>
+      <div id="auditNote" class="audit-note"></div>
+    </section>
+
+    <!-- Workspace -->
+    <section aria-label="Results workspace">
+      <div class="tabs" role="tablist">
+        <button role="tab" onclick="switchTab('tabAllStudents')" id="btn-tabAllStudents" class="tab-btn is-active">1. All Students</button>
+        <button role="tab" onclick="switchTab('tabFailedStudents')" id="btn-tabFailedStudents" class="tab-btn">2. Failed Students</button>
+        <button role="tab" onclick="switchTab('tabGracedStudents')" id="btn-tabGracedStudents" class="tab-btn">3. Graced Students</button>
+        <button role="tab" onclick="switchTab('tabGracedCases')" id="btn-tabGracedCases" class="tab-btn">4. Graced Cases Details</button>
+        <button role="tab" onclick="switchTab('tabSubjectSummary')" id="btn-tabSubjectSummary" class="tab-btn">5. Subject Summary</button>
+        <button role="tab" onclick="switchTab('tabStudentSummary')" id="btn-tabStudentSummary" class="tab-btn">6. Student Summary</button>
+        <button role="tab" onclick="switchTab('tabIntegrity')" id="btn-tabIntegrity" class="tab-btn">7. Integrity Audit <span id="integrityTabCount" class="pill">0</span></button>
+      </div>
+
+      <!-- Search, filter and export -->
+      <div class="panel toolbar">
+        <div class="search">
+          <label for="searchInput">Filter / search</label>
+          <input type="text" id="searchInput" placeholder="Student number, name, module, or rule (e.g. R4)"/>
+        </div>
+        <label class="check"><input type="checkbox" id="flaggedOnly"/> <span>Show only students with discrepancies</span></label>
+        <span class="spacer"></span>
+        <button id="reportBtn" type="button" onclick="openReport()" disabled class="btn btn-ghost">Formal report (print / PDF)</button>
+        <button id="downloadExcelBtn" type="button" onclick="exportCompleteExcelReport()" disabled class="btn btn-primary">Export multi-sheet Excel report (.xlsx)</button>
+      </div>
+
+      <div class="legend" aria-label="Colour legend">
+        <span class="legend-item"><span class="swatch-fill"></span> Integrity discrepancy: entire cell in red, hover for the exact reason</span>
+        <span class="legend-item"><span class="swatch-text">42</span> Existing alert: below 40%, AB / UFM, F grade, unsuccessful</span>
+        <span class="legend-item"><span class="swatch-total"></span> Student TOTAL / PERCENTAGE row</span>
+      </div>
+
+      <!-- Tab 1 -->
+      <section id="tabAllStudents" class="panel tab-content is-active">
+        <div class="tab-head">
+          <h3>All students restructured ledger</h3>
+          <span id="allStudentsCountBadge" class="count-badge">0 Rows</span>
+        </div>
+        <div class="table-scroll">
+          <table class="ledger">
+            <thead data-ledger-head></thead>
+            <tbody id="allStudentsTableBody">
+              <tr><td colspan="15" class="empty-cell">Upload an examination workbook or click "Load sample demo data".</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <!-- Tab 2 -->
+      <section id="tabFailedStudents" class="panel tab-content">
+        <div class="tab-head">
+          <h3>Failed candidates (completed unsuccessfully)</h3>
+          <span id="failedStudentsCountBadge" class="count-badge warn">0 Students</span>
+        </div>
+        <div class="table-scroll">
+          <table class="ledger">
+            <thead data-ledger-head></thead>
+            <tbody id="failedStudentsTableBody">
+              <tr><td colspan="15" class="empty-cell">No failed students loaded.</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <!-- Tab 3 -->
+      <section id="tabGracedStudents" class="panel tab-content">
+        <div class="tab-head">
+          <h3>Graced candidates, full records</h3>
+          <span id="gracedStudentsCountBadge" class="count-badge good">0 Students</span>
+        </div>
+        <div class="table-scroll">
+          <table class="ledger">
+            <thead data-ledger-head></thead>
+            <tbody id="gracedStudentsTableBody">
+              <tr><td colspan="15" class="empty-cell">No graced students loaded.</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <!-- Tab 4 -->
+      <section id="tabGracedCases" class="panel tab-content">
+        <div class="tab-head">
+          <h3>Awarded grace marks, case breakdown</h3>
+          <span id="gracedCasesCountBadge" class="count-badge">0 Cases</span>
+        </div>
+        <div class="table-scroll">
+          <table class="ledger simple">
+            <thead>
+              <tr>
+                <th>Sr.</th>
+                <th class="t-left">Student Number</th>
+                <th class="t-left">Student Name</th>
+                <th class="t-left">Additional ID</th>
+                <th>Module Code</th>
+                <th class="t-left">Module Description</th>
+                <th class="t-left">Appraisal Type</th>
+                <th>Marks Before</th>
+                <th>Grace Marks</th>
+                <th>Marks After</th>
+                <th>Composite Before</th>
+                <th>Composite After</th>
+                <th>Grade</th>
+                <th class="t-left">Status</th>
+              </tr>
+            </thead>
+            <tbody id="gracedCasesTableBody">
+              <tr><td colspan="14" class="empty-cell">No graced cases detected.</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <!-- Tab 5 -->
+      <section id="tabSubjectSummary" class="panel tab-content">
+        <div class="tab-head">
+          <h3>Subject-wise gracing distribution</h3>
+          <span id="subjectSummaryCountBadge" class="count-badge">0 Subjects</span>
+        </div>
+        <div class="table-scroll">
+          <table class="ledger simple">
+            <thead>
+              <tr>
+                <th>Sr.</th>
+                <th>Subject Code</th>
+                <th class="t-left">Subject Name</th>
+                <th>Graced Students Count</th>
+                <th>Total Grace Marks</th>
+                <th>Max Grace Marks</th>
+                <th>Avg Grace Marks</th>
+              </tr>
+            </thead>
+            <tbody id="subjectSummaryTableBody">
+              <tr><td colspan="7" class="empty-cell">No subject gracing statistics available.</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <!-- Tab 6 -->
+      <section id="tabStudentSummary" class="panel tab-content">
+        <div class="tab-head">
+          <h3>Student-wise gracing summary</h3>
+          <span id="studentSummaryCountBadge" class="count-badge">0 Candidates</span>
+        </div>
+        <div class="table-scroll">
+          <table class="ledger simple">
+            <thead>
+              <tr>
+                <th>Sr.</th>
+                <th class="t-left">Student Number</th>
+                <th class="t-left">Student Name</th>
+                <th class="t-left">Additional ID</th>
+                <th>Graced Subjects Count</th>
+                <th>Total Grace Marks</th>
+                <th class="t-left">Graced Subjects &amp; Marks</th>
+              </tr>
+            </thead>
+            <tbody id="studentSummaryTableBody">
+              <tr><td colspan="7" class="empty-cell">No student gracing summary available.</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <!-- Tab 7: Integrity audit (new) -->
+      <section id="tabIntegrity" class="panel tab-content">
+        <div class="tab-head">
+          <div>
+            <h3>Data integrity findings</h3>
+            <p class="tab-sub">Every discrepancy, with the reported value and what the rule expected. Matching cells are filled red in the ledger tabs.</p>
+          </div>
+          <div style="display:flex;flex-wrap:wrap;gap:10px;align-items:center">
+            <label for="integrityRuleFilter" style="font-size:13px;font-weight:600;color:var(--ink-soft)">Rule</label>
+            <select id="integrityRuleFilter" class="select"></select>
+            <span id="integrityCountBadge" class="count-badge">0 Findings</span>
+          </div>
+        </div>
+        <div class="table-scroll">
+          <table class="ledger simple">
+            <thead>
+              <tr>
+                <th>Sr.</th>
+                <th class="t-left">Student Number</th>
+                <th class="t-left">Student Name</th>
+                <th>Module Code</th>
+                <th class="t-left">Module Description</th>
+                <th class="t-left">Rule</th>
+                <th class="t-left">Cell</th>
+                <th>Reported</th>
+                <th>Expected / Limit</th>
+                <th class="t-left">Explanation</th>
+              </tr>
+            </thead>
+            <tbody id="integrityTableBody">
+              <tr><td colspan="10" class="empty-cell">Upload an examination workbook to run the integrity audit.</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+    </section>
+
+  </main>
+
+  <div id="reportView"></div>
+
+  <footer>Automated Examination Gracing Verification &middot; Institutional Examination Committee Portal</footer>
+
+  <script>
+    /* ==========================================================================
+       Global application state
+       ========================================================================== */
+    let rawWorkbookData = [];
+    let processedAllRows = [];
+    let processedFailedRows = [];
+    let processedGracedRows = [];
+    let gracedCasesList = [];
+    let subjectSummaryList = [];
+    let studentSummaryList = [];
+    let integrityFindings = [];
+    let flaggedStudents = new Set();
+    let auditMeta = { loaded: false, totalMaxExplicitCount: 0, totalRowCount: 0, studentsEvaluated: 0 };
+    let currentSourceName = '';
+    let activeTabId = 'tabAllStudents';
+
+    /* ==========================================================================
+       Integrity configuration (edit here to adapt to another grading scheme)
+       ========================================================================== */
+    // Tolerance for comparing marks (existing portal tolerance)
+    const INTEGRITY_TOLERANCE = 0.01;
+
+    // Grade for a Composite Score percentage (obtained / maximum x 100), highest band first.
+    // Verified against the supplied dataset: O>=90, A+ 80-89, A 70-79, B+ 60-69, B 55-59, C 50-54, P 40-49, F <40.
+    const GRADE_SCALE = [
+      { grade: 'O',  min: 90 },
+      { grade: 'A+', min: 80 },
+      { grade: 'A',  min: 70 },
+      { grade: 'B+', min: 60 },
+      { grade: 'B',  min: 55 },
+      { grade: 'C',  min: 50 },
+      { grade: 'P',  min: 40 },
+      { grade: 'F',  min: -Infinity }
+    ];
+    const FAIL_GRADE = 'F';
+
+    // Completion status that must accompany a grade
+    const STATUS_SUCCESS_LABEL = 'Completed with Success';
+    const STATUS_FAIL_LABEL = 'Completed Unsuccessfuly';
+    const STATUS_SUCCESS_ACCEPTED = ['completed with success'];
+    // The source system spells it "Unsuccessfuly"; the correct spelling is tolerated as well.
+    const STATUS_FAIL_ACCEPTED = ['completed unsuccessfuly', 'completed unsuccessfully'];
+
+    const INTEGRITY_RULES = [
+      { id: 'R1', short: 'Internal Actual > Internal Actual (Max)',
+        title: 'Internal Actual exceeds Internal Actual (Max)' },
+      { id: 'R2', short: 'Sem Actual > Sem Actual (Max)',
+        title: 'Sem Actual exceeds Sem Actual (Max)' },
+      { id: 'R3', short: 'Composite Score > Composite Score (Max)',
+        title: 'Composite Score exceeds Composite Score (Max)' },
+      { id: 'R4', short: 'Composite ≠ Internal + Sem + Sem Grace',
+        title: 'Composite Score does not equal Internal Actual + Sem Actual + Sem Grace' },
+      { id: 'R5', short: 'Overall Grade ≠ grade for Composite %',
+        title: 'Overall Grade does not match the grade for the Composite Score and maximum marks' },
+      { id: 'R6', short: 'Completion Status ≠ grade outcome',
+        title: 'Completion Status is inconsistent with the Overall Grade' },
+      { id: 'R7', short: 'TOTAL ≠ sum of subject Composite Scores',
+        title: 'TOTAL Composite Score does not equal the sum of subject Composite Scores' },
+      { id: 'R8', short: 'TOTAL (Max) ≠ sum of subject Maximums',
+        title: 'TOTAL Composite Score (Max) does not equal the sum of subject Composite Score (Max)' },
+      { id: 'R9', short: 'PERCENTAGE ≠ TOTAL ÷ TOTAL (Max) × 100',
+        title: 'PERCENTAGE does not equal (TOTAL Composite Score ÷ TOTAL Composite Score (Max)) × 100' }
+    ];
+    const RULE_BY_ID = Object.fromEntries(INTEGRITY_RULES.map(r => [r.id, r]));
+
+    /* ==========================================================================
+       Helpers
+       ========================================================================== */
+    function esc(s) {
+      return String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+    }
+
+    // Natural alphanumeric sort comparison
+    const natCompare = (a, b) => String(a ?? '').localeCompare(String(b ?? ''), undefined, { numeric: true, sensitivity: 'base' });
+
+    // Parse scale numbers (e.g. 'R050' -> 50.0)
+    function parseScaleNum(scaleVal) {
+      const s = String(scaleVal ?? '').trim();
+      const digits = s.match(/\d+/g);
+      return digits ? parseFloat(digits[0]) : 0.0;
+    }
+
+    // Parse scale display string (e.g. 'R050' -> '50')
+    function parseScaleStr(scaleVal) {
+      const s = String(scaleVal ?? '').trim();
+      const digits = s.match(/\d+/g);
+      if (digits) return String(parseInt(digits[0], 10));
+      return (['NAN', 'NONE', 'NA', ''].includes(s.toUpperCase())) ? '' : s;
+    }
+
+    // Parse mark values: Z1 -> AB, Z3 -> UFM, empty -> '', numbers -> numeric value
+    function parseMark(val) {
+      const s = String(val ?? '').trim().toUpperCase();
+      if (s === 'Z1') {
+        return { display: 'AB', num: 0.0, isAbsUfm: true };
+      } else if (s === 'Z3') {
+        return { display: 'UFM', num: 0.0, isAbsUfm: true };
+      } else if (['', 'NAN', 'NONE', 'NA', 'UNDEFINED'].includes(s)) {
+        return { display: '', num: 0.0, isAbsUfm: false };
+      } else {
+        const num = parseFloat(s);
+        if (!isNaN(num)) {
+          const outVal = Number.isInteger(num) ? String(parseInt(num, 10)) : String(num);
+          return { display: outVal, num: num, isAbsUfm: false };
+        }
+        return { display: val, num: 0.0, isAbsUfm: false };
+      }
+    }
+
+    // Integrity helpers
+    function isPresent(v) {
+      const s = String(v ?? '').trim().toUpperCase();
+      return !(s === '' || ['NAN', 'NONE', 'NA', 'UNDEFINED'].includes(s));
+    }
+    function fmtNum(n) {
+      if (typeof n !== 'number' || !isFinite(n)) return String(n);
+      const r = Math.round(n * 100) / 100;
+      return String(r);
+    }
+    function markText(p) { return p.isAbsUfm ? `${p.display} (counted as 0)` : fmtNum(p.num); }
+    function countDecimals(raw) {
+      const s = String(raw ?? '').trim();
+      const m = s.match(/^-?\d+\.(\d+)$/);
+      return m ? m[1].length : 0;
+    }
+    function gradeForPercent(pct) {
+      const p = Math.round(pct * 1e6) / 1e6;   // guard against floating-point noise at band edges
+      for (const band of GRADE_SCALE) { if (p >= band.min) return band.grade; }
+      return FAIL_GRADE;
+    }
+    function gradeScaleText() {
+      const bands = GRADE_SCALE.filter(b => isFinite(b.min));
+      const last = GRADE_SCALE[GRADE_SCALE.length - 1];
+      return bands.map((b, i) => {
+        const upper = i === 0 ? '' : ` to <${bands[i - 1].min}%`;
+        return `${b.grade} ≥ ${b.min}%${upper}`;
+      }).join(', ') + `, ${last.grade} < ${bands[bands.length - 1].min}%`;
+    }
+    function normStatus(s) { return String(s ?? '').trim().replace(/\s+/g, ' ').toLowerCase(); }
+
+    const CELL_LABELS = {
+      'Internal Actual': 'Internal Actual',
+      'Sem Actual': 'Sem Actual',
+      'Composite Score': 'Composite Score',
+      'Overall Grade': 'Overall Grade',
+      'Completion Status after Gracing': 'Completion Status',
+      'Composite Score (Max)': 'Composite Score (Max)'
+    };
+
+    function makeFinding(ruleId, ctx, field, cellLabel, found, expected, detail) {
+      return {
+        ruleId,
+        rule: RULE_BY_ID[ruleId].title,
+        studentNumber: ctx.sNum,
+        studentName: ctx.stdName,
+        additionalId: ctx.addId,
+        moduleCode: ctx.mCode,
+        moduleDesc: ctx.mDesc,
+        field,
+        cell: cellLabel,
+        found: String(found ?? ''),
+        expected: String(expected ?? ''),
+        detail
+      };
+    }
+
+    function groupByField(findings) {
+      const map = {};
+      findings.forEach(f => { (map[f.field] = map[f.field] || []).push(f); });
+      return map;
+    }
+
+    /* ==========================================================================
+       Integrity validation: subject (module) rows  -> rules R1 to R6
+       ========================================================================== */
+    function validateModuleRow(c) {
+      const out = [];
+      const add = (ruleId, field, found, expected, detail) =>
+        out.push(makeFinding(ruleId, c, field, CELL_LABELS[field], found, expected, detail));
+
+      // R1: Internal Actual > Internal Actual (Max)
+      if (c.intMaxNum > 0 && !c.intP.isAbsUfm && c.intP.num > c.intMaxNum + INTEGRITY_TOLERANCE) {
+        add('R1', 'Internal Actual', c.intP.display, `≤ ${fmtNum(c.intMaxNum)}`,
+          `Internal Actual ${c.intP.display} exceeds its maximum of ${fmtNum(c.intMaxNum)}.`);
+      }
+
+      // R2: Sem Actual > Sem Actual (Max)
+      if (c.semMaxNum > 0 && !c.semP.isAbsUfm && c.semP.num > c.semMaxNum + INTEGRITY_TOLERANCE) {
+        add('R2', 'Sem Actual', c.semP.display, `≤ ${fmtNum(c.semMaxNum)}`,
+          `Sem Actual ${c.semP.display} exceeds its maximum of ${fmtNum(c.semMaxNum)}.`);
+      }
+
+      const compPresent = isPresent(c.compVal);
+
+      // R3: Composite Score > Composite Score (Max)
+      if (compPresent && c.compMaxNum > 0 && !c.compP.isAbsUfm && c.compP.num > c.compMaxNum + INTEGRITY_TOLERANCE) {
+        add('R3', 'Composite Score', c.compP.display, `≤ ${fmtNum(c.compMaxNum)}`,
+          `Composite Score ${c.compP.display} exceeds its maximum of ${fmtNum(c.compMaxNum)}.`);
+      }
+
+      // R4: Composite Score = Internal Actual + Sem Actual + Sem Grace
+      if (c.isMismatch) {
+        add('R4', 'Composite Score', c.compP.display, fmtNum(c.sumComponents),
+          `Internal Actual ${markText(c.intP)} + Sem Actual ${markText(c.semP)} + Sem Grace ${markText(c.graceP)} = ${fmtNum(c.sumComponents)}, ` +
+          `but Composite Score shows ${c.compP.display}.`);
+      }
+
+      // R5: Overall Grade must match the grade for Composite Score / maximum marks
+      const gradeStr = String(c.grade ?? '').trim().toUpperCase();
+      if (compPresent && c.compMaxNum > 0) {
+        const pct = c.compP.num / c.compMaxNum * 100;
+        const expGrade = gradeForPercent(pct);
+        let gradeOk = gradeStr === expGrade;
+        // An F is legitimate when a head is below the 40% minimum (or AB/UFM) even if the composite alone would pass.
+        if (!gradeOk && gradeStr === FAIL_GRADE && (c.failInt || c.failSem || c.compP.isAbsUfm)) gradeOk = true;
+        if (!gradeOk) {
+          const shown = gradeStr === '' ? '(blank)' : String(c.grade).trim();
+          let why = `Composite ${c.compP.display}/${fmtNum(c.compMaxNum)} = ${pct.toFixed(2)}% corresponds to grade ${expGrade}, but Overall Grade is ${shown}.`;
+          if (gradeStr === FAIL_GRADE) why += ' No head (Internal / Sem) is below the 40% minimum, so F is not explained.';
+          add('R5', 'Overall Grade', shown, expGrade, why);
+        }
+      }
+
+      // R6: Completion Status must follow the grade (non-F -> success, F -> unsuccessful)
+      if (gradeStr !== '') {
+        const isF = gradeStr === FAIL_GRADE;
+        const accepted = isF ? STATUS_FAIL_ACCEPTED : STATUS_SUCCESS_ACCEPTED;
+        const expectedLabel = isF ? STATUS_FAIL_LABEL : STATUS_SUCCESS_LABEL;
+        if (!accepted.includes(normStatus(c.status))) {
+          const shown = String(c.status ?? '').trim() || '(blank)';
+          add('R6', 'Completion Status after Gracing', shown, expectedLabel,
+            `Grade ${String(c.grade).trim()} requires the status "${expectedLabel}", but the status is "${shown}".`);
+        }
+      }
+      return out;
+    }
+
+    /* ==========================================================================
+       Core Logic 1: Create processed data (restructure student by student)
+       ========================================================================== */
+    function createProcessedData(records, targetStudentIds = null) {
+      const cleanedRecords = records.map(row => {
+        const cleaned = {};
+        Object.keys(row).forEach(k => {
+          cleaned[String(k).trim()] = row[k];
+        });
+        return cleaned;
+      });
+
+      // Decimal precision used by the file's PERCENTAGE rows (sets the rounding tolerance for R9)
+      let pctDecimals = 0, sawPct = false;
+      cleanedRecords.forEach(r => {
+        if (String(r['Student Name'] ?? '').trim().toUpperCase() === 'PERCENTAGE' && isPresent(r['Marks after Gracing'])) {
+          sawPct = true;
+          pctDecimals = Math.max(pctDecimals, countDecimals(r['Marks after Gracing']));
+        }
+      });
+      pctDecimals = sawPct ? Math.min(pctDecimals, 2) : 2;
+      const pctTolerance = 0.5 * Math.pow(10, -pctDecimals) + 1e-6;
+
+      let studentIds = [];
+      const seen = new Set();
+      cleanedRecords.forEach(r => {
+        const sid = String(r['Student Number'] ?? '').trim();
+        if (sid && !seen.has(sid)) {
+          seen.add(sid);
+          studentIds.push(sid);
+        }
+      });
+
+      if (targetStudentIds) {
+        const targetSet = new Set(targetStudentIds.map(id => String(id).trim()));
+        studentIds = studentIds.filter(sid => targetSet.has(sid));
+      }
+
+      const allProcessedRows = [];
+
+      studentIds.forEach(sNum => {
+        const sRows = cleanedRecords.filter(r => String(r['Student Number'] ?? '').trim() === sNum);
+
+        // Filter module rows vs total/percentage rows
+        const moduleRows = sRows.filter(r => {
+          const mDesc = r['Module Desc'];
+          const sName = String(r['Student Name'] ?? '').trim().toUpperCase();
+          return mDesc !== undefined && mDesc !== null && String(mDesc).trim() !== '' && !['TOTAL', 'PERCENTAGE'].includes(sName);
+        });
+
+        const totalRow = sRows.find(r => String(r['Student Name'] ?? '').trim().toUpperCase() === 'TOTAL');
+        const percRow = sRows.find(r => String(r['Student Name'] ?? '').trim().toUpperCase() === 'PERCENTAGE');
+
+        const stdName = moduleRows.length ? (moduleRows[0]['Student Name'] || '') : (sRows[0]?.['Student Name'] || '');
+        const addId = moduleRows.length ? (moduleRows[0]['Additional ID'] || '') : (sRows[0]?.['Additional ID'] || '');
+        const gender = moduleRows.length ? (moduleRows[0]['Gender'] || '') : (sRows[0]?.['Gender'] || '');
+
+        let studentFindingCount = 0;
+
+        // 1. Merged Student Header Row
+        const studentHeaderStr = `${sNum} | ${stdName} | ${addId} | ${gender}`;
+        const headerRow = {
+          'Module Code': studentHeaderStr,
+          'Module Desc': '',
+          'Credit': '',
+          'Internal Actual (Max)': '',
+          'Internal Actual': '',
+          'Sem Actual (Max)': '',
+          'Sem Actual': '',
+          'Sem Grace': '',
+          'Composite Score (Max)': '',
+          'Composite Score': '',
+          'Overall Grade': '',
+          'Completion Status after Gracing': '',
+          'Remarks & Scale': '',
+          'Row_Type': 'HEADER',
+          'Comp_Mismatch': false,
+          'Red_Internal': false,
+          'Red_Sem': false,
+          'Red_Grace': false,
+          'Red_Composite': false,
+          'Red_Grade': false,
+          'Red_Status': false,
+          'Findings': [],
+          'Err': {},
+          'Finding_Count': 0,
+          'Student_Number': sNum,
+          'Student_Name': stdName,
+          'Additional_ID': addId,
+          'Student_Gender': gender
+        };
+        allProcessedRows.push(headerRow);
+
+        // Unique modules for this student
+        const uniqueModules = [];
+        const seenModules = new Set();
+        moduleRows.forEach(r => {
+          const mc = String(r['Module Code'] ?? '').trim();
+          if (mc && !seenModules.has(mc)) {
+            seenModules.add(mc);
+            uniqueModules.push(mc);
+          }
+        });
+
+        let calcTotalComp = 0.0;
+        let calcTotalMaxComp = 0.0;
+
+        uniqueModules.forEach(mCode => {
+          const mSub = moduleRows.filter(r => String(r['Module Code'] ?? '').trim() === mCode);
+          const mDesc = mSub[0]?.['Module Desc'] || '';
+
+          // Credit extraction
+          const creditRow = mSub.find(r => String(r['Appraisal Type Code'] ?? '').trim() === 'Overall Grade');
+          const creditRaw = creditRow ? creditRow['Credit'] : mSub[0]?.['Credit'];
+          const creditParsed = parseMark(creditRaw);
+
+          function getValAndScale(code) {
+            const sub = mSub.find(r => String(r['Appraisal Type Code'] ?? '').trim() === code);
+            if (sub) {
+              return { val: sub['Marks after Gracing'], scale: sub['Scale'] ?? '' };
+            }
+            return { val: '', scale: '' };
+          }
+
+          const intData = getValAndScale('Internal Actual');
+          const semData = getValAndScale('Sem Actual');
+          const graceData = getValAndScale('Sem Grace');
+          const compData = getValAndScale('Composite Score');
+          const gradeData = getValAndScale('Overall Grade');
+
+          const intP = parseMark(intData.val);
+          const semP = parseMark(semData.val);
+          const graceP = parseMark(graceData.val);
+          const compP = parseMark(compData.val);
+
+          const intMaxNum = parseScaleNum(intData.scale);
+          const intMaxDisplay = parseScaleStr(intData.scale);
+
+          const semMaxNum = parseScaleNum(semData.scale);
+          const semMaxDisplay = parseScaleStr(semData.scale);
+
+          const compMaxNum = parseScaleNum(compData.scale);
+          const compMaxDisplay = parseScaleStr(compData.scale);
+
+          const subOverall = mSub.find(r => String(r['Appraisal Type Code'] ?? '').trim() === 'Overall Grade');
+          const completionStatus = subOverall ? (subOverall['Completion Status after Gracing'] || '') : '';
+
+          const appRem = subOverall ? String(subOverall['Appraisal Remarks'] ?? '').trim() : '';
+          const genRem = subOverall ? String(subOverall['General Remarks'] ?? '').trim() : '';
+          const scaleT = subOverall ? String(subOverall['Scale Type'] ?? '').trim() : '';
+
+          const remarksList = [appRem, genRem, scaleT].filter(r => r && !['NAN', 'NONE', 'NA'].includes(r.toUpperCase()));
+          const remarksCombined = remarksList.join(' | ');
+
+          // Verify: Internal Actual + Sem Actual + Sem Grace == Composite Score
+          const sumComponents = intP.num + semP.num + graceP.num;
+          calcTotalComp += compP.num;
+          calcTotalMaxComp += compMaxNum;
+
+          let isMismatch = false;
+          if (String(compData.val).trim() !== '' && !['nan', 'NA'].includes(String(compData.val).toLowerCase())) {
+            if (Math.abs(sumComponents - compP.num) >= 0.01) {
+              isMismatch = true;
+            }
+          }
+
+          // 40% Minimum Passing Criteria
+          const failInt = (intMaxNum > 0) && (intP.num < 0.40 * intMaxNum || intP.isAbsUfm);
+          const failSem = (semMaxNum > 0) && (semP.num < 0.40 * semMaxNum || semP.isAbsUfm);
+          const failComp = (compMaxNum > 0) && (compP.num < 0.40 * compMaxNum || compP.isAbsUfm);
+
+          const isFGrade = String(gradeData.val ?? '').trim().toUpperCase() === 'F';
+          const isUnsuccessful = String(completionStatus ?? '').trim().toLowerCase() === 'completed unsuccessfuly';
+
+          // Integrity validation (R1 to R6)
+          const modFindings = validateModuleRow({
+            sNum, stdName, addId, mCode, mDesc,
+            intP, semP, graceP, compP, intMaxNum, semMaxNum, compMaxNum,
+            compVal: compData.val, grade: gradeData.val, status: completionStatus,
+            failInt, failSem, sumComponents, isMismatch
+          });
+          studentFindingCount += modFindings.length;
+
+          allProcessedRows.push({
+            'Module Code': mCode,
+            'Module Desc': mDesc,
+            'Credit': creditParsed.display,
+            'Internal Actual (Max)': intMaxDisplay,
+            'Internal Actual': intP.display,
+            'Sem Actual (Max)': semMaxDisplay,
+            'Sem Actual': semP.display,
+            'Sem Grace': graceP.display,
+            'Composite Score (Max)': compMaxDisplay,
+            'Composite Score': compP.display,
+            'Overall Grade': String(gradeData.val ?? '').trim(),
+            'Completion Status after Gracing': completionStatus,
+            'Remarks & Scale': remarksCombined,
+            'Row_Type': 'DATA',
+            'Comp_Mismatch': isMismatch,
+            'Red_Internal': intP.isAbsUfm || failInt,
+            'Red_Sem': semP.isAbsUfm || failSem,
+            'Red_Grace': graceP.isAbsUfm,
+            'Red_Composite': compP.isAbsUfm || failComp || isMismatch,
+            'Red_Grade': isFGrade,
+            'Red_Status': isUnsuccessful,
+            'Findings': modFindings,
+            'Err': groupByField(modFindings),
+            'Student_Number': sNum,
+            'Student_Name': stdName,
+            'Additional_ID': addId
+          });
+        });
+
+        // 2. Summary Row (Totals and Percentages)
+        const totValRaw = totalRow ? (totalRow['Marks after Gracing'] || totalRow['Marks before Gracing'] || '') : '';
+        const percValRaw = percRow ? (percRow['Marks after Gracing'] || percRow['Marks before Gracing'] || '') : '';
+
+        const totP = parseMark(totValRaw);
+
+        let totalMismatch = false;
+        if (String(totValRaw).trim() !== '' && !['nan', 'NA'].includes(String(totValRaw).toLowerCase())) {
+          if (Math.abs(calcTotalComp - totP.num) >= 0.01) {
+            totalMismatch = true;
+          }
+        }
+
+        let percDisplay = '';
+        const pNum = parseFloat(percValRaw);
+        if (!isNaN(pNum)) {
+          percDisplay = `${Number.isInteger(pNum) ? pNum : pNum.toFixed(2)}%`;
+        } else if (String(percValRaw).trim() !== '') {
+          percDisplay = `${percValRaw}%`;
+        }
+
+        // Integrity validation (R7 to R9)
+        const sumFindings = [];
+        const sctx = { sNum, stdName, addId, mCode: '', mDesc: 'TOTAL / PERCENTAGE' };
+        const totalPresent = !!totalRow && isPresent(totValRaw);
+
+        // R7: TOTAL Composite Score = sum of subject Composite Scores
+        if (totalPresent && totalMismatch) {
+          sumFindings.push(makeFinding('R7', sctx, 'Composite Score', 'TOTAL Composite Score',
+            totP.display, fmtNum(calcTotalComp),
+            `TOTAL shows ${totP.display}, but the ${uniqueModules.length} subject Composite Scores add up to ${fmtNum(calcTotalComp)} (difference ${fmtNum(totP.num - calcTotalComp)}).`));
+        }
+
+        // R8: TOTAL Composite Score (Max) = sum of subject Composite Score (Max).
+        // The maximum is read from the TOTAL row's Scale when the file supplies one; otherwise the sum is displayed.
+        const explicitTotalMax = totalRow ? parseScaleNum(totalRow['Scale']) : 0;
+        let totalMaxShown = calcTotalMaxComp;
+        if (explicitTotalMax > 0) {
+          totalMaxShown = explicitTotalMax;
+          if (Math.abs(explicitTotalMax - calcTotalMaxComp) >= 0.01) {
+            sumFindings.push(makeFinding('R8', sctx, 'Composite Score (Max)', 'TOTAL Composite Score (Max)',
+              fmtNum(explicitTotalMax), fmtNum(calcTotalMaxComp),
+              `TOTAL (Max) shows ${fmtNum(explicitTotalMax)}, but the subject Composite Score (Max) values add up to ${fmtNum(calcTotalMaxComp)}.`));
+          }
+        }
+
+        // R9: PERCENTAGE = (TOTAL / TOTAL Max) x 100
+        if (percRow && isPresent(percValRaw) && !isNaN(pNum) && totalMaxShown > 0) {
+          const totalForPct = totalPresent ? totP.num : calcTotalComp;
+          const expPct = totalForPct / totalMaxShown * 100;
+          if (Math.abs(pNum - expPct) > pctTolerance) {
+            sumFindings.push(makeFinding('R9', sctx, 'Overall Grade', 'PERCENTAGE',
+              percDisplay, `${expPct.toFixed(2)}%`,
+              `PERCENTAGE shows ${percDisplay}, but ${fmtNum(totalForPct)} ÷ ${fmtNum(totalMaxShown)} × 100 = ${expPct.toFixed(2)}%.`));
+          }
+        }
+        studentFindingCount += sumFindings.length;
+
+        allProcessedRows.push({
+          'Module Code': '',
+          'Module Desc': '',
+          'Credit': '',
+          'Internal Actual (Max)': '',
+          'Internal Actual': '',
+          'Sem Actual (Max)': '',
+          'Sem Actual': '',
+          'Sem Grace': '',
+          'Composite Score (Max)': fmtNum(totalMaxShown),
+          'Composite Score': totP.display,
+          'Overall Grade': percDisplay,
+          'Completion Status after Gracing': '',
+          'Remarks & Scale': '',
+          'Row_Type': 'SUMMARY',
+          'Comp_Mismatch': totalMismatch,
+          'Red_Internal': false,
+          'Red_Sem': false,
+          'Red_Grace': false,
+          'Red_Composite': totalMismatch,
+          'Red_Grade': false,
+          'Red_Status': false,
+          'Findings': sumFindings,
+          'Err': groupByField(sumFindings),
+          'Student_Number': sNum,
+          'Student_Name': stdName,
+          'Additional_ID': addId
+        });
+
+        headerRow.Finding_Count = studentFindingCount;
+      });
+
+      return allProcessedRows;
+    }
+
+    /* ==========================================================================
+       Core Logic 2: Extract graced cases details
+       ========================================================================== */
+    function processGracingData(records) {
+      const nonSummary = records.filter(r => {
+        const mDesc = r['Module Desc'];
+        const sName = String(r['Student Name'] ?? '').trim().toUpperCase();
+        return mDesc !== undefined && mDesc !== null && String(mDesc).trim() !== '' && !['TOTAL', 'PERCENTAGE'].includes(sName);
+      });
+
+      const graceRows = nonSummary.filter(r => {
+        const appType = String(r['Appraisal Type Code'] ?? '').trim();
+        return ['Sem Grace', 'Grace on Total marks'].includes(appType);
+      });
+
+      const awardedGrace = graceRows.filter(r => {
+        const val = parseFloat(r['Marks after Gracing']);
+        return !isNaN(val) && val > 0;
+      });
+
+      const cases = [];
+
+      awardedGrace.forEach(gRow => {
+        const sNum = gRow['Student Number'];
+        const mCode = gRow['Module Code'];
+
+        const subDf = nonSummary.filter(r => r['Student Number'] === sNum && r['Module Code'] === mCode);
+
+        const semActual = subDf.find(r => String(r['Appraisal Type Code'] ?? '').trim() === 'Sem Actual');
+        const semTot = subDf.find(r => String(r['Appraisal Type Code'] ?? '').trim() === 'Semester Total Marks');
+        const compScore = subDf.find(r => String(r['Appraisal Type Code'] ?? '').trim() === 'Composite Score');
+        const gradeRow = subDf.find(r => String(r['Appraisal Type Code'] ?? '').trim() === 'Overall Grade');
+
+        const marksBefore = semActual ? semActual['Marks before Gracing'] : (gRow['Marks before Gracing'] || '');
+        const marksAfter = semTot ? semTot['Marks after Gracing'] : '';
+        const compBefore = compScore ? compScore['Marks before Gracing'] : '';
+        const compAfter = compScore ? compScore['Marks after Gracing'] : '';
+        const grade = gradeRow ? gradeRow['Marks after Gracing'] : '';
+        const status = gradeRow ? gradeRow['Completion Status after Gracing'] : '';
+
+        const graceNum = parseFloat(gRow['Marks after Gracing']) || 0;
+
+        cases.push({
+          'Student Number': sNum,
+          'Student Name': gRow['Student Name'] || '',
+          'Additional ID': gRow['Additional ID'] || '',
+          'Module Code': mCode,
+          'Module Desc': gRow['Module Desc'] || '',
+          'Appraisal Type': gRow['Appraisal Type Code'] || '',
+          'Marks Before Gracing': marksBefore,
+          'Grace Marks': graceNum,
+          'Marks After Gracing': marksAfter,
+          'Composite Score Before': compBefore,
+          'Composite Score After': compAfter,
+          'Grade': grade,
+          'Status': status
+        });
+      });
+
+      return cases;
+    }
+
+    /* ==========================================================================
+       Core Logic 3: Subject summary aggregation
+       ========================================================================== */
+    function getSubjectSummary(gracedCases) {
+      if (!gracedCases.length) return [];
+
+      const map = {};
+      gracedCases.forEach(c => {
+        const key = `${c['Module Code']}||${c['Module Desc']}`;
+        if (!map[key]) {
+          map[key] = {
+            code: c['Module Code'],
+            desc: c['Module Desc'],
+            students: new Set(),
+            totalGrace: 0,
+            maxGrace: 0,
+            marksList: []
+          };
+        }
+        map[key].students.add(c['Student Number']);
+        map[key].totalGrace += c['Grace Marks'];
+        map[key].maxGrace = Math.max(map[key].maxGrace, c['Grace Marks']);
+        map[key].marksList.push(c['Grace Marks']);
+      });
+
+      return Object.values(map).map(m => {
+        const count = m.students.size;
+        const avg = count ? (m.totalGrace / m.marksList.length) : 0;
+        return {
+          'Subject Code': m.code,
+          'Subject Name': m.desc,
+          'Graced Students Count': count,
+          'Total Grace Marks': m.totalGrace,
+          'Max Grace Marks': m.maxGrace,
+          'Avg Grace Marks': parseFloat(avg.toFixed(2))
+        };
+      }).sort((a, b) => natCompare(a['Subject Code'], b['Subject Code']));
+    }
+
+    /* ==========================================================================
+       Core Logic 4: Student summary aggregation
+       ========================================================================== */
+    function getStudentSummary(gracedCases) {
+      if (!gracedCases.length) return [];
+
+      const map = {};
+      gracedCases.forEach(c => {
+        const sNum = c['Student Number'];
+        if (!map[sNum]) {
+          map[sNum] = {
+            num: sNum,
+            name: c['Student Name'],
+            addId: c['Additional ID'],
+            count: 0,
+            totalGrace: 0,
+            subList: []
+          };
+        }
+        map[sNum].count += 1;
+        map[sNum].totalGrace += c['Grace Marks'];
+        const gDisplay = Number.isInteger(c['Grace Marks']) ? String(c['Grace Marks']) : String(c['Grace Marks']);
+        map[sNum].subList.push(`${c['Module Desc']} (+${gDisplay})`);
+      });
+
+      return Object.values(map).map(m => ({
+        'Student Number': m.num,
+        'Student Name': m.name,
+        'Additional ID': m.addId,
+        'Graced Subjects Count': m.count,
+        'Total Grace Marks': m.totalGrace,
+        'Graced Subjects & Marks': m.subList.join(', ')
+      })).sort((a, b) => natCompare(a['Student Number'], b['Student Number']));
+    }
+
+    /* ==========================================================================
+       Ingestion & file processing
+       ========================================================================== */
+    function setStatus(kind, text) {
+      const el = document.getElementById('uploadStatusMsg');
+      el.className = 'status-msg ' + kind;
+      el.innerText = text;
+    }
+
+    document.getElementById('gracingFileInput').addEventListener('change', function(e) {
+      if (!e.target.files.length) return;
+      const file = e.target.files[0];
+      setStatus('info', `Reading workbook: ${file.name}...`);
+
+      const reader = new FileReader();
+      reader.onload = function(ev) {
+        try {
+          const wb = XLSX.read(new Uint8Array(ev.target.result), { type: 'array' });
+          const ws = wb.Sheets[wb.SheetNames[0]];
+          const raw = XLSX.utils.sheet_to_json(ws, { defval: '', raw: true });
+
+          if (!raw.length) {
+            throw new Error('The selected Excel sheet has no data rows.');
+          }
+
+          processRawRecords(raw, file.name);
+        } catch (err) {
+          setStatus('err', `Error: ${err.message}`);
+        }
+      };
+      reader.onerror = function() {
+        setStatus('err', 'Could not read the uploaded Excel file.');
+      };
+      reader.readAsArrayBuffer(file);
+    });
+
+    function processRawRecords(raw, sourceName = 'Workbook') {
+      // Clean headers
+      const firstRow = raw[0];
+      const cleanedHeaders = Object.keys(firstRow).map(k => String(k).trim());
+
+      const requiredCols = ['Student Number', 'Module Desc', 'Marks after Gracing', 'Appraisal Type Code'];
+      const missingCols = requiredCols.filter(col => !cleanedHeaders.some(h => h.toLowerCase() === col.toLowerCase()));
+
+      if (missingCols.length) {
+        throw new Error(`Missing mandatory columns: ${missingCols.join(', ')}`);
+      }
+
+      rawWorkbookData = raw;
+      currentSourceName = sourceName;
+
+      // Extract failed and graced PRNs
+      const failedPrns = [];
+      const gracedPrns = [];
+      const seenF = new Set();
+      const seenG = new Set();
+
+      raw.forEach(r => {
+        const sNum = String(r['Student Number'] ?? '').trim();
+        const compStatus = String(r['Completion Status after Gracing'] ?? '').trim().toLowerCase();
+        const appType = String(r['Appraisal Type Code'] ?? '').trim();
+        const marksAfter = parseFloat(r['Marks after Gracing']);
+
+        if (compStatus === 'completed unsuccessfuly' && sNum && !seenF.has(sNum)) {
+          seenF.add(sNum);
+          failedPrns.push(sNum);
+        }
+
+        if (['Sem Grace', 'Grace on Total marks'].includes(appType) && !isNaN(marksAfter) && marksAfter > 0 && sNum && !seenG.has(sNum)) {
+          seenG.add(sNum);
+          gracedPrns.push(sNum);
+        }
+      });
+
+      // Generate datasets
+      processedAllRows = createProcessedData(raw);
+      processedFailedRows = createProcessedData(raw, failedPrns);
+      processedGracedRows = createProcessedData(raw, gracedPrns);
+
+      gracedCasesList = processGracingData(raw);
+      subjectSummaryList = getSubjectSummary(gracedCasesList);
+      studentSummaryList = getStudentSummary(gracedCasesList);
+
+      // Integrity findings are collected once, from the full ledger, so nothing is double counted
+      integrityFindings = processedAllRows.flatMap(r => r.Findings || []);
+      flaggedStudents = new Set(integrityFindings.map(f => String(f.studentNumber)));
+
+      // Unique student count
+      const totalStudents = new Set(raw.map(r => String(r['Student Number'] ?? '').trim()).filter(Boolean)).size;
+      const totalGraceMarks = gracedCasesList.reduce((acc, c) => acc + c['Grace Marks'], 0);
+
+      // Audit metadata (is a TOTAL maximum present in the file?)
+      const totalRows = raw.filter(r => String(r['Student Name'] ?? '').trim().toUpperCase() === 'TOTAL');
+      auditMeta = {
+        loaded: true,
+        totalRowCount: totalRows.length,
+        totalMaxExplicitCount: totalRows.filter(r => parseScaleNum(r['Scale']) > 0).length,
+        studentsEvaluated: totalStudents
+      };
+
+      // Update metrics
+      document.getElementById('metricTotalCandidates').innerText = totalStudents;
+      document.getElementById('metricGracedCandidates').innerText = gracedPrns.length;
+      document.getElementById('metricTotalCases').innerText = gracedCasesList.length;
+      document.getElementById('metricTotalMarks').innerText = Number.isInteger(totalGraceMarks) ? totalGraceMarks : totalGraceMarks.toFixed(2);
+
+      // Render tables
+      renderProcessedTable('allStudentsTableBody', processedAllRows);
+      renderProcessedTable('failedStudentsTableBody', processedFailedRows);
+      renderProcessedTable('gracedStudentsTableBody', processedGracedRows);
+      renderGracedCasesTable();
+      renderSubjectSummaryTable();
+      renderStudentSummaryTable();
+      renderIntegrityTable();
+      renderAuditPanel();
+
+      // Badges
+      document.getElementById('allStudentsCountBadge').innerText = `${processedAllRows.length} Rows (${totalStudents} Students)`;
+      document.getElementById('failedStudentsCountBadge').innerText = `${failedPrns.length} Students`;
+      document.getElementById('gracedStudentsCountBadge').innerText = `${gracedPrns.length} Students`;
+      document.getElementById('gracedCasesCountBadge').innerText = `${gracedCasesList.length} Cases`;
+      document.getElementById('subjectSummaryCountBadge').innerText = `${subjectSummaryList.length} Subjects`;
+      document.getElementById('studentSummaryCountBadge').innerText = `${studentSummaryList.length} Students`;
+
+      // Enable export
+      document.getElementById('downloadExcelBtn').disabled = false;
+      document.getElementById('reportBtn').disabled = false;
+
+      const issueText = integrityFindings.length
+        ? ` ${integrityFindings.length} integrity discrepanc${integrityFindings.length === 1 ? 'y' : 'ies'} found across ${flaggedStudents.size} student${flaggedStudents.size === 1 ? '' : 's'}.`
+        : ' No integrity discrepancies found.';
+      setStatus('ok', `Successfully processed ${raw.length} records from "${sourceName}". ${totalStudents} students evaluated, ${gracedPrns.length} graced, ${failedPrns.length} failed.${issueText}`);
+      applySearchFilter();
+    }
+
+    /* ==========================================================================
+       Rendering
+       ========================================================================== */
+    function ledgerHeadHtml() {
+      return `
+        <tr class="group">
+          <th colspan="4" class="g-left">Module</th>
+          <th colspan="2">Internal</th>
+          <th colspan="3">Semester</th>
+          <th colspan="2">Composite</th>
+          <th colspan="2">Result</th>
+          <th colspan="2" class="g-left">Review</th>
+        </tr>
+        <tr class="cols">
+          <th>Sr.</th>
+          <th>Module Code</th>
+          <th class="t-left">Module Description</th>
+          <th>Credit</th>
+          <th class="c-max-h">Internal Actual (Max)</th>
+          <th>Internal Actual</th>
+          <th class="c-max-h">Sem Actual (Max)</th>
+          <th>Sem Actual</th>
+          <th>Sem Grace</th>
+          <th class="c-max-h">Composite Score (Max)</th>
+          <th>Composite Score</th>
+          <th>Overall Grade</th>
+          <th class="t-left">Completion Status</th>
+          <th class="t-left">Remarks &amp; Scale</th>
+          <th class="t-left">Audit Findings</th>
+        </tr>`;
+    }
+    document.querySelectorAll('[data-ledger-head]').forEach(el => { el.innerHTML = ledgerHeadHtml(); });
+
+    // A ledger cell. A cell with integrity findings is filled red (and annotated); otherwise the
+    // existing red-text alert (below 40%, AB/UFM, F, unsuccessful) applies.
+    function ledgerCell(r, field, text, baseCls, alertFlag) {
+      const errs = r.Err && r.Err[field];
+      if (errs && errs.length) {
+        const tip = errs.map(e => `[${e.ruleId}] ${e.rule}\n${e.detail}`).join('\n\n');
+        const rules = errs.map(e => e.ruleId).join(' ');
+        const shown = String(text ?? '') === '' ? '(blank)' : text;
+        return `<td class="${baseCls} cell-error" data-rules="${esc(rules)}" title="${esc(tip)}">${esc(shown)}</td>`;
+      }
+      return `<td class="${baseCls}${alertFlag ? ' alert-text' : ''}">${esc(text)}</td>`;
+    }
+
+    function findingsCell(r) {
+      const list = r.Findings || [];
+      if (!list.length) return '<td class="c-findings"><span class="no-finding"></span></td>';
+      return `<td class="c-findings">${list.map(f => `<span class="finding"><b>${esc(f.ruleId)}</b>${esc(f.detail)}</span>`).join('')}</td>`;
+    }
+
+    // Render restructured student tables (Tab 1, 2, 3)
+    function renderProcessedTable(tbodyId, rows) {
+      const tbody = document.getElementById(tbodyId);
+      if (!rows.length) {
+        tbody.innerHTML = `<tr><td colspan="15" class="empty-cell">No matching student records found.</td></tr>`;
+        return;
+      }
+
+      let html = '';
+      let displayIndex = 1;
+
+      rows.forEach(r => {
+        const isHeader = r['Row_Type'] === 'HEADER';
+        const isSummary = r['Row_Type'] === 'SUMMARY';
+        const flagAttr = flaggedStudents.has(String(r['Student_Number'])) ? '1' : '0';
+        const findingSearch = (r.Findings || []).map(f => `${f.ruleId} ${f.rule} ${f.detail}`).join(' ');
+
+        if (isHeader) {
+          const n = r['Finding_Count'] || 0;
+          const badge = n ? `<span class="badge-err">${n} discrepanc${n === 1 ? 'y' : 'ies'}</span>` : '';
+          const meta = [r['Additional_ID'], r['Student_Gender']].filter(Boolean).map(esc).join('&nbsp;&nbsp;&nbsp;');
+          html += `
+            <tr class="row-student" data-student-flag="${flagAttr}" data-search="${esc(r['Module Code']).toLowerCase()}">
+              <td class="c-sr">${displayIndex++}</td>
+              <td colspan="14"><div class="student-line">
+                <span class="student-id">${esc(r['Student_Number'])}</span>
+                <span class="student-name">${esc(r['Student_Name'])}</span>
+                <span class="student-meta">${meta}</span>
+                ${badge}
+              </div></td>
+            </tr>`;
+        } else if (isSummary) {
+          html += `
+            <tr class="row-summary${(r.Findings || []).length ? ' row-flagged' : ''}" data-student-flag="${flagAttr}" data-search="${esc(r['Student_Number'] + ' ' + r['Student_Name'] + ' ' + findingSearch).toLowerCase()}">
+              <td class="c-sr">${displayIndex++}</td>
+              <td class="c-code"></td>
+              <td class="c-desc">TOTAL / PERCENTAGE</td>
+              <td class="c-num"></td>
+              <td class="c-max"></td>
+              <td class="c-num"></td>
+              <td class="c-max"></td>
+              <td class="c-num"></td>
+              <td class="c-num"></td>
+              ${ledgerCell(r, 'Composite Score (Max)', r['Composite Score (Max)'], 'c-max', false)}
+              ${ledgerCell(r, 'Composite Score', r['Composite Score'], 'c-num', r['Red_Composite'])}
+              ${ledgerCell(r, 'Overall Grade', r['Overall Grade'], 'c-grade', false)}
+              <td class="c-status"></td>
+              <td class="c-remarks"></td>
+              ${findingsCell(r)}
+            </tr>`;
+        } else {
+          html += `
+            <tr class="row-data${(r.Findings || []).length ? ' row-flagged' : ''}" data-student-flag="${flagAttr}" data-search="${esc(r['Student_Number'] + ' ' + r['Student_Name'] + ' ' + r['Module Code'] + ' ' + r['Module Desc'] + ' ' + findingSearch).toLowerCase()}">
+              <td class="c-sr">${displayIndex++}</td>
+              <td class="c-code">${esc(r['Module Code'])}</td>
+              <td class="c-desc">${esc(r['Module Desc'])}</td>
+              <td class="c-num">${esc(r['Credit'])}</td>
+              <td class="c-max">${esc(r['Internal Actual (Max)'])}</td>
+              ${ledgerCell(r, 'Internal Actual', r['Internal Actual'], 'c-num', r['Red_Internal'])}
+              <td class="c-max">${esc(r['Sem Actual (Max)'])}</td>
+              ${ledgerCell(r, 'Sem Actual', r['Sem Actual'], 'c-num', r['Red_Sem'])}
+              <td class="c-num${r['Red_Grace'] ? ' alert-text' : ''}">${esc(r['Sem Grace'])}</td>
+              <td class="c-max">${esc(r['Composite Score (Max)'])}</td>
+              ${ledgerCell(r, 'Composite Score', r['Composite Score'], 'c-num', r['Red_Composite'])}
+              ${ledgerCell(r, 'Overall Grade', r['Overall Grade'], 'c-grade', r['Red_Grade'])}
+              ${ledgerCell(r, 'Completion Status after Gracing', r['Completion Status after Gracing'], 'c-status', r['Red_Status'])}
+              <td class="c-remarks">${esc(r['Remarks & Scale'])}</td>
+              ${findingsCell(r)}
+            </tr>`;
+        }
+      });
+
+      tbody.innerHTML = html;
+    }
+
+    // Render Tab 4: graced cases
+    function renderGracedCasesTable() {
+      const tbody = document.getElementById('gracedCasesTableBody');
+      if (!gracedCasesList.length) {
+        tbody.innerHTML = `<tr><td colspan="14" class="empty-cell">No graced cases detected.</td></tr>`;
+        return;
+      }
+
+      let html = '';
+      gracedCasesList.forEach((c, idx) => {
+        const flagAttr = flaggedStudents.has(String(c['Student Number'])) ? '1' : '0';
+        html += `
+          <tr class="row-data" data-student-flag="${flagAttr}" data-search="${esc(c['Student Number'] + ' ' + c['Student Name'] + ' ' + c['Module Code'] + ' ' + c['Module Desc']).toLowerCase()}">
+            <td class="c-sr">${idx + 1}</td>
+            <td class="t-left c-id">${esc(c['Student Number'])}</td>
+            <td class="t-left" style="font-weight:600">${esc(c['Student Name'])}</td>
+            <td class="t-left">${esc(c['Additional ID'])}</td>
+            <td class="c-code">${esc(c['Module Code'])}</td>
+            <td class="t-left">${esc(c['Module Desc'])}</td>
+            <td class="t-left" style="color:var(--muted);font-size:12px">${esc(c['Appraisal Type'])}</td>
+            <td class="c-num">${esc(c['Marks Before Gracing'])}</td>
+            <td class="c-num" style="font-weight:800;color:var(--steel);background:var(--steel-soft)">+${c['Grace Marks']}</td>
+            <td class="c-num" style="font-weight:600;color:var(--ok)">${esc(c['Marks After Gracing'])}</td>
+            <td class="c-num">${esc(c['Composite Score Before'])}</td>
+            <td class="c-num" style="font-weight:700">${esc(c['Composite Score After'])}</td>
+            <td class="c-grade${c['Grade'] === 'F' ? ' alert-text' : ''}">${esc(c['Grade'])}</td>
+            <td class="t-left c-status${String(c['Status']).toLowerCase() === 'completed unsuccessfuly' ? ' alert-text' : ''}">${esc(c['Status'])}</td>
+          </tr>`;
+      });
+      tbody.innerHTML = html;
+    }
+
+    // Render Tab 5: subject summary
+    function renderSubjectSummaryTable() {
+      const tbody = document.getElementById('subjectSummaryTableBody');
+      if (!subjectSummaryList.length) {
+        tbody.innerHTML = `<tr><td colspan="7" class="empty-cell">No subject gracing statistics available.</td></tr>`;
+        return;
+      }
+
+      let html = '';
+      subjectSummaryList.forEach((s, idx) => {
+        html += `
+          <tr class="row-data" data-search="${esc(s['Subject Code'] + ' ' + s['Subject Name']).toLowerCase()}">
+            <td class="c-sr">${idx + 1}</td>
+            <td class="c-code">${esc(s['Subject Code'])}</td>
+            <td class="t-left" style="font-weight:600">${esc(s['Subject Name'])}</td>
+            <td class="c-num" style="font-weight:700">${s['Graced Students Count']}</td>
+            <td class="c-num" style="font-weight:800;color:var(--steel)">${s['Total Grace Marks']}</td>
+            <td class="c-num">${s['Max Grace Marks']}</td>
+            <td class="c-num">${s['Avg Grace Marks']}</td>
+          </tr>`;
+      });
+      tbody.innerHTML = html;
+    }
+
+    // Render Tab 6: student summary
+    function renderStudentSummaryTable() {
+      const tbody = document.getElementById('studentSummaryTableBody');
+      if (!studentSummaryList.length) {
+        tbody.innerHTML = `<tr><td colspan="7" class="empty-cell">No student gracing summary available.</td></tr>`;
+        return;
+      }
+
+      let html = '';
+      studentSummaryList.forEach((s, idx) => {
+        const flagAttr = flaggedStudents.has(String(s['Student Number'])) ? '1' : '0';
+        html += `
+          <tr class="row-data" data-student-flag="${flagAttr}" data-search="${esc(s['Student Number'] + ' ' + s['Student Name'] + ' ' + s['Additional ID'] + ' ' + s['Graced Subjects & Marks']).toLowerCase()}">
+            <td class="c-sr">${idx + 1}</td>
+            <td class="t-left c-id">${esc(s['Student Number'])}</td>
+            <td class="t-left" style="font-weight:600">${esc(s['Student Name'])}</td>
+            <td class="t-left">${esc(s['Additional ID'])}</td>
+            <td class="c-num" style="font-weight:700">${s['Graced Subjects Count']}</td>
+            <td class="c-num" style="font-weight:800;color:var(--steel)">${s['Total Grace Marks']}</td>
+            <td class="t-left" style="font-size:12px;color:var(--ink-soft)">${esc(s['Graced Subjects & Marks'])}</td>
+          </tr>`;
+      });
+      tbody.innerHTML = html;
+    }
+
+    // Render Tab 7: integrity findings
+    function renderIntegrityTable() {
+      const tbody = document.getElementById('integrityTableBody');
+      const badge = document.getElementById('integrityCountBadge');
+      const tabPill = document.getElementById('integrityTabCount');
+
+      // Rule filter options
+      const sel = document.getElementById('integrityRuleFilter');
+      const previous = sel.value || 'all';
+      sel.innerHTML = `<option value="all">All rules</option>` +
+        INTEGRITY_RULES.map(r => {
+          const n = integrityFindings.filter(f => f.ruleId === r.id).length;
+          return `<option value="${r.id}">${r.id}: ${esc(r.short)} (${n})</option>`;
+        }).join('');
+      sel.value = previous;
+
+      const n = integrityFindings.length;
+      tabPill.innerText = n;
+      tabPill.className = 'pill ' + (auditMeta.loaded ? (n ? 'err' : 'ok') : '');
+      badge.innerText = `${n} Finding${n === 1 ? '' : 's'}`;
+      badge.className = 'count-badge ' + (auditMeta.loaded ? (n ? 'warn' : 'good') : '');
+
+      if (!auditMeta.loaded) {
+        tbody.innerHTML = `<tr><td colspan="10" class="empty-cell">Upload an examination workbook to run the integrity audit.</td></tr>`;
+        return;
+      }
+      if (!n) {
+        tbody.innerHTML = `<tr><td colspan="10" class="empty-cell">No discrepancies detected. All integrity checks passed for every student in this file.</td></tr>`;
+        return;
+      }
+
+      let html = '';
+      integrityFindings.forEach((f, idx) => {
+        html += `
+          <tr class="row-data" data-rule="${f.ruleId}" data-search="${esc(f.studentNumber + ' ' + f.studentName + ' ' + f.moduleCode + ' ' + f.moduleDesc + ' ' + f.ruleId + ' ' + f.rule + ' ' + f.cell + ' ' + f.detail).toLowerCase()}">
+            <td class="c-sr">${idx + 1}</td>
+            <td class="t-left c-id">${esc(f.studentNumber)}</td>
+            <td class="t-left" style="font-weight:600">${esc(f.studentName)}</td>
+            <td class="c-code">${esc(f.moduleCode)}</td>
+            <td class="t-left">${esc(f.moduleDesc)}</td>
+            <td class="t-left rule-cell"><span class="rule-chip">${esc(f.ruleId)}</span>${esc(f.rule)}</td>
+            <td class="t-left" style="font-weight:600">${esc(f.cell)}</td>
+            <td class="c-val">${esc(f.found)}</td>
+            <td class="c-exp">${esc(f.expected)}</td>
+            <td class="t-left c-detail">${esc(f.detail)}</td>
+          </tr>`;
+      });
+      tbody.innerHTML = html;
+    }
+
+    // Render the audit panel (rule checklist + banner + notes)
+    function renderAuditPanel() {
+      const counts = {};
+      INTEGRITY_RULES.forEach(r => counts[r.id] = 0);
+      integrityFindings.forEach(f => counts[f.ruleId]++);
+
+      const r8NotInSource = auditMeta.loaded && auditMeta.totalMaxExplicitCount === 0;
+
+      document.getElementById('auditRules').innerHTML = INTEGRITY_RULES.map(r => {
+        const n = counts[r.id];
+        const na = r.id === 'R8' && r8NotInSource && n === 0;
+        const cls = na ? 'na' : (n ? 'has-issues' : '');
+        const sub = na ? '<span class="rule-sub">No TOTAL maximum in this file</span>' : '';
+        const countText = !auditMeta.loaded ? '–' : (na ? 'n/a' : n);
+        return `<button type="button" class="rule ${cls}" data-rule="${r.id}" title="${esc(r.title)}">
+            <span class="rule-id">${r.id}</span>
+            <span class="rule-text">${esc(r.short)}${sub}</span>
+            <span class="rule-count">${countText}</span>
+          </button>`;
+      }).join('');
+
+      const banner = document.getElementById('auditBanner');
+      const lead = document.getElementById('auditLead');
+      if (!auditMeta.loaded) {
+        banner.className = 'banner';
+        banner.innerText = 'Awaiting data';
+      } else if (!integrityFindings.length) {
+        banner.className = 'banner pass';
+        banner.innerText = 'All integrity checks passed';
+        lead.innerText = `${auditMeta.studentsEvaluated} students evaluated, no discrepancies detected.`;
+      } else {
+        banner.className = 'banner fail';
+        banner.innerText = `${integrityFindings.length} discrepanc${integrityFindings.length === 1 ? 'y' : 'ies'} · ${flaggedStudents.size} student${flaggedStudents.size === 1 ? '' : 's'} affected`;
+        lead.innerText = `${auditMeta.studentsEvaluated} students evaluated. Select a rule to review its findings; flagged cells are filled red in the ledger tabs.`;
+      }
+
+      const notes = [`<p><strong>Grade scale applied (percentage of Composite Score ÷ its maximum):</strong> ${esc(gradeScaleText())}. An F is accepted when the composite is below 40%, or when Internal Actual / Sem Actual is below its 40% minimum or marked AB / UFM.</p>`];
+      notes.push(`<p><strong>Completion Status:</strong> any grade other than F must read "${STATUS_SUCCESS_LABEL}"; an F must read "${STATUS_FAIL_LABEL}".</p>`);
+      if (r8NotInSource) {
+        notes.push(`<p><strong>R8:</strong> the TOTAL rows in this file carry no maximum, so the TOTAL (Max) shown is the sum of the subject maximums. R9 still verifies PERCENTAGE against that maximum. R8 is evaluated automatically for any file whose TOTAL row supplies a maximum.</p>`);
+      }
+      document.getElementById('auditNote').innerHTML = notes.join('');
+    }
+
+    document.getElementById('auditRules').addEventListener('click', function(e) {
+      const btn = e.target.closest('.rule');
+      if (!btn || !auditMeta.loaded) return;
+      document.getElementById('integrityRuleFilter').value = btn.getAttribute('data-rule');
+      switchTab('tabIntegrity');
+      document.getElementById('tabIntegrity').scrollIntoView({ behavior: 'smooth', block: 'start' });
+    });
+
+    /* ==========================================================================
+       Tabs & filtering
+       ========================================================================== */
+    function switchTab(tabId) {
+      activeTabId = tabId;
+      document.querySelectorAll('.tab-content').forEach(el => el.classList.remove('is-active'));
+      document.querySelectorAll('.tab-btn').forEach(btn => {
+        btn.classList.remove('is-active');
+        btn.setAttribute('aria-selected', 'false');
+      });
+
+      const targetTab = document.getElementById(tabId);
+      if (targetTab) targetTab.classList.add('is-active');
+
+      const targetBtn = document.getElementById('btn-' + tabId);
+      if (targetBtn) {
+        targetBtn.classList.add('is-active');
+        targetBtn.setAttribute('aria-selected', 'true');
+      }
+
+      // Re-apply active search filter
+      applySearchFilter();
+    }
+
+    // Live search + discrepancy filter across the active table
+    function applySearchFilter() {
+      const q = document.getElementById('searchInput').value.trim().toLowerCase();
+      const flaggedOnly = document.getElementById('flaggedOnly').checked;
+      const ruleSel = document.getElementById('integrityRuleFilter').value || 'all';
+      const currentTab = document.getElementById(activeTabId);
+      if (!currentTab) return;
+
+      const rows = currentTab.querySelectorAll('tbody tr[data-search]');
+      rows.forEach(tr => {
+        const text = tr.getAttribute('data-search') || '';
+        let show = !q || text.includes(q);
+        if (show && flaggedOnly && tr.getAttribute('data-student-flag') === '0') show = false;
+        if (show && activeTabId === 'tabIntegrity' && ruleSel !== 'all' && tr.getAttribute('data-rule') !== ruleSel) show = false;
+        tr.style.display = show ? '' : 'none';
+      });
+    }
+    document.getElementById('searchInput').addEventListener('input', applySearchFilter);
+    document.getElementById('flaggedOnly').addEventListener('change', applySearchFilter);
+    document.getElementById('integrityRuleFilter').addEventListener('change', applySearchFilter);
+
+    /* ==========================================================================
+       Demo data
+       Statuses use the real source wording ("Completed with Success"). Students 4 and 5 are
+       deliberately seeded with defects so every integrity rule can be seen in action.
+       ========================================================================== */
+    function buildDemoData() {
+      const rows = [];
+      const SC = { int: 'R025', sem: 'R075', comp: 'R100' };
+
+      function line(s, m, type, after, before, scale, status, remarks) {
+        rows.push({
+          'Student Number': s.num, 'Student Name': s.name, 'Additional ID': s.addId, 'Gender': s.gender,
+          'Module Code': m.code, 'Module Desc': m.desc, 'Credit': m.credit,
+          'Appraisal Type Code': type, 'Marks after Gracing': String(after), 'Marks before Gracing': String(before),
+          'Scale': scale || '', 'Scale Type': '', 'Appraisal Remarks': remarks || '', 'General Remarks': '',
+          'Completion Status after Gracing': status || ''
+        });
+      }
+      function addModule(s, m) {
+        const semBefore = m.semBefore !== undefined ? m.semBefore : m.sem;
+        const semTotal = (m.sem === 'Z1' || m.sem === 'Z3') ? m.sem : (Number(m.sem) + Number(m.grace || 0));
+        line(s, m, 'Internal Actual', m.int, m.int, SC.int);
+        line(s, m, 'Sem Actual', m.sem, semBefore, SC.sem, '', m.remarks);
+        line(s, m, 'Sem Grace', m.grace || 0, 0, '');
+        line(s, m, 'Semester Total Marks', semTotal, semBefore, SC.sem);
+        line(s, m, 'Composite Score', m.comp, m.compBefore !== undefined ? m.compBefore : m.comp, SC.comp);
+        line(s, m, 'Overall Grade', m.grade, m.gradeBefore || m.grade, '', m.status);
+      }
+      function addTotals(s, total, totalBefore, pct, pctBefore, totalScale) {
+        const base = { 'Module Code': '', 'Module Desc': '', 'Credit': '', 'Appraisal Type Code': '', 'Scale Type': '', 'Appraisal Remarks': '', 'General Remarks': '', 'Completion Status after Gracing': '' };
+        rows.push({ ...base, 'Student Number': s.num, 'Student Name': 'TOTAL', 'Additional ID': s.addId, 'Gender': s.gender,
+          'Marks after Gracing': String(total), 'Marks before Gracing': String(totalBefore), 'Scale': totalScale || '' });
+        rows.push({ ...base, 'Student Number': s.num, 'Student Name': 'PERCENTAGE', 'Additional ID': s.addId, 'Gender': s.gender,
+          'Marks after Gracing': String(pct), 'Marks before Gracing': String(pctBefore), 'Scale': '' });
+      }
+      const OK = 'Completed with Success', NOK = 'Completed Unsuccessfuly';
+
+      // Student 1: clean record, graced
+      const s1 = { num: '53014240001', name: 'Deshmukh Aarav Sunil', addId: 'MMC01', gender: 'Male' };
+      addModule(s1, { code: 'BAMMC301', desc: 'Copywriting Principles', credit: '4', int: 18, sem: 28, grace: 3, comp: 49, compBefore: 46, grade: 'P', gradeBefore: 'F', status: OK });
+      addTotals(s1, 49, 46, '49.0', '46.0');
+
+      // Student 2: failed, absent (Z1), F grade: a valid F
+      const s2 = { num: '53014240002', name: 'Patel Ananya Rajesh', addId: 'MMC02', gender: 'Female' };
+      addModule(s2, { code: 'BAMMC302', desc: 'Media Research Methods', credit: '4', int: 15, sem: 'Z1', grace: 0, comp: 15, grade: 'F', status: NOK, remarks: 'Absent in Final Exam' });
+      addTotals(s2, 15, 15, '15.0', '15.0');
+
+      // Student 3: graced, clean record
+      const s3 = { num: '53014240003', name: 'Mehta Rohan Kirit', addId: 'BMS01', gender: 'Male' };
+      addModule(s3, { code: 'BMS301', desc: 'Financial Management', credit: '3', int: 20, sem: 26, grace: 4, comp: 50, compBefore: 46, grade: 'C', gradeBefore: 'P', status: OK });
+      addTotals(s3, 50, 46, '50.0', '46.0');
+
+      // Student 4: one defect per subject (rules R1 to R6); totals are internally consistent
+      const s4 = { num: '53014240004', name: 'Kulkarni Ishita Vikas', addId: 'BCM01', gender: 'Female' };
+      addModule(s4, { code: 'BCM401', desc: 'Corporate Accounting',      credit: '4', int: 27, sem: 40, grace: 0, comp: 67,  grade: 'B+', status: OK });   // R1
+      addModule(s4, { code: 'BCM402', desc: 'Business Economics',        credit: '4', int: 20, sem: 78, grace: 0, comp: 98,  grade: 'O',  status: OK });   // R2
+      addModule(s4, { code: 'BCM403', desc: 'Business Law',              credit: '3', int: 25, sem: 75, grace: 2, comp: 102, grade: 'O',  status: OK });   // R3
+      addModule(s4, { code: 'BCM404', desc: 'Marketing Management',      credit: '3', int: 20, sem: 44, grace: 0, comp: 68,  grade: 'B+', status: OK });   // R4
+      addModule(s4, { code: 'BCM405', desc: 'Business Statistics',       credit: '3', int: 22, sem: 50, grace: 0, comp: 72,  grade: 'B',  status: OK });   // R5
+      addModule(s4, { code: 'BCM406', desc: 'Business Communication',    credit: '2', int: 12, sem: 24, grace: 0, comp: 36,  grade: 'F',  status: OK });   // R6 (F, wrong status)
+      addModule(s4, { code: 'BCM407', desc: 'Human Resource Management', credit: '2', int: 18, sem: 27, grace: 0, comp: 45,  grade: 'P',  status: NOK });  // R6 (pass, wrong status)
+      addTotals(s4, 488, 488, '69.71', '69.71');
+
+      // Student 5: subjects are clean, TOTAL / TOTAL (Max) / PERCENTAGE rows are wrong (R7, R8, R9)
+      const s5 = { num: '53014240005', name: 'Joshi Rahul Mahesh', addId: 'BCM02', gender: 'Male' };
+      addModule(s5, { code: 'BCM401', desc: 'Corporate Accounting', credit: '4', int: 22, sem: 45, grace: 0, comp: 67, grade: 'B+', status: OK });
+      addModule(s5, { code: 'BCM402', desc: 'Business Economics',   credit: '4', int: 20, sem: 60, grace: 0, comp: 80, grade: 'A+', status: OK });
+      addTotals(s5, 150, 150, '72.5', '72.5', 'R300');
+
+      return rows;
+    }
+
+    document.getElementById('loadDemoBtn').addEventListener('click', function() {
+      try {
+        processRawRecords(buildDemoData(), 'Sample Demo Data');
+        switchTab('tabAllStudents');
+      } catch (err) {
+        setStatus('err', `Error: ${err.message}`);
+      }
+    });
+
+
+    /* ==========================================================================
+       Formal printable report (use browser Print > Save as PDF)
+       ========================================================================== */
+    function openReport() {
+      if (!processedAllRows.length) { alert('Please upload or load gracing data first.'); return; }
+      const students = new Set(rawWorkbookData.map(r => String(r['Student Number'] ?? '').trim()).filter(Boolean)).size;
+      const failedStudents = processedFailedRows.filter(r => r.Row_Type === 'HEADER').length;
+      const failedSubjects = processedAllRows.filter(r => r.Row_Type === 'DATA' && String(r['Overall Grade']).toUpperCase() === 'F').length;
+      const totalMarks = gracedCasesList.reduce((a, c) => a + c['Grace Marks'], 0);
+      const n = integrityFindings.length;
+      const now = new Date().toLocaleString('en-IN', { dateStyle: 'long', timeStyle: 'short' });
+      const rows = (arr, f) => arr.map(f).join('');
+      const td = v => `<td>${esc(v)}</td>`, tl = v => `<td class="l">${esc(v)}</td>`;
+      const ruleRows = INTEGRITY_RULES.map(r => {
+        const c = integrityFindings.filter(f => f.ruleId === r.id).length;
+        const na = r.id === 'R8' && auditMeta.totalMaxExplicitCount === 0 && c === 0;
+        return `<tr>${td(r.id)}${tl(r.title)}${td(na ? 'n/a*' : c)}${td(na ? 'Not applicable' : (c ? 'Review' : 'Passed'))}</tr>`;
+      }).join('');
+      const html = `
+      <div class="rp-bar">
+        <button class="btn btn-primary" onclick="window.print()">Print / Save as PDF</button>
+        <button class="btn btn-ghost" onclick="closeReport()">Back to portal</button>
+      </div>
+      <div class="rp">
+        <h1>Examination Gracing Verification Report</h1>
+        <div class="rp-sub">Pre / post gracing verification and data-integrity audit</div>
+        <table class="meta"><tr><td><b>Source file:</b> ${esc(currentSourceName)}</td><td><b>Generated:</b> ${esc(now)}</td></tr></table>
+
+        <h2>1. Executive summary</h2>
+        <table>
+          <tr><th>Candidates evaluated</th><th>Candidates graced</th><th>Gracing cases</th><th>Total grace marks</th><th>Candidates with F (subject-level)</th><th>Integrity findings</th></tr>
+          <tr>${td(students)}${td(studentSummaryList.length)}${td(gracedCasesList.length)}${td(Number.isInteger(totalMarks) ? totalMarks : totalMarks.toFixed(2))}${td(failedStudents + ' (' + failedSubjects + ' subjects)')}${td(n)}</tr>
+        </table>
+        <div class="verdict ${n ? 'bad' : 'ok'}">${n ? `Audit result: ${n} discrepanc${n === 1 ? 'y' : 'ies'} found across ${flaggedStudents.size} student${flaggedStudents.size === 1 ? '' : 's'}. Correct before publication of results.` : 'Audit result: all integrity checks passed. No discrepancies detected.'}</div>
+
+        <h2>2. Integrity checks performed</h2>
+        <table><thead><tr><th>Rule</th><th class="l">Check</th><th>Findings</th><th>Status</th></tr></thead><tbody>${ruleRows}</tbody></table>
+        <p class="note">Grade scale: ${gradeScaleText()}. ${auditMeta.totalMaxExplicitCount === 0 ? '*TOTAL rows carry no maximum; the sum of subject maximums is used and R9 verifies PERCENTAGE against it.' : ''}</p>
+
+        <h2>3. Discrepancies requiring correction</h2>
+        ${n ? `<table><thead><tr><th>Sr.</th><th class="l">Student No.</th><th class="l">Name</th><th>Module</th><th>Rule</th><th>Reported</th><th>Expected</th><th class="l">Explanation</th></tr></thead><tbody>${rows(integrityFindings, (f, i) => `<tr>${td(i + 1)}${tl(f.studentNumber)}${tl(f.studentName)}${td(f.moduleCode || 'TOTAL')}${td(f.ruleId)}${td(f.found)}${td(f.expected)}${tl(f.detail)}</tr>`)}</tbody></table>` : '<p class="note">None.</p>'}
+
+        <h2>4. Subject-wise gracing summary</h2>
+        <table><thead><tr><th>Sr.</th><th>Code</th><th class="l">Subject</th><th>Students graced</th><th>Total grace</th><th>Max grace</th><th>Avg grace</th></tr></thead><tbody>
+        ${rows(subjectSummaryList, (s, i) => `<tr>${td(i + 1)}${td(s['Subject Code'])}${tl(s['Subject Name'])}${td(s['Graced Students Count'])}${td(s['Total Grace Marks'])}${td(s['Max Grace Marks'])}${td(s['Avg Grace Marks'])}</tr>`)}
+        <tr><th colspan="3" class="l">Total</th><th>${gracedCasesList.length}</th><th>${Number.isInteger(totalMarks) ? totalMarks : totalMarks.toFixed(2)}</th><th></th><th></th></tr></tbody></table>
+
+        <h2>5. Graced cases (before and after)</h2>
+        <table><thead><tr><th>Sr.</th><th class="l">Student No.</th><th class="l">Name</th><th>Module</th><th>Sem before</th><th>Grace</th><th>Sem after</th><th>Composite before</th><th>Composite after</th><th>Grade</th><th class="l">Status</th></tr></thead><tbody>
+        ${rows(gracedCasesList, (c, i) => `<tr>${td(i + 1)}${tl(c['Student Number'])}${tl(c['Student Name'])}${td(c['Module Code'])}${td(c['Marks Before Gracing'])}${td('+' + c['Grace Marks'])}${td(c['Marks After Gracing'])}${td(c['Composite Score Before'])}${td(c['Composite Score After'])}${td(c['Grade'])}${tl(c['Status'])}</tr>`)}
+        </tbody></table>
+
+        <div class="sign"><div>Prepared by</div><div>Verified by</div><div>Controller of Examinations</div></div>
+      </div>`;
+      document.getElementById('reportView').innerHTML = html;
+      document.body.classList.add('show-report');
+      window.scrollTo(0, 0);
+    }
+    function closeReport() { document.body.classList.remove('show-report'); }
+
+    /* ==========================================================================
+       Multi-sheet styled Excel exporter
+       ========================================================================== */
+    const XL_ERR_FILL = 'DC2626';
+
+    function exportCompleteExcelReport() {
+      if (!processedAllRows.length) {
+        alert('Please upload or load gracing data before exporting.');
+        return;
+      }
+
+      const wb = XLSX.utils.book_new();
+
+      const studentSheets = [
+        { name: 'All Students', data: processedAllRows },
+        { name: 'Failed Students', data: processedFailedRows },
+        { name: 'Graced Students', data: processedGracedRows }
+      ];
+
+      const columnsOrder = [
+        'Module Code', 'Module Desc', 'Credit', 'Internal Actual (Max)', 'Internal Actual',
+        'Sem Actual (Max)', 'Sem Actual', 'Sem Grace', 'Composite Score (Max)',
+        'Composite Score', 'Overall Grade', 'Completion Status after Gracing', 'Remarks & Scale',
+        'Audit Findings'
+      ];
+      const NCOLS = columnsOrder.length;   // 14
+
+      const colWidths = [
+        { wch: 16 }, { wch: 38 }, { wch: 8 }, { wch: 14 }, { wch: 14 },
+        { wch: 14 }, { wch: 14 }, { wch: 12 }, { wch: 14 },
+        { wch: 14 }, { wch: 12 }, { wch: 28 }, { wch: 26 },
+        { wch: 70 }
+      ];
+
+      // Excel column index -> field key holding that cell's integrity findings
+      const ERR_FIELD_BY_COL = {
+        4: 'Internal Actual', 6: 'Sem Actual', 8: 'Composite Score (Max)',
+        9: 'Composite Score', 10: 'Overall Grade', 11: 'Completion Status after Gracing'
+      };
+      const findingsText = r => (r.Findings || []).map(f => `[${f.ruleId}] ${f.detail}`).join('\n');
+
+      const thinBorder = {
+        top: { style: 'thin', color: { rgb: '000000' } },
+        bottom: { style: 'thin', color: { rgb: '000000' } },
+        left: { style: 'thin', color: { rgb: '000000' } },
+        right: { style: 'thin', color: { rgb: '000000' } }
+      };
+      const summaryThickBorder = {
+        top: { style: 'thin', color: { rgb: '000000' } },
+        bottom: { style: 'medium', color: { rgb: '000000' } },
+        left: { style: 'thin', color: { rgb: '000000' } },
+        right: { style: 'thin', color: { rgb: '000000' } }
+      };
+      const errStyle = (horizontal, border) => ({
+        font: { bold: true, color: { rgb: 'FFFFFF' } },
+        fill: { fgColor: { rgb: XL_ERR_FILL } },
+        alignment: { horizontal, vertical: 'center' },
+        border
+      });
+
+      // Format & build student sheets
+      studentSheets.forEach(sheetDef => {
+        const aoa = [columnsOrder];
+        const merges = [];
+        const rowsMeta = [];
+
+        sheetDef.data.forEach((r, rIdx) => {
+          const excelRowIdx = rIdx + 1; // 0-based header is row 0
+          const isHeader = r['Row_Type'] === 'HEADER';
+          const isSummary = r['Row_Type'] === 'SUMMARY';
+
+          if (isHeader) {
+            const n = r['Finding_Count'] || 0;
+            const headerText = n ? `${r['Module Code']}     [${n} integrity discrepanc${n === 1 ? 'y' : 'ies'}]` : r['Module Code'];
+            aoa.push([headerText, '', '', '', '', '', '', '', '', '', '', '', '', '']);
+            merges.push({ s: { r: excelRowIdx, c: 0 }, e: { r: excelRowIdx, c: NCOLS - 1 } });
+            rowsMeta.push({ type: 'HEADER', rowData: r });
+          } else if (isSummary) {
+            aoa.push([
+              '', '', '', '', '', '', '', '',
+              r['Composite Score (Max)'], r['Composite Score'], r['Overall Grade'], '', '', findingsText(r)
+            ]);
+            rowsMeta.push({ type: 'SUMMARY', rowData: r });
+          } else {
+            aoa.push([
+              r['Module Code'], r['Module Desc'], r['Credit'],
+              r['Internal Actual (Max)'], r['Internal Actual'],
+              r['Sem Actual (Max)'], r['Sem Actual'], r['Sem Grace'],
+              r['Composite Score (Max)'], r['Composite Score'],
+              r['Overall Grade'], r['Completion Status after Gracing'], r['Remarks & Scale'], findingsText(r)
+            ]);
+            rowsMeta.push({ type: 'DATA', rowData: r });
+          }
+        });
+
+        const ws = XLSX.utils.aoa_to_sheet(aoa);
+        ws['!merges'] = merges;
+        ws['!cols'] = colWidths;
+
+        const centerCols = [2, 3, 4, 5, 6, 7, 8, 9, 10];
+        const maxCols = [3, 5, 8];
+
+        for (let R = 0; R < aoa.length; R++) {
+          for (let C = 0; C < NCOLS; C++) {
+            const cellAddress = XLSX.utils.encode_cell({ r: R, c: C });
+            if (!ws[cellAddress]) ws[cellAddress] = { t: 's', v: '' };
+            const cell = ws[cellAddress];
+
+            if (R === 0) {
+              // Main sheet header
+              cell.s = {
+                font: { bold: true, color: { rgb: C === NCOLS - 1 ? 'FFFFFF' : '000000' } },
+                fill: { fgColor: { rgb: C === NCOLS - 1 ? '9B1C12' : 'D9D9D9' } },
+                alignment: { horizontal: 'center', vertical: 'center', wrapText: true },
+                border: thinBorder
+              };
+            } else {
+              const meta = rowsMeta[R - 1];
+              if (!meta) continue;
+
+              const errField = ERR_FIELD_BY_COL[C];
+              const cellErrs = (meta.type !== 'HEADER' && errField && meta.rowData.Err) ? meta.rowData.Err[errField] : null;
+              const hasErr = !!(cellErrs && cellErrs.length);
+
+              if (hasErr) {
+                // Integrity discrepancy: whole cell red, with a hover note naming each rule
+                if (cell.v === '' || cell.v === undefined) { cell.v = '(blank)'; cell.t = 's'; }
+                cell.s = errStyle(meta.type === 'SUMMARY' || centerCols.includes(C) ? 'center' : 'left',
+                                  meta.type === 'SUMMARY' ? summaryThickBorder : thinBorder);
+                cell.c = [{ a: 'Integrity Audit', t: cellErrs.map(e => `[${e.ruleId}] ${e.rule}\n${e.detail}`).join('\n\n') }];
+                cell.c.hidden = true;
+              } else if (meta.type === 'HEADER') {
+                const flagged = (meta.rowData.Finding_Count || 0) > 0;
+                cell.s = {
+                  font: { bold: true, color: { rgb: '1F4E78' } },
+                  fill: { fgColor: { rgb: 'D9E1F2' } },
+                  alignment: { horizontal: 'left', vertical: 'center' },
+                  border: thinBorder
+                };
+                if (flagged && C === 0) cell.s.font = { bold: true, color: { rgb: '9B1C12' } };
+              } else if (meta.type === 'SUMMARY') {
+                const isRedComp = meta.rowData.Red_Composite && C === 9;
+                cell.s = {
+                  font: { bold: true, color: { rgb: isRedComp ? 'FF0000' : (C === NCOLS - 1 ? '9B1C12' : '000000') } },
+                  fill: { fgColor: { rgb: 'FFF2CC' } },
+                  alignment: { horizontal: C === NCOLS - 1 ? 'left' : 'center', vertical: 'center', wrapText: C === NCOLS - 1 },
+                  border: summaryThickBorder
+                };
+              } else {
+                // DATA row
+                const isCenter = centerCols.includes(C);
+                const isBoldMax = maxCols.includes(C);
+                let isRed = false;
+
+                if (C === 4 && meta.rowData.Red_Internal) isRed = true;
+                if (C === 6 && meta.rowData.Red_Sem) isRed = true;
+                if (C === 7 && meta.rowData.Red_Grace) isRed = true;
+                if (C === 9 && meta.rowData.Red_Composite) isRed = true;
+                if (C === 10 && meta.rowData.Red_Grade) isRed = true;
+                if (C === 11 && meta.rowData.Red_Status) isRed = true;
+
+                const isFindingsCol = C === NCOLS - 1;
+                cell.s = {
+                  font: {
+                    bold: isBoldMax || isRed,
+                    color: { rgb: isFindingsCol ? '9B1C12' : (isRed ? 'FF0000' : '000000') }
+                  },
+                  alignment: {
+                    horizontal: isCenter ? 'center' : 'left',
+                    vertical: 'center',
+                    wrapText: isFindingsCol
+                  },
+                  border: thinBorder
+                };
+              }
+            }
+          }
+        }
+
+        XLSX.utils.book_append_sheet(wb, ws, sheetDef.name);
+      });
+
+      // Sheet 4: Graced Cases Details
+      if (gracedCasesList.length) {
+        const wsCases = XLSX.utils.json_to_sheet(gracedCasesList);
+        wsCases['!cols'] = [
+          { wch: 16 }, { wch: 26 }, { wch: 14 }, { wch: 14 }, { wch: 32 },
+          { wch: 18 }, { wch: 12 }, { wch: 12 }, { wch: 12 }, { wch: 14 },
+          { wch: 14 }, { wch: 8 }, { wch: 24 }
+        ];
+        XLSX.utils.book_append_sheet(wb, wsCases, 'Graced Cases Details');
+      }
+
+      // Sheet 5: Subject Summary
+      if (subjectSummaryList.length) {
+        const wsSub = XLSX.utils.json_to_sheet(subjectSummaryList);
+        wsSub['!cols'] = [
+          { wch: 16 }, { wch: 38 }, { wch: 22 }, { wch: 18 }, { wch: 16 }, { wch: 16 }
+        ];
+        XLSX.utils.book_append_sheet(wb, wsSub, 'Subject Summary');
+      }
+
+      // Sheet 6: Student Summary
+      if (studentSummaryList.length) {
+        const wsStd = XLSX.utils.json_to_sheet(studentSummaryList);
+        wsStd['!cols'] = [
+          { wch: 16 }, { wch: 26 }, { wch: 16 }, { wch: 22 }, { wch: 18 }, { wch: 50 }
+        ];
+        XLSX.utils.book_append_sheet(wb, wsStd, 'Student Summary');
+      }
+
+      // Sheets 7 and 8: integrity audit
+      appendAuditSheets(wb, thinBorder);
+
+      // Generate formatted date DD-MM-YY
+      const now = new Date();
+      const pad = n => String(n).padStart(2, '0');
+      const dateStr = `${pad(now.getDate())}-${pad(now.getMonth() + 1)}-${String(now.getFullYear()).slice(-2)}`;
+      const filename = `Gracing_Analysis_Report_${dateStr}.xlsx`;
+
+      XLSX.writeFile(wb, filename);
+    }
+
+    function appendAuditSheets(wb, thinBorder) {
+      const counts = {};
+      INTEGRITY_RULES.forEach(r => counts[r.id] = 0);
+      integrityFindings.forEach(f => counts[f.ruleId]++);
+      const r8NotInSource = auditMeta.totalMaxExplicitCount === 0;
+
+      const hdrStyle = {
+        font: { bold: true, color: { rgb: 'FFFFFF' } },
+        fill: { fgColor: { rgb: '1F4E78' } },
+        alignment: { horizontal: 'center', vertical: 'center', wrapText: true },
+        border: thinBorder
+      };
+      const labelStyle = { font: { bold: true, color: { rgb: '1F4E78' } }, fill: { fgColor: { rgb: 'D9E1F2' } }, alignment: { vertical: 'center' }, border: thinBorder };
+      const valueStyle = { font: { color: { rgb: '000000' } }, alignment: { horizontal: 'left', vertical: 'center' }, border: thinBorder };
+      const style = (ws, r, c, s) => { const a = XLSX.utils.encode_cell({ r, c }); if (!ws[a]) ws[a] = { t: 's', v: '' }; ws[a].s = s; };
+
+      /* ---- Audit Summary ---- */
+      const gen = new Date().toLocaleString();
+      const sAoa = [
+        ['Data Integrity Audit: Summary', '', '', ''],
+        ['Source file', currentSourceName, '', ''],
+        ['Generated', gen, '', ''],
+        ['Students evaluated', auditMeta.studentsEvaluated, '', ''],
+        ['Students with discrepancies', flaggedStudents.size, '', ''],
+        ['Total discrepancies', integrityFindings.length, '', ''],
+        ['Grade scale applied', gradeScaleText(), '', ''],
+        ['', '', '', ''],
+        ['Rule', 'Check', 'Discrepancies', 'Result']
+      ];
+      INTEGRITY_RULES.forEach(r => {
+        const n = counts[r.id];
+        const na = r.id === 'R8' && r8NotInSource && n === 0;
+        sAoa.push([r.id, r.title, n, na ? 'Not in source (no TOTAL max in file)' : (n ? 'Review' : 'Pass')]);
+      });
+      const wsS = XLSX.utils.aoa_to_sheet(sAoa);
+      wsS['!cols'] = [{ wch: 28 }, { wch: 88 }, { wch: 16 }, { wch: 36 }];
+      wsS['!merges'] = [{ s: { r: 0, c: 0 }, e: { r: 0, c: 3 } }];
+      for (let c = 0; c < 4; c++) style(wsS, 0, c, { font: { bold: true, sz: 14, color: { rgb: 'FFFFFF' } }, fill: { fgColor: { rgb: '14283C' } }, alignment: { horizontal: 'left', vertical: 'center' } });
+      for (let r = 1; r <= 6; r++) {
+        style(wsS, r, 0, labelStyle);
+        style(wsS, r, 1, valueStyle);
+        style(wsS, r, 2, valueStyle);
+        style(wsS, r, 3, valueStyle);
+        wsS['!merges'].push({ s: { r, c: 1 }, e: { r, c: 3 } });
+      }
+      for (let c = 0; c < 4; c++) style(wsS, 8, c, hdrStyle);
+      INTEGRITY_RULES.forEach((r, i) => {
+        const row = 9 + i;
+        const n = counts[r.id];
+        const na = r.id === 'R8' && r8NotInSource && n === 0;
+        style(wsS, row, 0, { font: { bold: true, color: { rgb: n ? 'FFFFFF' : '1F4E78' } }, fill: { fgColor: { rgb: n ? XL_ERR_FILL : 'D9E1F2' } }, alignment: { horizontal: 'center', vertical: 'center' }, border: thinBorder });
+        style(wsS, row, 1, { ...valueStyle, alignment: { horizontal: 'left', vertical: 'center', wrapText: true } });
+        style(wsS, row, 2, n ? errStyle('center', thinBorder) : { ...valueStyle, alignment: { horizontal: 'center', vertical: 'center' } });
+        style(wsS, row, 3, n
+          ? { font: { bold: true, color: { rgb: '9B1C12' } }, alignment: { horizontal: 'left', vertical: 'center' }, border: thinBorder }
+          : { font: { bold: !na, color: { rgb: na ? '666666' : '17784A' } }, alignment: { horizontal: 'left', vertical: 'center' }, border: thinBorder });
+      });
+      XLSX.utils.book_append_sheet(wb, wsS, 'Audit Summary');
+
+      /* ---- Audit Findings ---- */
+      const fHead = ['Sr.', 'Student Number', 'Student Name', 'Additional ID', 'Module Code', 'Module Description',
+                     'Rule', 'Check', 'Cell', 'Reported Value', 'Expected / Limit', 'Explanation'];
+      const fAoa = [fHead];
+      if (integrityFindings.length) {
+        integrityFindings.forEach((f, i) => fAoa.push([
+          i + 1, f.studentNumber, f.studentName, f.additionalId, f.moduleCode, f.moduleDesc,
+          f.ruleId, f.rule, f.cell, f.found, f.expected, f.detail
+        ]));
+      } else {
+        fAoa.push(['', 'No discrepancies detected. All integrity checks passed.', '', '', '', '', '', '', '', '', '', '']);
+      }
+      const wsF = XLSX.utils.aoa_to_sheet(fAoa);
+      wsF['!cols'] = [{ wch: 6 }, { wch: 16 }, { wch: 28 }, { wch: 12 }, { wch: 14 }, { wch: 30 },
+                      { wch: 7 }, { wch: 52 }, { wch: 24 }, { wch: 16 }, { wch: 18 }, { wch: 90 }];
+      for (let c = 0; c < fHead.length; c++) style(wsF, 0, c, hdrStyle);
+      if (integrityFindings.length) {
+        wsF['!autofilter'] = { ref: XLSX.utils.encode_range({ s: { r: 0, c: 0 }, e: { r: fAoa.length - 1, c: fHead.length - 1 } }) };
+        for (let r = 1; r < fAoa.length; r++) {
+          for (let c = 0; c < fHead.length; c++) {
+            if (c === 6) style(wsF, r, c, errStyle('center', thinBorder));
+            else if (c === 9) style(wsF, r, c, { font: { bold: true, color: { rgb: '9B1C12' } }, alignment: { horizontal: 'center', vertical: 'center' }, border: thinBorder });
+            else if (c === 10) style(wsF, r, c, { font: { bold: true, color: { rgb: '17784A' } }, alignment: { horizontal: 'center', vertical: 'center' }, border: thinBorder });
+            else style(wsF, r, c, { font: { color: { rgb: '000000' } }, alignment: { horizontal: c === 0 ? 'center' : 'left', vertical: 'center', wrapText: c === 7 || c === 11 }, border: thinBorder });
+          }
+        }
+      } else {
+        style(wsF, 1, 1, { font: { bold: true, color: { rgb: '17784A' } } });
+      }
+      XLSX.utils.book_append_sheet(wb, wsF, 'Audit Findings');
+    }
+  </script>
+</body>
+</html>

@@ -5,7 +5,8 @@ MERGE FILES TOOL (MASTER COLUMN & DUPES ENHANCED)
 
 PURPOSE
 --------------------------------------------------
-Merges multiple Excel files (.xlsx / .xls) uploaded simultaneously.
+Merges multiple Excel (.xlsx / .xls) and CSV (.csv) files uploaded
+simultaneously (formats can be mixed freely in one batch).
 Automatically selects the file with the highest number of columns as the
 master structure, maps all matching columns regardless of order, leaves
 missing fields blank, and removes blank rows.
@@ -20,6 +21,7 @@ and an organized 'Duplicates' sheet with thick group dividers.
 """
 
 import io
+import os
 import re
 
 import pandas as pd
@@ -49,6 +51,65 @@ def sanitize_cell_value(val):
     if val_str.endswith(".0"):
         val_str = val_str[:-2]
     return val_str
+
+
+CSV_ENCODINGS = ("utf-8-sig", "cp1252", "latin-1")
+CSV_DELIMITERS = [",", ";", "\t", "|"]
+
+
+def _detect_delimiter(text: str) -> str:
+    """Pick the most frequent candidate delimiter in the header line (default comma)."""
+    first_line = text.lstrip("\ufeff").split("\n", 1)[0]
+    counts = {d: first_line.count(d) for d in CSV_DELIMITERS}
+    best = max(counts, key=counts.get)
+    return best if counts[best] > 0 else ","
+
+
+def read_csv_file(f) -> pd.DataFrame:
+    """
+    Reads an uploaded CSV robustly:
+    - tries several encodings (UTF-8 w/ BOM, UTF-16 w/ BOM, Windows-1252, Latin-1)
+    - auto-detects the delimiter (comma / semicolon / tab / pipe)
+    - reads everything as text with no NA conversion, so IDs, leading zeros
+      and blanks are preserved exactly
+    - tolerates quoted multi-line cells and malformed short/long rows
+    """
+    raw = f.getvalue() if hasattr(f, "getvalue") else f.read()
+    if not raw or not raw.strip():
+        raise ValueError("The CSV file is empty.")
+
+    last_err = None
+    encodings = CSV_ENCODINGS
+    if raw[:2] in (b"\xff\xfe", b"\xfe\xff"):  # UTF-16 only when a BOM says so
+        encodings = ("utf-16",) + CSV_ENCODINGS
+    for enc in encodings:
+        try:
+            text = raw.decode(enc)
+        except (UnicodeDecodeError, UnicodeError) as e:
+            last_err = e
+            continue
+        try:
+            return pd.read_csv(
+                io.StringIO(text),
+                sep=_detect_delimiter(text),
+                dtype=str,
+                keep_default_na=False,
+                na_filter=False,
+                skipinitialspace=False,
+                engine="python",
+            )
+        except Exception as e:  # try next encoding / surface last error
+            last_err = e
+    raise ValueError(f"Could not parse CSV: {last_err}")
+
+
+def read_uploaded_file(f) -> pd.DataFrame:
+    """Dispatch on file extension: .csv -> CSV reader, otherwise Excel (first sheet)."""
+    ext = os.path.splitext(f.name)[1].lower()
+    if ext == ".csv":
+        return read_csv_file(f)
+    # Read all columns as string to protect long identifiers
+    return pd.read_excel(f, sheet_name=0, dtype=str)
 
 
 def style_preview(df: pd.DataFrame):
@@ -226,20 +287,20 @@ def format_duplicates_sheet(writer, sheet_name: str, dupes_df: pd.DataFrame, dup
 def show():
     st.title("🔗 Master Merge & Duplicate Auditor")
     st.caption(
-        "Upload multiple Excel files simultaneously. The file with the most columns sets the "
+        "Upload multiple Excel (.xlsx / .xls) or CSV files simultaneously. The file with the most columns sets the "
         "master column structure. Large numeric IDs (PRNs, Roll numbers) are protected and "
         "prevented from converting to scientific notation."
     )
     st.markdown("---")
 
     uploaded_files = st.file_uploader(
-        "Upload Excel files to merge",
-        type=["xlsx", "xls"],
+        "Upload Excel or CSV files to merge",
+        type=["xlsx", "xls", "csv"],
         accept_multiple_files=True,
     )
 
     if not uploaded_files:
-        st.info("Upload two or more Excel files to get started.")
+        st.info("Upload two or more Excel or CSV files to get started.")
         return
 
     if len(uploaded_files) == 1:
@@ -255,13 +316,13 @@ def show():
 
     for f in uploaded_files:
         try:
-            # Read all columns as string to protect long identifiers
-            df = pd.read_excel(f, sheet_name=0, dtype=str)
+            # All columns are read as text to protect long identifiers
+            df = read_uploaded_file(f)
         except Exception as e:
             read_errors.append((f.name, str(e)))
             continue
 
-        # Drop completely blank rows
+        # Drop completely blank rows (CSV blanks are "" rather than NaN, handled below)
         df = df.dropna(how="all")
         # Apply string sanitation across all cells
         df = df.map(sanitize_cell_value)
