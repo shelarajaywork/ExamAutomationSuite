@@ -30,6 +30,14 @@ This Streamlit tool helps exam staff:
    - Formatted File: All UserTypes, GMR columns, Change %, center alignment, F2 freeze, 
      thick student borders, green/red text, and automatic Excel pop-up message if eligible.
    - Consolidated Multi-Sheet Excel option for multiple files with pop-up messages per eligible sheet.
+   Both the Formatted File and the Consolidated Excel additionally get: fixed width 10 on question
+     columns, fixed 21pt row height, vertical-middle alignment, yellow fill on Moderator 'NA' cells where
+     the Examiner awarded marks, bright-green bold Moderator marks where the Examiner is 'NA', and
+     SAP ID colour scale by Examiner->Moderator score change (green up / red down / blue none), header height 45, 'Total Obtained Score' header label,
+     fixed widths for SrNo/Subject code/SubjectName/SAP ID/UserType/Total Obtained Score, thick vertical
+     borders between main question groups and around Total Obtained Score, and a Tan fill on
+     Examiner-only student rows, and a red SAP ID fill (Examiner + Moderator rows) when the Moderator
+     value is 'NA' for a question the Examiner awarded marks for.
 ==================================================
 """
 
@@ -166,6 +174,41 @@ GRADE_RANKS = {
     "P": 2,
     "F": 1
 }
+
+
+# --- Extra Excel formatting settings (Formatted File + Consolidated Excel only) ---
+QUESTION_COL_WIDTH = 10        # Fixed width for question-wise mark columns (~75 px).
+EXCEL_ROW_HEIGHT = 21          # Fixed height in points for header + data rows (~28 px).
+
+
+HEADER_ROW_HEIGHT = 45         # Header row height in points (~60 px).
+TOTAL_SCORE_LABEL = "Total Obtained Score"   # Display label for 'TotalObtainedScore' in the two formatted exports.
+
+# Fixed widths (keyed by the column name as it appears in the formatted export).
+FIXED_COLUMN_WIDTHS = {
+    "SrNo": 4.57,
+    "Subject code": 11.57,
+    "SubjectName": 30,
+    "SAP ID": 12,
+    "UserType": 10,
+    "TotalObtainedScore": 9,
+}
+
+# Tan, Background 2, Darker 50% - fills rows of students that only have an Examiner row.
+EXAMINER_ONLY_FILL = "948A54"
+
+# Red fill on the SAP ID cell of the Examiner AND Moderator rows when the Moderator value is "NA"
+# for any question the Examiner awarded marks for (overrides the score-change colour).
+NA_MISMATCH_SAP_FILL = "FF0000"
+
+# SAP ID colour-coding by the change in Total Obtained Score (Examiner -> Moderator),
+# applied to the SAP ID cell of every row of that student.
+# Magnitude tiers use the absolute Change % of the Moderator row:
+#   <= first limit -> light, <= second limit -> medium, above -> dark.
+CHANGE_TIER_LIMITS = (5.0, 10.0)
+SAP_INCREASE_FILLS = ["C3E6C3", "8FD18F", "5DBB63"]   # pastel green: light / medium / darker
+SAP_DECREASE_FILLS = ["F8CBCB", "F19999", "E86A6A"]   # pastel red:   light / medium / darker
+SAP_NO_CHANGE_FILL = "BDD7EE"                         # pastel blue
 
 
 # ==================================================
@@ -1179,6 +1222,181 @@ def _apply_semester_marks_highlighting(worksheet, download_df, cols, green_fill,
         cell.fill = green_fill if sem_val == tot_val else red_fill
 
 
+def _change_fill(diff, change_pct):
+    """
+    Picks the SAP ID fill for a student from the Examiner -> Moderator score change.
+    diff > 0  -> pastel green (light/medium/darker by |Change %|)
+    diff < 0  -> pastel red   (light/medium/darker by |Change %|)
+    diff == 0 -> pastel blue
+    A missing/non-numeric Change % falls back to the lightest tier.
+    """
+    if diff == 0:
+        return PatternFill(start_color=SAP_NO_CHANGE_FILL, end_color=SAP_NO_CHANGE_FILL, fill_type="solid")
+
+    try:
+        magnitude = abs(float(str(change_pct).strip()))
+    except (ValueError, TypeError):
+        magnitude = 0.0
+
+    low, high = CHANGE_TIER_LIMITS
+    tier = 0 if magnitude <= low else (1 if magnitude <= high else 2)
+    colour = (SAP_INCREASE_FILLS if diff > 0 else SAP_DECREASE_FILLS)[tier]
+    return PatternFill(start_color=colour, end_color=colour, fill_type="solid")
+
+
+def _apply_enhanced_formatting(worksheet, download_df, cols, bright_green_font):
+    """
+    Extra formatting pass for the Formatted File / Consolidated Excel. Runs LAST,
+    after all existing styling and column auto-sizing, and only touches:
+      - fixed column widths (question columns + SrNo/Subject code/SubjectName/SAP ID/UserType/score)
+      - Moderator cell fill where Examiner has marks but Moderator is 'NA' (yellow), and a red
+        SAP ID fill on the Examiner + Moderator rows of that student
+      - Moderator font where Examiner is 'NA' but Moderator has marks (bright green bold)
+      - Tan fill on rows of students that only have an Examiner row
+      - SAP ID fill by Examiner->Moderator change in Total Obtained Score (colour scale)
+      - thick vertical borders between main question groups and around the score column
+      - row heights (header 45pt, others 21pt) and vertical-middle alignment (all cells)
+      - the 'TotalObtainedScore' header label (renamed last, after all column lookups)
+    No data, logic, freeze panes or other existing formatting is changed.
+    """
+    non_question = (
+        set(FIXED_COLUMNS) | set(COLUMNS_TO_DROP_FORMATTED)
+        | {"SAP ID", "Subject code", "TotalObtainedScore"}
+    )
+    question_cols = [c for c in cols if c not in non_question]
+
+    # 1. Fixed widths: question-wise mark columns, then the named columns.
+    for q_col in question_cols:
+        letter = get_column_letter(cols.index(q_col) + 1)
+        worksheet.column_dimensions[letter].width = QUESTION_COL_WIDTH
+    for col_name, width in FIXED_COLUMN_WIDTHS.items():
+        if col_name in cols:
+            worksheet.column_dimensions[get_column_letter(cols.index(col_name) + 1)].width = width
+
+    # 2 & 3. Moderator vs Examiner "NA" handling.
+    red_sap_rows = []   # DataFrame row indices whose SAP ID cell gets the red fill (applied after step 5).
+    if "UserType" in cols and "SAP ID" in cols and question_cols:
+        yellow_fill = PatternFill(start_color="FFFF00", end_color="FFFF00", fill_type="solid")
+
+        for _, group in download_df.groupby("SAP ID", dropna=False):
+            examiner_rows = group[group["UserType"].astype(str).str.strip() == "Examiner"]
+            if examiner_rows.empty:
+                continue
+            examiner_row = examiner_rows.iloc[0]
+
+            for row_idx in group.index:
+                if str(download_df.loc[row_idx, "UserType"]).strip() != "Moderator":
+                    continue
+                excel_row_num = row_idx + 2
+                na_hit = False
+
+                for q_col in question_cols:
+                    ex_val = str(examiner_row[q_col]).strip()
+                    mod_val = str(download_df.loc[row_idx, q_col]).strip()
+                    cell = worksheet.cell(row=excel_row_num, column=cols.index(q_col) + 1)
+
+                    if ex_val not in ("",) and ex_val.upper() != "NA" and mod_val.upper() == "NA":
+                        cell.fill = yellow_fill                  # Examiner marked, Moderator "NA".
+                        na_hit = True
+                    elif ex_val.upper() == "NA" and mod_val != "" and mod_val.upper() != "NA":
+                        cell.font = bright_green_font            # Examiner "NA", Moderator marked.
+
+                if na_hit:
+                    red_sap_rows.extend([examiner_rows.index[0], row_idx])
+
+    # 4. Examiner-only students (no Moderator / Reval rows) -> Tan fill on the whole row.
+    #    Cells that already carry a fill (e.g. Semester Marks match/mismatch) keep it.
+    if "UserType" in cols and "SAP ID" in cols:
+        tan_fill = PatternFill(start_color=EXAMINER_ONLY_FILL, end_color=EXAMINER_ONLY_FILL, fill_type="solid")
+        for _, group in download_df.groupby("SAP ID", dropna=False):
+            if set(group["UserType"].astype(str).str.strip()) != {"Examiner"}:
+                continue
+            for row_idx in group.index:
+                for col_idx in range(1, worksheet.max_column + 1):
+                    cell = worksheet.cell(row=row_idx + 2, column=col_idx)
+                    if cell.fill is None or cell.fill.fill_type is None:
+                        cell.fill = tan_fill
+
+    # 5. SAP ID colour by Examiner -> Moderator change in Total Obtained Score.
+    #    Every row of the student's SAP ID group gets the same fill.
+    if "SAP ID" in cols and "UserType" in cols and "TotalObtainedScore" in cols:
+        sap_col_idx = cols.index("SAP ID") + 1
+        for _, group in download_df.groupby("SAP ID", dropna=False):
+            user_types = group["UserType"].astype(str).str.strip()
+            examiner_rows = group[user_types == "Examiner"]
+            moderator_rows = group[user_types == "Moderator"]
+            if examiner_rows.empty or moderator_rows.empty:
+                continue  # No Examiner -> Moderator change to report.
+
+            try:
+                ex_score = float(examiner_rows.iloc[0]["TotalObtainedScore"])
+                mod_score = float(moderator_rows.iloc[0]["TotalObtainedScore"])
+            except (ValueError, TypeError):
+                continue  # Non-numeric score (ABSENT / UFM) - leave uncoloured.
+
+            fill = _change_fill(mod_score - ex_score, moderator_rows.iloc[0].get("Change %", ""))
+            for row_idx in group.index:
+                worksheet.cell(row=row_idx + 2, column=sap_col_idx).fill = fill
+
+
+    # 5b. Red SAP ID on Examiner + Moderator rows where Moderator is "NA" but Examiner has marks.
+    if red_sap_rows and "SAP ID" in cols:
+        red_fill = PatternFill(start_color=NA_MISMATCH_SAP_FILL, end_color=NA_MISMATCH_SAP_FILL, fill_type="solid")
+        for row_idx in set(red_sap_rows):
+            worksheet.cell(row=row_idx + 2, column=cols.index("SAP ID") + 1).fill = red_fill
+
+    # 6. Thick vertical borders (top/bottom of each cell are preserved).
+    thick_side = Side(style="thick", color="000000")
+
+    def _thick_vertical(col_idx, left=False, right=False):
+        for r in range(1, worksheet.max_row + 1):
+            cell = worksheet.cell(row=r, column=col_idx)
+            b = cell.border
+            cell.border = Border(
+                left=thick_side if left else b.left,
+                right=thick_side if right else b.right,
+                top=b.top,
+                bottom=b.bottom,
+            )
+
+    # 6a. Between main question groups (Q1.A..Q1.D | Q2.A..Q2.D | ...).
+    groups = []   # list of [first_col_idx, last_col_idx]
+    prev_key = None
+    for q_col in question_cols:
+        col_idx = cols.index(q_col) + 1
+        match = re.search(r"\bQ\s*(\d+)", q_col)
+        key = match.group(1) if match else q_col
+        if groups and key == prev_key and col_idx == groups[-1][1] + 1:
+            groups[-1][1] = col_idx
+        else:
+            groups.append([col_idx, col_idx])
+        prev_key = key
+    for g_i, (first_idx, last_idx) in enumerate(groups):
+        if g_i > 0:
+            _thick_vertical(first_idx, left=True)
+        if g_i < len(groups) - 1:
+            _thick_vertical(last_idx, right=True)
+
+    # 6b. Both sides of the Total Obtained Score column.
+    if "TotalObtainedScore" in cols:
+        _thick_vertical(cols.index("TotalObtainedScore") + 1, left=True, right=True)
+
+    # 7. Fixed row heights + vertical-middle alignment on every cell (header + data).
+    for row in worksheet.iter_rows(min_row=1, max_row=worksheet.max_row,
+                                    min_col=1, max_col=worksheet.max_column):
+        worksheet.row_dimensions[row[0].row].height = HEADER_ROW_HEIGHT if row[0].row == 1 else EXCEL_ROW_HEIGHT
+        for cell in row:
+            a = cell.alignment
+            cell.alignment = Alignment(
+                horizontal=a.horizontal, vertical="center", textRotation=a.textRotation,
+                wrap_text=a.wrap_text, shrink_to_fit=a.shrink_to_fit, indent=a.indent,
+            )
+
+    # 8. Rename the header label last (all column lookups above use the original name).
+    if "TotalObtainedScore" in cols:
+        worksheet.cell(row=1, column=cols.index("TotalObtainedScore") + 1).value = TOTAL_SCORE_LABEL
+
+
 def to_excel_bytes(df):
     """ORIGINAL Standard clean output without GMR columns."""
     download_df = process_data_for_download(df, include_all_usertypes=False)
@@ -1275,6 +1493,9 @@ def to_excel_bytes_formatted(df):
         # Auto-size columns, except the GMR/Change % block which gets a fixed width of 10.
         _autosize_or_fixed_width_columns(worksheet, fixed_width_cols=fixed_10_cols, fixed_width=10)
 
+        # Extra formatting (question widths, row height, vertical middle, NA/score-change highlights).
+        _apply_enhanced_formatting(worksheet, download_df, cols, bright_green_font)
+
     return buffer.getvalue()
 
 
@@ -1346,6 +1567,9 @@ def create_consolidated_multi_sheet_excel(dfs_list):
             add_sheet_popup_validation(worksheet, is_eligible)
 
             _autosize_or_fixed_width_columns(worksheet, fixed_width_cols=fixed_10_cols, fixed_width=10)
+
+            # Extra formatting (question widths, row height, vertical middle, NA/score-change highlights).
+            _apply_enhanced_formatting(worksheet, download_df, cols, bright_green_font)
 
     return buffer.getvalue()
 
@@ -1493,7 +1717,7 @@ def show():
 
                 st.markdown(
                     f"""
-                    <div style="background-color:#1E293B;padding:12px;border-radius:8px;color:white;border:1px solid #334155;">
+                    <div style="background-color:#586987;padding:12px;border-radius:8px;color:white;border:1px solid #334155;">
                         <span style="font-size:15px;font-weight:600;"> Require 100% Moderation?</span><br/>
                         <span style="font-size:15px;"> Change % > 10%: <b>{cnt_gt_10} / {mod_cnt}</b></span><br/>                        
                         <span style="font-size:60px;font-weight:bold;{color_style}">{pct_str}</span>
@@ -1736,6 +1960,26 @@ Moderation"** when more than 50% of Moderator rows show an absolute Change % gre
   medium-thickness bottom border marking the end of each student's block.
 - **100% Moderation pop-up**: if a paper is eligible, opening the Excel file and clicking cell A1
   shows an on-screen alert message.
+- **Moderator "NA" where Examiner gave marks** (Formatted File / Consolidated Excel only): the
+  Moderator's cell for that question is filled **yellow**. In addition, the **SAP ID cell of both the
+  Examiner row and the Moderator row** of that student is filled **red** (this overrides the
+  score-change colour on those two cells).
+- **Moderator marks where Examiner is "NA"** (Formatted / Consolidated only): the Moderator's mark is
+  shown in bright green bold, the same green used for mark increases.
+- **Examiner-only students** (no Moderator / Reval row) (Formatted / Consolidated only): the whole row
+  is filled **Tan (Background 2, Darker 50%)**. Cells that already carry a fill (e.g. the Semester
+  Marks match/mismatch fill) keep it.
+- **SAP ID colour scale** (Formatted / Consolidated only): for every student with both an Examiner and
+  a Moderator row, the SAP ID cell of **all rows of that SAP ID** is coloured by the change in Total
+  Obtained Score (Moderator vs Examiner): **pastel green** = increase, **pastel red** = decrease,
+  **pastel blue** = no change. Green and red come in three shades - light (|Change %| up to 5%),
+  medium (above 5% up to 10%) and darker (above 10%). Students without a Moderator row, or with a
+  non-numeric score (ABSENT / UFM), are left uncoloured.
+- **Layout** (Formatted / Consolidated only): header row 45 pt, all other rows 21 pt, everything
+  vertically middle-aligned; question columns width 10; SrNo 4.57, Subject code 11.57, SubjectName 30,
+  SAP ID 12, UserType 10, Total Obtained Score 9; thick vertical borders between main question groups
+  (Q1 | Q2 | ...) and on both sides of **Total Obtained Score** (shown with that label in these two
+  outputs; the Cleaned File keeps the original header).
 
 ---
 ### 10. Preview Tabs
@@ -1752,7 +1996,8 @@ Moderation"** when more than 50% of Moderator rows show an absolute Change % gre
   Total Marks Obtained, Grade, Change %) **not included**.
 - **🎨 Download Formatted File** - all UserTypes, all GMR columns including **Semester Marks**,
   Change %, centered alignment, header freeze, thick per-student borders, green/red highlighting,
-  Semester Marks match/mismatch fill, and the 100% Moderation pop-up if eligible.
+  Semester Marks match/mismatch fill, the 100% Moderation pop-up if eligible, plus the extra layout and
+  highlight rules listed in section 9 (those marked Formatted / Consolidated only).
 - **📦 Download All Output Excel Files (ZIP)** - one Cleaned File per uploaded Questionwise file,
   bundled into a single ZIP (Semester Marks **not included**, matching the Cleaned File format).
 - **📊 Download Consolidated Multi-Sheet Excel** - one workbook with a separate sheet per uploaded
