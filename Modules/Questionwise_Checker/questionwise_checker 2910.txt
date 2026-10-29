@@ -9,7 +9,7 @@ This Streamlit tool helps exam staff:
 
 1. Open password-protected or unprotected Excel mark sheets exported from
    the examination system (supports multiple uploads simultaneously).
-2. Optionally upload a GMR Excel file to match records by PRN/Student Number 
+2. Optionally upload a VGMR Excel file to match records by PRN/Student Number 
    and Subject Code/Modulecode to fetch 'Internal Marks' (Internal Total Obtained),
    'Total Max Marks' (from Composite AGR type), 'Semester Total Max Marks' (from 
    Semester Total AGR type), 'Semester Marks' (Grades value from "Semester Total 
@@ -1197,7 +1197,7 @@ def _apply_semester_marks_highlighting(worksheet, download_df, cols, green_fill,
     Examiner row with no corresponding Moderator record), compares it against
     that same row's TotalObtainedScore and fills the cell:
       - light green if Semester Marks == TotalObtainedScore
-      - light red if Semester Marks != TotalObtainedScore
+      - red fill with yellow font if Semester Marks != TotalObtainedScore
     Rows where Semester Marks is blank are left untouched.
     """
     if "Semester Marks" not in download_df.columns or "TotalObtainedScore" not in download_df.columns:
@@ -1219,7 +1219,49 @@ def _apply_semester_marks_highlighting(worksheet, download_df, cols, green_fill,
 
         excel_row_num = row_idx + 2  # +1 for header row, +1 for 1-based Excel rows.
         cell = worksheet.cell(row=excel_row_num, column=sem_col_idx)
-        cell.fill = green_fill if sem_val == tot_val else red_fill
+        if sem_val == tot_val:
+            cell.fill = green_fill
+        else:
+            cell.fill = red_fill
+            # Mismatch: keep the cell's existing font settings but switch the colour to yellow.
+            f = cell.font
+            cell.font = Font(name=f.name, size=f.size, bold=f.bold, italic=f.italic, color="FFFF00")
+
+
+def _blank_repeated_examiner_fields(worksheet, download_df, cols):
+    """
+    Display-only tidy-up for the Formatted File / Consolidated Excel. When a SAP ID also has a
+    Moderator or Revaluation row, the Examiner row's Internal Marks, Total Max Marks, Total Marks
+    Obtained and Grade are left blank (the values are identical on every row of that SAP ID, so they
+    are shown once, on the other rows). Only worksheet cells are cleared - the DataFrame, the
+    calculations and the highlighting rules are untouched.
+    """
+    if "SAP ID" not in cols or "UserType" not in cols:
+        return
+
+    target_cols = ["Internal Marks", "Total Max Marks", "Total Marks Obtained", "Grade"]
+    target_idx = [cols.index(c) + 1 for c in target_cols if c in cols]
+    if not target_idx:
+        return
+
+    for _, group in download_df.groupby("SAP ID", dropna=False):
+        user_types = group["UserType"].astype(str).str.strip()
+        has_other_row = ((user_types != "Examiner") & (user_types != "")).any()
+        if not has_other_row:
+            continue
+        for row_idx in group.index[user_types == "Examiner"]:
+            for col_idx in target_idx:
+                worksheet.cell(row=row_idx + 2, column=col_idx).value = None
+
+
+def _is_zero_after_marks(examiner_val, moderator_val):
+    """True when the Moderator awarded 0 for a question where the Examiner awarded non-zero marks."""
+    try:
+        ex_num = float(re.sub(r"^\+\s*", "", str(examiner_val).strip()))
+        mod_num = float(re.sub(r"^\+\s*", "", str(moderator_val).strip()))
+    except (ValueError, TypeError):
+        return False
+    return mod_num == 0 and ex_num != 0
 
 
 def _change_fill(diff, change_pct):
@@ -1249,7 +1291,7 @@ def _apply_enhanced_formatting(worksheet, download_df, cols, bright_green_font):
     Extra formatting pass for the Formatted File / Consolidated Excel. Runs LAST,
     after all existing styling and column auto-sizing, and only touches:
       - fixed column widths (question columns + SrNo/Subject code/SubjectName/SAP ID/UserType/score)
-      - Moderator cell fill where Examiner has marks but Moderator is 'NA' (yellow), and a red
+      - Moderator cell fill where Examiner has marks but Moderator is 'NA' or 0 (yellow), and a red
         SAP ID fill on the Examiner + Moderator rows of that student
       - Moderator font where Examiner is 'NA' but Moderator has marks (bright green bold)
       - Tan fill on rows of students that only have an Examiner row
@@ -1295,8 +1337,10 @@ def _apply_enhanced_formatting(worksheet, download_df, cols, bright_green_font):
                     mod_val = str(download_df.loc[row_idx, q_col]).strip()
                     cell = worksheet.cell(row=excel_row_num, column=cols.index(q_col) + 1)
 
-                    if ex_val not in ("",) and ex_val.upper() != "NA" and mod_val.upper() == "NA":
-                        cell.fill = yellow_fill                  # Examiner marked, Moderator "NA".
+                    if ex_val not in ("",) and ex_val.upper() != "NA" and (
+                        mod_val.upper() == "NA" or _is_zero_after_marks(ex_val, mod_val)
+                    ):
+                        cell.fill = yellow_fill                  # Examiner marked, Moderator "NA" or 0.
                         na_hit = True
                     elif ex_val.upper() == "NA" and mod_val != "" and mod_val.upper() != "NA":
                         cell.font = bright_green_font            # Examiner "NA", Moderator marked.
@@ -1453,7 +1497,7 @@ def to_excel_bytes_formatted(df):
         bright_green_font = Font(color="00B050", bold=True)  # Standard Excel bright green for high visibility
         red_font = Font(color="FF4500", bold=True)
         sem_marks_green_fill = PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid")
-        sem_marks_red_fill = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")
+        sem_marks_red_fill = PatternFill(start_color="FF0000", end_color="FF0000", fill_type="solid")
 
         cols = download_df.columns.tolist()
 
@@ -1496,6 +1540,9 @@ def to_excel_bytes_formatted(df):
         # Extra formatting (question widths, row height, vertical middle, NA/score-change highlights).
         _apply_enhanced_formatting(worksheet, download_df, cols, bright_green_font)
 
+        # Show repeated Examiner values (Internal/Total Max/Total Obtained/Grade) only once per SAP ID.
+        _blank_repeated_examiner_fields(worksheet, download_df, cols)
+
     return buffer.getvalue()
 
 
@@ -1534,7 +1581,7 @@ def create_consolidated_multi_sheet_excel(dfs_list):
             bright_green_font = Font(color="00B050", bold=True)  # Standard Excel bright green for high visibility
             red_font = Font(color="FF4500", bold=True)
             sem_marks_green_fill = PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid")
-            sem_marks_red_fill = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")
+            sem_marks_red_fill = PatternFill(start_color="FF0000", end_color="FF0000", fill_type="solid")
 
             cols = download_df.columns.tolist()
 
@@ -1571,6 +1618,9 @@ def create_consolidated_multi_sheet_excel(dfs_list):
             # Extra formatting (question widths, row height, vertical middle, NA/score-change highlights).
             _apply_enhanced_formatting(worksheet, download_df, cols, bright_green_font)
 
+            # Show repeated Examiner values (Internal/Total Max/Total Obtained/Grade) only once per SAP ID.
+            _blank_repeated_examiner_fields(worksheet, download_df, cols)
+
     return buffer.getvalue()
 
 
@@ -1603,7 +1653,7 @@ def show():
 
     with col_up2:
         gmr_file = st.file_uploader(
-            "Upload GMR Excel",
+            "Upload VGMR Excel",
             type=["xlsx", "xls"]
         )
 
@@ -1617,12 +1667,12 @@ def show():
     # Load GMR File if present (optional - the tool still works without it, just without GMR columns).
     gmr_df = None
     if gmr_file is not None:
-        with st.spinner("Loading GMR Excel..."):
+        with st.spinner("Loading VGMR Excel..."):
             gmr_df = load_gmr_file(gmr_file)
             if gmr_df is not None:
-                st.caption("✅ GMR File uploaded and loaded successfully.")
+                st.caption("✅ VGMR File uploaded and loaded successfully.")
             else:
-                st.warning("⚠️ Could not load GMR Excel file.")
+                st.warning("⚠️ Could not load VGMR Excel file.")
 
     processed_outputs_clean = []   # (filename, bytes) pairs for the bulk ZIP download.
     dfs_for_multi_sheet = []       # (DataFrame, original filename) pairs for the consolidated workbook.
@@ -1879,24 +1929,24 @@ ready-to-use preview tabs and downloadable Excel outputs.
   the standard identifier columns (`SrNo`, `Subject Name-Subject code`, `SubjectName`, `Semester`,
   `RollNo`, `Name`, `CampusName`, `MarkAttendance`, `Email`, `TotalObtainedScore`) and one column
   per question (headers like `Q1 (10)` where the number in parentheses is that question's max mark).
-- **GMR Excel** (`.xlsx` / `.xls`, single file, optional) - the Grade/Marks Register export. Must
+- **VGMR Excel** (`.xlsx` / `.xls`, single file, optional) - the Grade/Marks Register export. Must
   contain `Student Number`, `Modulecode`, `AGR type`, and `Grades` columns for any lookups to run;
-  `MAX Marks` is additionally needed for the Max Marks lookups. If the GMR file is not uploaded, or
+  `MAX Marks` is additionally needed for the Max Marks lookups. If the VGMR file is not uploaded, or
   is missing these columns, the tool still works - the GMR-derived columns are simply left blank.
 
 ---
 ### 3. Upload Options
 - **Upload Questionwise Excel/Excels** - accepts multiple files at once; each is processed and
   displayed independently, one section per file, so one bad/corrupt file does not block the rest.
-- **Upload GMR Excel** - a single optional file used to enrich *every* uploaded Questionwise file
+- **Upload VGMR Excel** - a single optional file used to enrich *every* uploaded Questionwise file
   with Internal Marks, Total Max Marks, Semester Total Max Marks, Semester Marks and Grade.
 
 ---
-### 4. Matching Logic Between Questionwise and GMR Files
+### 4. Matching Logic Between Questionwise and VGMR Files
 Every lookup uses the same composite key: **PRNNumber + Subject Name-Subject code** (Questionwise
 side) matched against **Student Number + Modulecode** (GMR side), both stripped of surrounding
 whitespace and concatenated into a single lookup string. A Questionwise row is only enriched if its
-key finds an exact match in the GMR file.
+key finds an exact match in the VGMR file.
 
 ---
 ### 5. Conditions & Filters Applied During Processing
@@ -1952,16 +2002,20 @@ Moderation"** when more than 50% of Moderator rows show an absolute Change % gre
 - **Question marks, Grade, Total Marks Obtained, Change %** (reviewer vs Examiner comparison):
   bright green text = increased/improved, red text = decreased/dropped, red text = a mark that
   existed for the Examiner but is missing for the reviewer.
-- **Semester Marks vs TotalObtainedScore**: light green cell fill = values match, light red cell
-  fill = values differ.
+- **Semester Marks vs TotalObtainedScore**: light green cell fill = values match. In the Excel outputs a
+  mismatch is shown with a **red fill and yellow font** (previews: red background, yellow text).
+- **Repeated Examiner values** (Formatted / Consolidated Excel only): when a SAP ID also has a Moderator
+  or Revaluation row, the Examiner row's **Internal Marks, Total Max Marks, Total Marks Obtained and
+  Grade** are left blank, because the same values already appear on the other rows of that SAP ID.
 - **Row background** (previews only): Moderator rows are shown on a dark green background, Reval 1
   on dark blue, Reval 2 on dark purple, for quick visual scanning.
 - **Moderator row fill** (Formatted File / Consolidated Excel only): light green row fill, plus a
   medium-thickness bottom border marking the end of each student's block.
 - **100% Moderation pop-up**: if a paper is eligible, opening the Excel file and clicking cell A1
   shows an on-screen alert message.
-- **Moderator "NA" where Examiner gave marks** (Formatted File / Consolidated Excel only): the
-  Moderator's cell for that question is filled **yellow**. In addition, the **SAP ID cell of both the
+- **Moderator "NA" or 0 where Examiner gave marks** (Formatted File / Consolidated Excel only): the
+  Moderator's cell for that question is filled **yellow**. A Moderator 0 counts only when the Examiner
+  awarded non-zero marks for that question. In addition, the **SAP ID cell of both the
   Examiner row and the Moderator row** of that student is filled **red** (this overrides the
   score-change colour on those two cells).
 - **Moderator marks where Examiner is "NA"** (Formatted / Consolidated only): the Moderator's mark is

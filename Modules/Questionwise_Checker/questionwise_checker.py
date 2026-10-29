@@ -1196,8 +1196,8 @@ def _apply_semester_marks_highlighting(worksheet, download_df, cols, green_fill,
     For every row where 'Semester Marks' is populated (Moderator rows, or an
     Examiner row with no corresponding Moderator record), compares it against
     that same row's TotalObtainedScore and fills the cell:
-      - light green if Semester Marks == TotalObtainedScore
-      - red fill with yellow font if Semester Marks != TotalObtainedScore
+      - no highlight if Semester Marks == TotalObtainedScore
+      - red fill with bold yellow font if Semester Marks != TotalObtainedScore
     Rows where Semester Marks is blank are left untouched.
     """
     if "Semester Marks" not in download_df.columns or "TotalObtainedScore" not in download_df.columns:
@@ -1219,39 +1219,61 @@ def _apply_semester_marks_highlighting(worksheet, download_df, cols, green_fill,
 
         excel_row_num = row_idx + 2  # +1 for header row, +1 for 1-based Excel rows.
         cell = worksheet.cell(row=excel_row_num, column=sem_col_idx)
-        if sem_val == tot_val:
-            cell.fill = green_fill
-        else:
+        if sem_val != tot_val:
+            # Matches are intentionally left without a fill; only mismatches are highlighted.
             cell.fill = red_fill
-            # Mismatch: keep the cell's existing font settings but switch the colour to yellow.
+            # Mismatch: keep the cell's font name/size/italic but make it bold yellow.
             f = cell.font
-            cell.font = Font(name=f.name, size=f.size, bold=f.bold, italic=f.italic, color="FFFF00")
+            cell.font = Font(name=f.name, size=f.size, bold=True, italic=f.italic, color="FFFF00")
 
 
-def _blank_repeated_examiner_fields(worksheet, download_df, cols):
+def _to_float_or_none(value):
+    """Parses a cell value (allowing a leading '+') into a float, or None if blank / non-numeric."""
+    try:
+        return float(re.sub(r"^\+\s*", "", str(value).strip()))
+    except (ValueError, TypeError):
+        return None
+
+
+def _apply_total_and_grade_validation(worksheet, download_df, cols):
     """
-    Display-only tidy-up for the Formatted File / Consolidated Excel. When a SAP ID also has a
-    Moderator or Revaluation row, the Examiner row's Internal Marks, Total Max Marks, Total Marks
-    Obtained and Grade are left blank (the values are identical on every row of that SAP ID, so they
-    are shown once, on the other rows). Only worksheet cells are cleared - the DataFrame, the
-    calculations and the highlighting rules are untouched.
+    Excel-only validation highlights (red fill + bold yellow font):
+      - Total Marks Obtained must equal Semester Marks + Internal Marks
+        (checked where Semester Marks and Total Marks Obtained are both numeric;
+         a blank Internal Marks counts as 0).
+      - Grade must equal the grade derived from the percentage of Total Marks Obtained over
+        Total Max Marks (the same ladder as calculate_grade, so flags match the tool's own grading;
+        checked where Total Marks Obtained and Total Max Marks are numeric and Grade is not blank).
     """
-    if "SAP ID" not in cols or "UserType" not in cols:
-        return
+    red_fill = PatternFill(start_color="FF0000", end_color="FF0000", fill_type="solid")
 
-    target_cols = ["Internal Marks", "Total Max Marks", "Total Marks Obtained", "Grade"]
-    target_idx = [cols.index(c) + 1 for c in target_cols if c in cols]
-    if not target_idx:
-        return
+    def _flag(row_idx, col_name):
+        cell = worksheet.cell(row=row_idx + 2, column=cols.index(col_name) + 1)
+        cell.fill = red_fill
+        f = cell.font
+        cell.font = Font(name=f.name, size=f.size, bold=True, italic=f.italic, color="FFFF00")
 
-    for _, group in download_df.groupby("SAP ID", dropna=False):
-        user_types = group["UserType"].astype(str).str.strip()
-        has_other_row = ((user_types != "Examiner") & (user_types != "")).any()
-        if not has_other_row:
+    has_total = "Total Marks Obtained" in cols
+    can_check_total = has_total and "Semester Marks" in cols and "Internal Marks" in cols
+    can_check_grade = has_total and "Grade" in cols and "Total Max Marks" in cols
+
+    for row_idx in download_df.index:
+        total_obtained = _to_float_or_none(download_df.loc[row_idx, "Total Marks Obtained"]) if has_total else None
+        if total_obtained is None:
             continue
-        for row_idx in group.index[user_types == "Examiner"]:
-            for col_idx in target_idx:
-                worksheet.cell(row=row_idx + 2, column=col_idx).value = None
+
+        if can_check_total:
+            semester = _to_float_or_none(download_df.loc[row_idx, "Semester Marks"])
+            if semester is not None:
+                internal = _to_float_or_none(download_df.loc[row_idx, "Internal Marks"])
+                if abs((semester + (internal or 0.0)) - total_obtained) > 0.005:
+                    _flag(row_idx, "Total Marks Obtained")
+
+        if can_check_grade:
+            shown_grade = str(download_df.loc[row_idx, "Grade"]).strip()
+            expected_grade = calculate_grade(total_obtained, download_df.loc[row_idx, "Total Max Marks"])
+            if shown_grade != "" and expected_grade != "" and shown_grade.upper() != expected_grade.upper():
+                _flag(row_idx, "Grade")
 
 
 def _is_zero_after_marks(examiner_val, moderator_val):
@@ -1298,6 +1320,7 @@ def _apply_enhanced_formatting(worksheet, download_df, cols, bright_green_font):
       - SAP ID fill by Examiner->Moderator change in Total Obtained Score (colour scale)
       - thick vertical borders between main question groups and around the score column
       - row heights (header 45pt, others 21pt) and vertical-middle alignment (all cells)
+      - Total Marks Obtained / Grade validation highlights (red fill + bold yellow font)
       - the 'TotalObtainedScore' header label (renamed last, after all column lookups)
     No data, logic, freeze panes or other existing formatting is changed.
     """
@@ -1388,6 +1411,9 @@ def _apply_enhanced_formatting(worksheet, download_df, cols, bright_green_font):
         red_fill = PatternFill(start_color=NA_MISMATCH_SAP_FILL, end_color=NA_MISMATCH_SAP_FILL, fill_type="solid")
         for row_idx in set(red_sap_rows):
             worksheet.cell(row=row_idx + 2, column=cols.index("SAP ID") + 1).fill = red_fill
+
+    # 5c. Total Marks Obtained (= Semester Marks + Internal Marks) and Grade validation.
+    _apply_total_and_grade_validation(worksheet, download_df, cols)
 
     # 6. Thick vertical borders (top/bottom of each cell are preserved).
     thick_side = Side(style="thick", color="000000")
@@ -1540,9 +1566,6 @@ def to_excel_bytes_formatted(df):
         # Extra formatting (question widths, row height, vertical middle, NA/score-change highlights).
         _apply_enhanced_formatting(worksheet, download_df, cols, bright_green_font)
 
-        # Show repeated Examiner values (Internal/Total Max/Total Obtained/Grade) only once per SAP ID.
-        _blank_repeated_examiner_fields(worksheet, download_df, cols)
-
     return buffer.getvalue()
 
 
@@ -1617,9 +1640,6 @@ def create_consolidated_multi_sheet_excel(dfs_list):
 
             # Extra formatting (question widths, row height, vertical middle, NA/score-change highlights).
             _apply_enhanced_formatting(worksheet, download_df, cols, bright_green_font)
-
-            # Show repeated Examiner values (Internal/Total Max/Total Obtained/Grade) only once per SAP ID.
-            _blank_repeated_examiner_fields(worksheet, download_df, cols)
 
     return buffer.getvalue()
 
@@ -2002,11 +2022,17 @@ Moderation"** when more than 50% of Moderator rows show an absolute Change % gre
 - **Question marks, Grade, Total Marks Obtained, Change %** (reviewer vs Examiner comparison):
   bright green text = increased/improved, red text = decreased/dropped, red text = a mark that
   existed for the Examiner but is missing for the reviewer.
-- **Semester Marks vs TotalObtainedScore**: light green cell fill = values match. In the Excel outputs a
-  mismatch is shown with a **red fill and yellow font** (previews: red background, yellow text).
-- **Repeated Examiner values** (Formatted / Consolidated Excel only): when a SAP ID also has a Moderator
-  or Revaluation row, the Examiner row's **Internal Marks, Total Max Marks, Total Marks Obtained and
-  Grade** are left blank, because the same values already appear on the other rows of that SAP ID.
+- **Semester Marks vs TotalObtainedScore**: in the Excel outputs matching values are left unhighlighted and a
+  mismatch is shown with a **red fill and bold yellow font** (previews: red background, yellow text).
+- **Total Marks Obtained check** (Formatted / Consolidated Excel only): Total Marks Obtained must equal
+  **Semester Marks + Internal Marks** (a blank Internal Marks counts as 0). If it does not, the Total
+  Marks Obtained cell gets a **red fill and bold yellow font**. Rows without a numeric Semester Marks
+  value are not checked.
+- **Grade check** (Formatted / Consolidated Excel only): the Grade is re-derived from the **percentage
+  of Total Marks Obtained over Total Max Marks** - 90% and above = O, 80-<90 = A+, 70-<80 = A,
+  60-<70 = B+, 55-<60 = B, 50-<55 = C, 40-<50 = P, below 40 = F (the same ladder the tool uses to
+  calculate Grade). If the displayed Grade differs, the Grade cell gets a **red fill and bold yellow
+  font**. Rows with a blank Grade or no numeric Total Max Marks are not checked.
 - **Row background** (previews only): Moderator rows are shown on a dark green background, Reval 1
   on dark blue, Reval 2 on dark purple, for quick visual scanning.
 - **Moderator row fill** (Formatted File / Consolidated Excel only): light green row fill, plus a
