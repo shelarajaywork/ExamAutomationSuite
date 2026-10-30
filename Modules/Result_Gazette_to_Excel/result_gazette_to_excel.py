@@ -742,7 +742,21 @@ def parse_result_pages(
             )
         return 99
 
-    sorted_sem_cols = sorted(all_discovered_sem_keys, key=sem_sort_key)
+    # Within each semester block: Credits, SGPA, Attempts, then remaining semester columns
+    sem_suffix_order = ["Credits", "SGPA", "Attempts", "CG", "Fail_Info"]
+
+    def sem_col_sort_key(col_name):
+        m = re.match(r"^Sem_([IVXLCDM\d]+)_(.*)$", col_name)
+        sem_name = m.group(1) if m else ""
+        suffix = m.group(2) if m else ""
+        suffix_rank = (
+            sem_suffix_order.index(suffix)
+            if suffix in sem_suffix_order
+            else len(sem_suffix_order)
+        )
+        return (sem_sort_key(col_name), sem_name, suffix_rank, col_name)
+
+    sorted_sem_cols = sorted(all_discovered_sem_keys, key=sem_col_sort_key)
 
     df_detailed = pd.DataFrame(detailed_records)
 
@@ -772,7 +786,12 @@ def parse_result_pages(
 
         gt_cols = [
             c
-            for c in ["Total Marks Obt.", "Max Total Marks", "Percentage"]
+            for c in [
+                "Grade",
+                "Total Marks Obt.",
+                "Max Total Marks",
+                "Percentage",
+            ]
             if c in df_detailed.columns
         ]
 
@@ -785,7 +804,6 @@ def parse_result_pages(
                 "Final Grade",
                 "Cumulative Percentage",
                 "Result Status",
-                "Grade",
                 "Eligibility Status",
             ]
             if c in df_detailed.columns
@@ -817,6 +835,40 @@ def parse_result_pages(
         df_detailed = df_detailed[non_empty_cols]
 
     return df_detailed
+
+
+_SUBJECT_PASTEL_PALETTE = [
+    "F9C6D0",  # rose
+    "FFD8B1",  # peach
+    "FFF2B3",  # butter
+    "C9EBC0",  # mint
+    "B8E6E0",  # aqua
+    "BFE0F5",  # sky
+    "CFCDF5",  # periwinkle
+    "E4C9F2",  # lilac
+    "F5C6E8",  # orchid
+    "D5E8B0",  # lime
+    "FAD4C0",  # apricot
+    "C0DCE8",  # powder blue
+]
+
+
+def generate_pastel_palette(n):
+    """Return n unique pastel hex colours (curated first, then generated dynamically)."""
+    import colorsys
+
+    palette = list(_SUBJECT_PASTEL_PALETTE[:n])
+    used = set(palette)
+    i = 0
+    while len(palette) < n:
+        hue = (i * 0.618033988749895) % 1.0
+        r, g, b = colorsys.hls_to_rgb(hue, 0.86, 0.55)
+        hex_color = f"{int(r * 255):02X}{int(g * 255):02X}{int(b * 255):02X}"
+        i += 1
+        if hex_color not in used:
+            used.add(hex_color)
+            palette.append(hex_color)
+    return palette
 
 
 def save_to_formatted_excel(sheets_dict, exam_type="Regular"):
@@ -979,6 +1031,25 @@ def save_to_formatted_excel(sheets_dict, exam_type="Regular"):
                     + pre_total_credit_col_indices
                 )
 
+                # Unique pastel header colour per subject block (Sub1..SubN)
+                subject_numbers = []
+                for c in df.columns:
+                    m_sub = re.match(r"^Sub(\d+)\s", str(c))
+                    if m_sub and int(m_sub.group(1)) not in subject_numbers:
+                        subject_numbers.append(int(m_sub.group(1)))
+                subject_pastel_fills = {
+                    num: PatternFill(
+                        start_color=hex_c, end_color=hex_c, fill_type="solid"
+                    )
+                    for num, hex_c in zip(
+                        subject_numbers,
+                        generate_pastel_palette(len(subject_numbers)),
+                    )
+                }
+                header_font_subject = Font(
+                    name="Calibri", size=11, bold=True, color="1F1F1F"
+                )
+
                 # Header Formatting with vibrant distinct section fills
                 for col_idx, col_name in enumerate(df.columns, start=1):
                     cell = ws.cell(row=1, column=col_idx)
@@ -995,7 +1066,14 @@ def save_to_formatted_excel(sheets_dict, exam_type="Regular"):
                     ]:
                         cell.fill = header_fill_marks
                     elif str(col_name).startswith("Sub"):
-                        cell.fill = header_fill_subject
+                        m_sub = re.match(r"^Sub(\d+)\s", str(col_name))
+                        if m_sub and int(m_sub.group(1)) in subject_pastel_fills:
+                            cell.fill = subject_pastel_fills[
+                                int(m_sub.group(1))
+                            ]
+                            cell.font = header_font_subject
+                        else:
+                            cell.fill = header_fill_subject
                     else:
                         cell.fill = header_fill_navy
 
@@ -1182,8 +1260,283 @@ def save_to_formatted_excel(sheets_dict, exam_type="Regular"):
                         max_len = val_len
                 ws.column_dimensions[col_letter].width = max(max_len + 2, 6)
 
+        # Additive: compact student-wise view built from the existing Result_Data
+        _add_student_wise_view_sheet(
+            writer, sheets_dict.get("Result_Data"), exam_type=exam_type
+        )
+
     output.seek(0)
     return output
+
+
+# ==============================================================================
+# STUDENT-WISE VIEW SHEET (additive)
+# Built ONLY from the already-generated Result_Data DataFrame. No parsing,
+# calculation or existing-sheet logic is touched by this block.
+# ==============================================================================
+
+_SWV_SHEET_NAME = "Student_Wise_View"
+
+
+def _swv_value(val, numeric=False):
+    """Normalise a Result_Data cell for display (NaN -> '', optional numeric cast)."""
+    import numbers
+
+    if val is None:
+        return ""
+    try:
+        if pd.isna(val):
+            return ""
+    except (TypeError, ValueError):
+        pass
+    if isinstance(val, bool):
+        return val
+    if isinstance(val, numbers.Real):
+        return int(val) if float(val).is_integer() else float(val)
+    text = str(val).strip()
+    if numeric:
+        if re.fullmatch(r"\d+", text):
+            return int(text)
+        if re.fullmatch(r"\d+\.\d+", text):
+            return float(text)
+    return text
+
+
+def _add_student_wise_view_sheet(writer, df, exam_type="Regular"):
+    """Append the 'Student_Wise_View' worksheet: one compact section per student.
+
+    Section layout (fixed 9-column grid, so no horizontal scrolling):
+      1. Banner + student information (merged label/value cells)
+      2. Subject-wise table  (Sub Code ... CG)
+      3. Semester Details (left)  |  Overall Result Details (right)
+    """
+    from openpyxl.worksheet.properties import PageSetupProperties
+
+    ws = writer.book.create_sheet(_SWV_SHEET_NAME)
+    ws.views.sheetView[0].showGridLines = False
+
+    # ---- column widths: A..I (9-column grid) --------------------------------
+    for col_letter, width in zip(
+        "ABCDEFGHI", [20, 50, 12, 12, 12, 12, 12, 12, 12]
+    ):
+        ws.column_dimensions[col_letter].width = width
+
+    if df is None or df.empty:
+        ws["A1"] = "No student records available."
+        return ws
+
+    # ---- styles (same palette family as the existing sheets) ----------------
+    thin_side = Side(style="thin", color="D9D9D9")
+    border = Border(
+        left=thin_side, right=thin_side, top=thin_side, bottom=thin_side
+    )
+    fill_navy = PatternFill(start_color="1B365D", end_color="1B365D", fill_type="solid")
+    fill_subject = PatternFill(start_color="1A5276", end_color="1A5276", fill_type="solid")
+    fill_semester = PatternFill(start_color="5B2C6F", end_color="5B2C6F", fill_type="solid")
+    fill_final = PatternFill(start_color="145A32", end_color="145A32", fill_type="solid")
+    fill_label = PatternFill(start_color="D6EAF8", end_color="D6EAF8", fill_type="solid")
+    fill_fail = PatternFill(start_color="FADBD8", end_color="FADBD8", fill_type="solid")
+    fill_carried = PatternFill(start_color="EAECEE", end_color="EAECEE", fill_type="solid")
+    fill_fresh = PatternFill(start_color="FFF3CD", end_color="FFF3CD", fill_type="solid")
+
+    font_banner = Font(name="Calibri", size=13, bold=True, color="FFFFFF")
+    font_header = Font(name="Calibri", size=11, bold=True, color="FFFFFF")
+    font_label = Font(name="Calibri", size=11, bold=True, color="1B365D")
+    font_value_bold = Font(name="Calibri", size=11, bold=True, color="000000")
+    font_normal = Font(name="Calibri", size=11, color="000000")
+    font_fail = Font(name="Calibri", size=11, color="9C0006")
+    font_bad = Font(name="Calibri", size=11, bold=True, color="C00000")
+
+    center = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    left = Alignment(horizontal="left", vertical="center", wrap_text=True)
+
+    def put(r1, c1, r2, c2, value=None, font=None, fill=None, align=None, fmt=None):
+        """Write (and merge when spanning >1 cell) with the border on every cell."""
+        if (r1, c1) != (r2, c2):
+            ws.merge_cells(
+                start_row=r1, start_column=c1, end_row=r2, end_column=c2
+            )
+        for rr in range(r1, r2 + 1):
+            for cc in range(c1, c2 + 1):
+                cell = ws.cell(row=rr, column=cc)
+                cell.border = border
+                if font is not None:
+                    cell.font = font
+                if fill is not None:
+                    cell.fill = fill
+                if align is not None:
+                    cell.alignment = align
+        top_left = ws.cell(row=r1, column=c1)
+        top_left.value = value
+        if fmt and value != "":
+            top_left.number_format = fmt
+        return top_left
+
+    # ---- discover subjects / semesters dynamically from the existing columns -
+    cols = list(df.columns)
+    sub_nums = []
+    for c in cols:
+        m = re.match(r"^Sub(\d+)\s", str(c))
+        if m and int(m.group(1)) not in sub_nums:
+            sub_nums.append(int(m.group(1)))
+    sub_nums.sort()
+
+    sem_names = []  # already in ascending order in Result_Data
+    for c in cols:
+        m = re.match(
+            r"^Sem_([IVXLCDM\d]+)_(Credits|SGPA|Attempts|Fail_Info)$", str(c)
+        )
+        if m and m.group(1) not in sem_names:
+            sem_names.append(m.group(1))
+
+    def get(row, col, numeric=False):
+        if col not in row.index:
+            return ""
+        return _swv_value(row[col], numeric=numeric)
+
+    info_layout = [
+        # (label, label_cols, value_cols) per group of three on each row
+        [("SNo", (1, 1), (2, 2)), ("SAP No", (3, 4), (5, 6)), ("Roll No", (7, 7), (8, 9))],
+        [("PRN No", (1, 1), (2, 2)), ("ABC ID", (3, 4), (5, 6)), ("Gender", (7, 7), (8, 9))],
+        [
+            ("Candidate Full Name", (1, 1), (2, 2)),
+            ("Examination Type", (3, 4), (5, 6)),
+            ("Is_PwD", (7, 7), (8, 9)),
+        ],
+    ]
+    sub_headers = [
+        "Sub Code", "Course Title", "IA Marks", "TH Marks",
+        "Total Marks", "Grade", "GP", "Credits", "CG",
+    ]
+    sem_headers = ["Semester", "Credits", "SGPA", "Attempts", "Fail_Info"]
+    overall_items = [
+        ("Grade", False, None),
+        ("Total Marks Obt.", True, None),
+        ("Max Total Marks", True, None),
+        ("Percentage", True, '0.00"%"'),
+        ("Result Status", False, None),
+        ("Eligibility Status", False, None),
+    ]
+
+    total_students = len(df)
+    r = 1
+    for s_idx, (_, row) in enumerate(df.iterrows(), start=1):
+        # -- 1. Banner + student information ----------------------------------
+        put(r, 1, r, 9, f"Student {s_idx} of {total_students}", font_banner, fill_navy, center)
+        ws.row_dimensions[r].height = 24
+        r += 1
+        for info_row in info_layout:
+            for label, (lc1, lc2), (vc1, vc2) in info_row:
+                put(r, lc1, r, lc2, label, font_label, fill_label, left)
+                put(r, vc1, r, vc2, str(get(row, label)), font_value_bold, None, left)
+            r += 1
+
+        # -- 2. Subject-wise performance table --------------------------------
+        put(r, 1, r, 9, "Subject-Wise Performance", font_header, fill_subject, center)
+        r += 1
+        for c_idx, h in enumerate(sub_headers, start=1):
+            put(r, c_idx, r, c_idx, h, font_header, fill_subject, center)
+        r += 1
+
+        subject_rows = 0
+        for n in sub_nums:
+            code = get(row, f"Sub{n} Code")
+            if str(code).strip() == "":
+                continue
+            title = get(row, f"Sub{n} Course Title")
+            values = [
+                code,
+                title,
+                get(row, f"Sub{n} IA Marks", True),
+                get(row, f"Sub{n} TH Marks", True),
+                get(row, f"Sub{n} Total Marks", True),
+                get(row, f"Sub{n} Grade"),
+                get(row, f"Sub{n} GP", True),
+                get(row, f"Sub{n} Credits (C)", True),
+                get(row, f"Sub{n} CG", True),
+            ]
+            is_failed = "F" in str(values[5]).strip()
+            for c_idx, v in enumerate(values, start=1):
+                v_str = str(v)
+                if is_failed:
+                    fill_c, font_c = fill_fail, font_fail
+                elif "$" in v_str:
+                    fill_c, font_c = fill_carried, font_normal
+                elif (
+                    exam_type == "Re-examination"
+                    and c_idx in (3, 4)
+                    and v_str not in ["", "--", "NV", "AB", "NaN", "nan"]
+                ):
+                    fill_c, font_c = fill_fresh, font_normal
+                else:
+                    fill_c, font_c = None, font_normal
+                put(r, c_idx, r, c_idx, v, font_c, fill_c, left if c_idx == 2 else center)
+            if len(str(title)) > 52:
+                ws.row_dimensions[r].height = 30
+            r += 1
+            subject_rows += 1
+
+        if subject_rows == 0:
+            put(r, 1, r, 9, "No subject-wise data available for this student.", font_normal, None, center)
+            r += 1
+
+        # -- 3. Semester details (left) + Overall result details (right) ------
+        put(r, 1, r, 5, "Semester Details", font_header, fill_semester, center)
+        put(r, 6, r, 9, "Overall Result Details", font_header, fill_final, center)
+        r += 1
+        for c_idx, h in enumerate(sem_headers, start=1):
+            put(r, c_idx, r, c_idx, h, font_header, fill_semester, center)
+        put(r, 6, r, 7, "Metric", font_header, fill_final, center)
+        put(r, 8, r, 9, "Value", font_header, fill_final, center)
+        r += 1
+
+        sem_rows = []
+        for s in sem_names:
+            vals = [
+                get(row, f"Sem_{s}_Credits", True),
+                get(row, f"Sem_{s}_SGPA", True),
+                get(row, f"Sem_{s}_Attempts"),
+                get(row, f"Sem_{s}_Fail_Info"),
+            ]
+            if any(str(v).strip() != "" for v in vals):
+                sem_rows.append([f"Semester {s}"] + vals)
+
+        block_rows = max(len(sem_rows), len(overall_items), 1)
+        for k in range(block_rows):
+            if k < len(sem_rows):
+                for c_idx, v in enumerate(sem_rows[k], start=1):
+                    put(
+                        r + k, c_idx, r + k, c_idx, v, font_normal, None, center,
+                        fmt="0.00" if c_idx == 3 else None,
+                    )
+            elif k == 0:
+                put(r, 1, r, 5, "No semester data available.", font_normal, None, center)
+
+            if k < len(overall_items):
+                label, numeric, fmt = overall_items[k]
+                v = get(row, label, numeric)
+                bad = label in ("Result Status", "Eligibility Status") and (
+                    "Unsuccessful" in str(v) or "Not Eligible" in str(v)
+                )
+                put(r + k, 6, r + k, 7, label, font_label, fill_label, left)
+                put(
+                    r + k, 8, r + k, 9, v,
+                    font_bad if bad else font_value_bold, None, center,
+                    fmt=fmt if isinstance(v, (int, float)) else None,
+                )
+                if label == "Eligibility Status" and len(str(v)) > 22:
+                    ws.row_dimensions[r + k].height = 30
+        r += block_rows
+
+        # -- spacer between students ------------------------------------------
+        r += 2
+
+    # ---- print setup: fit all 9 columns on one page width --------------------
+    ws.page_setup.orientation = "portrait"
+    ws.page_setup.fitToWidth = 1
+    ws.page_setup.fitToHeight = 0
+    ws.sheet_properties.pageSetUpPr = PageSetupProperties(fitToPage=True)
+    return ws
 
 
 def render_detailed_table_html(df, exam_type="Regular"):
