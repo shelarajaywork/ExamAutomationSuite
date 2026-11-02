@@ -174,8 +174,8 @@ RULES = {
     'RG-08': (ERR, 'Range & Limits', 'Sem Actual + Sem Grace <= Sem Actual (Max)'),
     'CA-01': (ERR, 'Calculation', 'Composite Score (Max) = Internal (Max) + Sem (Max)'),
     'CA-02': (ERR, 'Calculation', 'Composite Score = Internal Actual + Sem Actual + Sem Grace'),
-    'CA-03': (ERR, 'Calculation', 'Internal Total Marks = Internal Actual'),
-    'CA-04': (ERR, 'Calculation', 'Semester Total Marks = Sem Actual + Sem Grace'),
+    'CA-03': (ERR, 'Calculation', 'Internal Total Marks = Internal Actual (absent status must match)'),
+    'CA-04': (ERR, 'Calculation', 'Semester Total Marks = Sem Actual + Sem Grace (absent status must match)'),
     'CA-05': (ERR, 'Calculation', 'Overall Grade matches grade scale applied to reported Composite %'),
     'CA-06': (ERR, 'Calculation', 'Overall Grade matches grade scale applied to recalculated Composite %'),
     'CA-07': (ERR, 'Calculation', 'Overall Grade is a valid grade (O, A+, A, B+, B, C, P, F)'),
@@ -190,9 +190,12 @@ RULES = {
     'BR-05': (ERR, 'Business Rules', 'Special result codes recognised (Z1, Z3)'),
     'BR-06': (WARN, 'Business Rules', 'Special code not replaced by marks after gracing'),
     'BR-07': (ERR, 'Business Rules', 'No grace awarded to AB / UFM candidates'),
+    'BR-08': (ERR, 'Business Rules', 'Scale NABS only on Internal/Sem rows and only with absent code Z1'),
+    'BR-09': (WARN, 'Business Rules', 'Absent code Z1 on Internal/Sem rows carries scale NABS'),
+    'BR-10': (ERR, 'Business Rules', '40% pass mark in EACH component (Internal; Sem Actual + Sem Grace) else grade F'),
     'GR-01': (WARN, 'Gracing', 'Grace marks within normal limits (per subject)'),
     'GR-02': (WARN, 'Gracing', 'Total grace per student and graced-subject count within normal limits'),
-    'GR-03': (WARN, 'Gracing', 'Grace awarded only where the subject would otherwise fail'),
+    'GR-03': (WARN, 'Gracing', 'Grace awarded only where Sem (or the subject) would otherwise fail'),
     'GR-04': (WARN, 'Gracing', 'Grace awarded but subject still fails'),
     'GR-05': (WARN, 'Gracing', '"Grace on Total marks" is zero / reflected in Composite'),
     'GR-06': (WARN, 'Gracing', 'Marks unchanged between before/after gracing unless grace awarded'),
@@ -262,6 +265,7 @@ class AuditResult:
         self.trail = []             # per subject recalculation rows
         self.student_rows = []      # per student audit status rows
         self.stats = {}
+        self.ref_max = {}
         self._flags = defaultdict(lambda: {'cols': {}, 'remarks': []})
 
     # ---- recording ------------------------------------------------------
@@ -396,6 +400,17 @@ def run_audit(raw_df):
         if a and p and S(r, 'Student Name').upper() not in SUMMARY_NAMES:
             addl_map[a].add(p)
 
+    # Reference component maxima per module (from rows whose scale is not NABS); used to resolve the
+    # maximum of an absent (scale NABS) component.
+    _rc = defaultdict(Counter)
+    for r in records:
+        code = S(r, 'Appraisal Type Code')
+        if code in ('Internal Actual', 'Sem Actual') and S(r, 'Scale').upper() != 'NABS':
+            mx = scale_max(S(r, 'Scale'))
+            if mx:
+                _rc[(S(r, 'Module Code'), code)][mx] += 1
+    A.ref_max = {k: c.most_common(1)[0][0] for k, c in _rc.items()}
+
     module_obs = defaultdict(list)      # module -> list of (student, name, desc, maxes, rows)
     module_ref = defaultdict(lambda: {'desc': Counter(), 'credit': Counter()})
     student_modules = {}
@@ -518,6 +533,17 @@ def run_audit(raw_df):
             int_max = scale_max(first('Internal Actual').get('Scale', '')) if first('Internal Actual') else None
             sem_max = scale_max(first('Sem Actual').get('Scale', '')) if first('Sem Actual') else None
             comp_max = scale_max(first('Composite Score').get('Scale', '')) if first('Composite Score') else None
+            # Scale NABS = candidate absent: component max is not stated, so resolve it from the module reference
+            int_nabs = bool(first('Internal Actual')) and _sv(first('Internal Actual').get('Scale', '')).upper() == 'NABS'
+            sem_nabs = bool(first('Sem Actual')) and _sv(first('Sem Actual').get('Scale', '')).upper() == 'NABS'
+            if int_nabs:
+                int_max = A.ref_max.get((m_code, 'Internal Actual'))
+                if int_max is None and comp_max and sem_max and not sem_nabs and comp_max > sem_max:
+                    int_max = comp_max - sem_max
+            if sem_nabs:
+                sem_max = A.ref_max.get((m_code, 'Sem Actual'))
+                if sem_max is None and comp_max and int_max and not int_nabs and comp_max > int_max:
+                    sem_max = comp_max - int_max
 
             # A subject may legitimately have no Internal (or no Sem) component: all its entries blank/missing
             # and max zero/blank. Such a component is "not applicable" - not an error.
@@ -602,11 +628,32 @@ def run_audit(raw_df):
             for lbl, mx, code in (('Internal Actual (Max)', int_max, 'Internal Actual'),
                                   ('Sem Actual (Max)', sem_max, 'Sem Actual'),
                                   ('Composite Score (Max)', comp_max, 'Composite Score')):
-                if first(code) is not None and not ((code == 'Internal Actual' and int_absent) or (code == 'Sem Actual' and sem_absent)):
+                if first(code) is not None and not ((code == 'Internal Actual' and (int_absent or int_nabs)) or (code == 'Sem Actual' and (sem_absent or sem_nabs))):
                     scale_txt = _sv(first(code).get('Scale', ''))
                     A.check('RG-03', mx is not None and mx > 0, rows=xl(code), field=lbl, expected='> 0',
                             actual=scale_txt or '(blank)', cols=[lbl],
                             message=f"{lbl} is invalid (scale '{scale_txt or 'blank'}').", **ctx)
+            # NABS scale / Z1 consistency
+            for code in ('Internal Actual', 'Internal Total Marks', 'Sem Actual', 'Semester Total Marks'):
+                r_ = first(code)
+                if r_ is None:
+                    continue
+                sc = _sv(r_.get('Scale', '')).upper()
+                v_ = vals[code]
+                is_ab = v_['kind'] == 'code' and v_['code'] == 'AB'
+                if sc == 'NABS':
+                    A.check('BR-08', is_ab, rows=xl(code), field=code, expected='Z1 (absent)', actual=v_['raw'] or '(blank)',
+                            cols=[col_of[code]],
+                            message=f"'{code}' has scale NABS (absent) but marks are '{v_['raw'] or 'blank'}' - NABS requires Z1.", **ctx)
+                if is_ab:
+                    A.check('BR-09', sc == 'NABS', rows=xl(code), field=code, expected='scale NABS',
+                            actual=sc or '(blank)', cols=[col_of[code]],
+                            message=f"'{code}' is Z1 (absent) but its scale is '{sc or 'blank'}' instead of NABS.", **ctx)
+            for code in ('Composite Score', 'Sem Grace', 'Grace on Total marks'):
+                r_ = first(code)
+                if r_ is not None and _sv(r_.get('Scale', '')).upper() == 'NABS':
+                    A.check('BR-08', False, rows=xl(code), field=code, expected='numeric scale', actual='NABS',
+                            cols=[col_of[code]], message=f"Scale NABS is not valid for '{code}'.", **ctx)
             valid_max = {'int': int_absent or (int_max is not None and int_max > 0),
                          'sem': sem_absent or (sem_max is not None and sem_max > 0),
                          'comp': comp_max is not None and comp_max > 0}
@@ -663,12 +710,24 @@ def run_audit(raw_df):
                         cols=['Composite Score'],
                         message=f"Composite Score {_fmt(c_num)} != Internal {_fmt(i_num)} + Sem {_fmt(s_num_v)} + "
                                 f"Grace {_fmt(g_num)} = {_fmt(rec_comp)}.", **ctx)
-            if v_itot['kind'] == 'num' and v_int['kind'] in ('num', 'code'):
+            if v_int['kind'] == 'code' or v_itot['kind'] == 'code':
+                A.check('CA-03', v_int['kind'] == v_itot['kind'] == 'code' and v_int['code'] == v_itot['code'],
+                        rows=xl('Internal Total Marks'), field='Internal Total Marks',
+                        expected=v_int['raw'] or '(blank)', actual=v_itot['raw'] or '(blank)', cols=['Internal Actual'],
+                        message=f"Internal Total Marks '{v_itot['raw'] or 'blank'}' does not match Internal Actual "
+                                f"'{v_int['raw'] or 'blank'}' (absent status must be the same).", **ctx)
+            elif v_itot['kind'] == 'num' and v_int['kind'] in ('num', 'code'):
                 A.check('CA-03', abs(v_itot['num'] - i_num) < MARK_TOLERANCE, rows=xl('Internal Total Marks'),
                         field='Internal Total Marks', expected=_fmt(i_num), actual=_fmt(v_itot['num']),
                         cols=['Internal Actual'],
                         message=f"Internal Total Marks {_fmt(v_itot['num'])} != Internal Actual {_fmt(i_num)}.", **ctx)
-            if v_stot['kind'] == 'num' and v_sem['kind'] in ('num', 'code') and v_gr['kind'] in ('num', 'blank', 'code'):
+            if v_sem['kind'] == 'code' or v_stot['kind'] == 'code':
+                A.check('CA-04', v_sem['kind'] == v_stot['kind'] == 'code' and v_sem['code'] == v_stot['code'],
+                        rows=xl('Semester Total Marks'), field='Semester Total Marks',
+                        expected=v_sem['raw'] or '(blank)', actual=v_stot['raw'] or '(blank)', cols=['Sem Actual'],
+                        message=f"Semester Total Marks '{v_stot['raw'] or 'blank'}' does not match Sem Actual "
+                                f"'{v_sem['raw'] or 'blank'}' (absent status must be the same).", **ctx)
+            elif v_stot['kind'] == 'num' and v_sem['kind'] in ('num', 'code') and v_gr['kind'] in ('num', 'blank', 'code'):
                 A.check('CA-04', abs(v_stot['num'] - (s_num_v + g_num)) < MARK_TOLERANCE,
                         rows=xl('Semester Total Marks'), field='Semester Total Marks',
                         expected=_fmt(s_num_v + g_num), actual=_fmt(v_stot['num']),
@@ -687,6 +746,24 @@ def run_audit(raw_df):
             if rec_comp is not None and rec_comp_max:
                 pct_rec = rec_comp * 100.0 / rec_comp_max
                 exp_rec = grade_for_percentage(pct_rec)
+
+            # 40% pass mark applies to EACH component. Sem % always uses Sem Actual + Sem Grace.
+            int_pct = sem_pct = None
+            reasons, fail_cols = [], []
+            if v_int['kind'] == 'num' and not int_absent and int_max and int_max > 0:
+                int_pct = i_num * 100.0 / int_max
+                if int_pct < 40 - 1e-9:
+                    reasons.append(f"Internal {_fmt(i_num)}/{_fmt(int_max)} = {int_pct:.2f}% (< 40%)")
+                    fail_cols.append('Internal Actual')
+            if v_sem['kind'] == 'num' and not sem_absent and sem_max and sem_max > 0:
+                sem_pct = (s_num_v + g_num) * 100.0 / sem_max
+                if sem_pct < 40 - 1e-9:
+                    reasons.append(f"Sem (Actual {_fmt(s_num_v)} + Grace {_fmt(g_num)} = {_fmt(s_num_v + g_num)})"
+                                   f"/{_fmt(sem_max)} = {sem_pct:.2f}% (< 40%)")
+                    fail_cols.append('Sem Actual')
+            comp_fail = bool(reasons)
+            if comp_fail:
+                exp_rep = exp_rec = 'F'
 
             if grade:
                 A.check('CA-07', grade in VALID_GRADES or (forced_fail and grade in KNOWN_SPECIAL),
@@ -709,7 +786,14 @@ def run_audit(raw_df):
                     A.check('BR-07', False, rows=xl('Sem Grace'), field='Sem Grace', expected='0',
                             actual=_fmt(g_num), cols=['Sem Grace'],
                             message=f"Grace {_fmt(g_num)} awarded to a candidate marked {'/'.join(sorted(codes))}.", **ctx)
+            elif grade in VALID_GRADES and comp_fail:
+                A.check('BR-10', grade == 'F', rows=xl('Overall Grade'), field='Overall Grade', expected='F',
+                        actual=grade_raw, cols=['Overall Grade'] + fail_cols,
+                        message=f"Component below the 40% pass mark: {'; '.join(reasons)} - subject must be F, "
+                                f"but Overall Grade is '{grade_raw}'.", **ctx)
             elif grade in VALID_GRADES:
+                if int_pct is not None or sem_pct is not None:
+                    A.check('BR-10', True)
                 if exp_rep is not None:
                     A.check('CA-05', grade == exp_rep, rows=xl('Overall Grade'), field='Overall Grade',
                             expected=exp_rep, actual=grade_raw, cols=['Overall Grade'],
@@ -777,20 +861,28 @@ def run_audit(raw_df):
                         expected=f'<= {_fmt(limit)}', actual=_fmt(g_num), cols=['Sem Grace'],
                         message=f"Abnormal grace of {_fmt(g_num)} marks (normal limit {_fmt(limit)}: "
                                 f"{MAX_GRACE_ABS} marks / {MAX_GRACE_PCT_OF_SEM:g}% of Sem Max).", **ctx)
-                if valid_max['comp'] and rec_comp is not None:
-                    pre = (i_num + s_num_v) * 100.0 / comp_max
-                    A.check('GR-03', pre < 40 - 1e-9, rows=xl('Sem Grace'), field='Sem Grace',
-                            expected='grace only when < 40% before grace', actual=f'{pre:.2f}% before grace',
-                            cols=['Sem Grace'],
-                            message=f"Grace {_fmt(g_num)} awarded although the subject is already "
-                                    f"{pre:.2f}% (>= 40%) without grace.", **ctx)
-                    post_grade, post_pct = (exp_rec, pct_rec) if exp_rec is not None else (exp_rep, pct_rep)
-                    if post_grade is not None and not forced_fail:
-                        A.check('GR-04', post_grade != 'F', rows=xl('Sem Grace'), field='Sem Grace',
-                                expected='subject clears pass mark', actual='still F',
-                                cols=['Sem Grace', 'Overall Grade'],
-                                message=f"Grace {_fmt(g_num)} awarded but subject still fails "
-                                        f"({post_pct:.2f}% after grace).", **ctx)
+                pre_sem = (s_num_v * 100.0 / sem_max) if (valid_max['sem'] and sem_max) else None
+                pre_comp = ((i_num + s_num_v) * 100.0 / comp_max) if (valid_max['comp'] and comp_max) else None
+                if pre_sem is not None or pre_comp is not None:
+                    needed = (pre_sem is not None and pre_sem < 40 - 1e-9) or (pre_comp is not None and pre_comp < 40 - 1e-9)
+                    txt = []
+                    if pre_sem is not None:
+                        txt.append(f"Sem {_fmt(s_num_v)}/{_fmt(sem_max)} = {pre_sem:.2f}%")
+                    if pre_comp is not None:
+                        txt.append(f"Composite {pre_comp:.2f}%")
+                    A.check('GR-03', needed, rows=xl('Sem Grace'), field='Sem Grace',
+                            expected='grace only when Sem or subject < 40% before grace',
+                            actual=' / '.join(txt) + ' before grace', cols=['Sem Grace'],
+                            message=f"Grace {_fmt(g_num)} awarded although the subject already clears 40% in Sem and "
+                                    f"overall without it ({' / '.join(txt)}).", **ctx)
+                post_grade = exp_rec if exp_rec is not None else exp_rep
+                if post_grade is not None and not forced_fail:
+                    post_txt = '; '.join(reasons) if reasons else (
+                        f"{(pct_rec if pct_rec is not None else pct_rep):.2f}% after grace")
+                    A.check('GR-04', post_grade != 'F', rows=xl('Sem Grace'), field='Sem Grace',
+                            expected='subject clears pass mark', actual='still F',
+                            cols=['Sem Grace', 'Overall Grade'],
+                            message=f"Grace {_fmt(g_num)} awarded but subject still fails ({post_txt}).", **ctx)
 
             # ---- accumulate student-level numbers & trail -------------------
             if v_comp['kind'] in ('num', 'code'):
@@ -808,6 +900,8 @@ def run_audit(raw_df):
                 'Reported Composite': v_comp['raw'], 'Recalculated Composite': rec_comp,
                 'Reported Composite Max': comp_max, 'Recalculated Composite Max': rec_comp_max,
                 'Recalculated %': round(pct_rec, 2) if pct_rec is not None else None,
+                'Internal %': round(int_pct, 2) if int_pct is not None else None,
+                'Sem % (Actual+Grace)': round(sem_pct, 2) if sem_pct is not None else None,
                 'Reported Grade': grade_raw,
                 'Recalculated Grade': ('F' if forced_fail else (exp_rec or exp_rep or '')),
                 'Reported Status': status_raw,
@@ -1209,6 +1303,15 @@ def audit_only_excel_bytes(audit, source_name=""):
 # ==================================================
 # STEP 1: PROCESSED DATA GENERATION
 # ==================================================
+def _resolve_max(audit, m_code, code, scale_raw):
+    """(max number, max display) for a scale code. Scale NABS (absent) is resolved from the module reference."""
+    if str(scale_raw).strip().upper() == 'NABS' and audit is not None:
+        ref = getattr(audit, 'ref_max', {}).get((str(m_code).strip(), code))
+        if ref:
+            return float(ref), str(int(ref))
+    return parse_scale_num(scale_raw), parse_scale_str(scale_raw)
+
+
 def create_processed_data(df, target_student_ids=None, audit=None):
     """
     Restructures raw examination records into a clean student-wise dataset:
@@ -1318,11 +1421,9 @@ def create_processed_data(df, target_student_ids=None, audit=None):
             grace_display, g_num_val, grace_is_abs_ufm = parse_mark(grace_raw)
             comp_display, c_num_val, comp_is_abs_ufm = parse_mark(comp_raw)
 
-            int_max_num = parse_scale_num(int_scale_raw)
-            int_max_display = parse_scale_str(int_scale_raw)
+            int_max_num, int_max_display = _resolve_max(audit, m_code, 'Internal Actual', int_scale_raw)
 
-            sem_max_num = parse_scale_num(sem_scale_raw)
-            sem_max_display = parse_scale_str(sem_scale_raw)
+            sem_max_num, sem_max_display = _resolve_max(audit, m_code, 'Sem Actual', sem_scale_raw)
 
             comp_max_num = parse_scale_num(comp_scale_raw)
             comp_max_display = parse_scale_str(comp_scale_raw)
@@ -1350,7 +1451,8 @@ def create_processed_data(df, target_student_ids=None, audit=None):
 
             # 40% Minimum Passing Criteria Checks
             fail_int = (int_max_num > 0) and (i_num < 0.40 * int_max_num or int_is_abs_ufm)
-            fail_sem = (sem_max_num > 0) and (s_num_val < 0.40 * sem_max_num or sem_is_abs_ufm)
+            # 40% on Sem uses Sem Actual + Sem Grace
+            fail_sem = (sem_max_num > 0) and ((s_num_val + g_num_val) < 0.40 * sem_max_num or sem_is_abs_ufm)
             fail_comp = (comp_max_num > 0) and (c_num_val < 0.40 * comp_max_num or comp_is_abs_ufm)
 
             _emit({
