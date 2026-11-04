@@ -20,6 +20,12 @@ re-validates every student, subject and calculated field (see RULES below):
                      special codes (Z1 = AB, Z3 = UFM), abnormal / unjustified grace
   * Data integrity - duplicates, missing mandatory student details, missing or duplicate
                      appraisal entries, incomplete subject records, cohort inconsistencies
+  * Gracing rules  - Rule 1 no Internal grace; 2a absent => no regular grace; 2b one failed subject
+                     (shortfall <= 10, overall % before grace >= 50, grace <= 10); 2c several failed
+                     subjects (grace must pass ALL, <= 2% of subject max, total <= min(10, 2% of total
+                     max)); 3 LD (PwD) up to 3% of total max; 4 Ordinance 229 up to 10 marks.
+                     The category of each grace is read from the "Appraisal Remarks" column.
+                     Pass mark is 40% in EACH component; Sem % = (Sem Actual + Sem Grace) / Sem Max.
 
 Every discrepancy is painted RED fill + BOLD YELLOW font on the exact cell, with a plain
 language remark in the "Audit Remarks" column. Warnings use an amber fill. A full
@@ -133,10 +139,23 @@ STATUS_FAIL = ('completed unsuccessfuly', 'completed unsuccessfully')   # file s
 VALID_GENDERS = {'male', 'female', 'other', 'transgender'}
 SUMMARY_NAMES = ('TOTAL', 'PERCENTAGE')
 
-MAX_GRACE_ABS = 5            # grace in one subject above this many marks  -> warning
-MAX_GRACE_PCT_OF_SEM = 10.0  # ... or above this % of Sem max             -> warning
-MAX_GRACE_PER_STUDENT = 15   # total grace across all subjects of a student -> warning
-MAX_GRACED_SUBJECTS = 3      # number of subjects graced for one student   -> warning
+# ---- Gracing rules (Mumbai University Autonomy / college policy) ----------------
+GRACE_RULES = {
+    'pass_pct': 40.0,                 # pass mark in EACH component
+    'single_max_shortfall': 10.0,     # Rule 2b: fails ONE subject by this many marks or less ...
+    'single_min_overall_pct': 50.0,   #          ... and overall % before gracing >= this
+    'single_max_grace': 10.0,         #          ... then up to this many marks in that subject only
+    'multi_subject_cap_pct': 2.0,     # Rule 2c: per-subject grace <= 2% of Composite (Max)
+    'multi_total_cap_abs': 10.0,      #          total grace <= min(10 marks, 2% of total max)
+    'multi_total_cap_pct': 2.0,
+    'ld_cap_pct': 3.0,                # Rule 3: LD (PwD) up to 3% of total maximum marks
+    'ord229_cap': 10.0,               # Rule 4: Ordinance 229 up to 10 additional marks
+}
+# How the grace category is recognised: text found in the "Appraisal Remarks" column of the student's rows
+LD_TOKENS = ('LD', 'PWD')                       # whole-word match
+ORD229_KEYWORDS = ('229', 'ORDINANCE')          # substring match
+REGULAR_KEYWORDS = ('AUTONOMY',)                # e.g. "New Rule MU Autonomy"
+
 PERCENT_TOLERANCE = 0.011    # percentage in the file is rounded to 2 decimals
 MARK_TOLERANCE = 0.01
 
@@ -163,6 +182,7 @@ RULES = {
     'DI-11': (ERR, 'Data Integrity', 'Marks are numeric or a recognised result code'),
     'DI-12': (WARN, 'Data Integrity', 'Subject set of the student matches the cohort norm'),
     'DI-13': (ERR, 'Data Integrity', 'Exactly one TOTAL and one PERCENTAGE row per student'),
+    'DI-15': (WARN, 'Data Integrity', 'Overall Grade scale code consistent with the rest of the file'),
     'DI-14': (WARN, 'Data Integrity', 'Student Number format consistent; Gender value recognised; Credit > 0'),
     'RG-01': (ERR, 'Range & Limits', 'No negative marks or credits'),
     'RG-02': (ERR, 'Range & Limits', 'No negative grace marks'),
@@ -189,16 +209,23 @@ RULES = {
     'BR-04': (ERR, 'Business Rules', 'Special code (AB/UFM) in a component => subject graded F / unsuccessful'),
     'BR-05': (ERR, 'Business Rules', 'Special result codes recognised (Z1, Z3)'),
     'BR-06': (WARN, 'Business Rules', 'Special code not replaced by marks after gracing'),
-    'BR-07': (ERR, 'Business Rules', 'No grace awarded to AB / UFM candidates'),
-    'BR-08': (ERR, 'Business Rules', 'Scale NABS only on Internal/Sem rows and only with absent code Z1'),
-    'BR-09': (WARN, 'Business Rules', 'Absent code Z1 on Internal/Sem rows carries scale NABS'),
+    'BR-08': (ERR, 'Business Rules', 'Scale NABS only on Internal/Sem rows and only with a result code (Z1 / Z3)'),
+    'BR-09': (WARN, 'Business Rules', 'Result code (Z1 / Z3) on Internal/Sem rows carries scale NABS'),
     'BR-10': (ERR, 'Business Rules', '40% pass mark in EACH component (Internal; Sem Actual + Sem Grace) else grade F'),
-    'GR-01': (WARN, 'Gracing', 'Grace marks within normal limits (per subject)'),
-    'GR-02': (WARN, 'Gracing', 'Total grace per student and graced-subject count within normal limits'),
-    'GR-03': (WARN, 'Gracing', 'Grace awarded only where Sem (or the subject) would otherwise fail'),
-    'GR-04': (WARN, 'Gracing', 'Grace awarded but subject still fails'),
-    'GR-05': (WARN, 'Gracing', '"Grace on Total marks" is zero / reflected in Composite'),
-    'GR-06': (WARN, 'Gracing', 'Marks unchanged between before/after gracing unless grace awarded'),
+    'GR-01': (ERR, 'Gracing', 'Rule 1: no grace in the Internal component'),
+    'GR-02': (ERR, 'Gracing', 'Rule 2a: absent in any subject => no regular grace in any subject'),
+    'GR-03': (ERR, 'Gracing', 'Rule 2: regular grace only in a subject failing in Sem (Internal must pass)'),
+    'GR-04': (ERR, 'Gracing', 'Rule 2b: ONE failed subject - shortfall <= 10, overall % before grace >= 50, grace <= 10'),
+    'GR-05': (ERR, 'Gracing', 'Rule 2c: several failed subjects - grace must make ALL failed subjects pass'),
+    'GR-06': (ERR, 'Gracing', 'Rule 2c: grace in a subject <= 2% of its Composite (Max)'),
+    'GR-07': (ERR, 'Gracing', 'Rule 2c: total grace <= lower of 10 marks and 2% of total maximum marks'),
+    'GR-08': (ERR, 'Gracing', 'Rule 3: LD (PwD) grace <= 3% of total maximum marks (+ any regular-rule entitlement)'),
+    'GR-09': (ERR, 'Gracing', 'Rule 4: Ordinance 229 grace <= 10 marks'),
+    'GR-10': (WARN, 'Gracing', 'Regular grace equals the marks needed to pass (not short, not excessive)'),
+    'GR-11': (WARN, 'Gracing', 'LD grace distributed to pass the maximum number of failed subjects'),
+    'GR-12': (WARN, 'Gracing', 'Grace category identifiable from remarks (LD / MU Autonomy / Ordinance 229)'),
+    'GR-13': (WARN, 'Gracing', '"Grace on Total marks" is zero / reflected in Composite'),
+    'GR-14': (WARN, 'Gracing', 'Actual marks unchanged between before/after gracing'),
 }
 
 
@@ -255,6 +282,314 @@ def grade_for_percentage(pct):
     return 'F'
 
 
+def _grace_category(remark):
+    """(category, recognised) from an Appraisal Remarks text."""
+    u = _sv(remark).upper()
+    if not u:
+        return 'REGULAR', False
+    toks = re.findall(r'[A-Z0-9]+', u)
+    if any(t in LD_TOKENS for t in toks):
+        return 'LD', True
+    if any(k in u for k in ORD229_KEYWORDS):
+        return 'ORD229', True
+    if any(k in u for k in REGULAR_KEYWORDS):
+        return 'REGULAR', True
+    return 'REGULAR', False
+
+
+def _is_ld_remark(remark):
+    toks = re.findall(r'[A-Z0-9]+', _sv(remark).upper())
+    return any(t in LD_TOKENS for t in toks)
+
+
+def _regular_allowance(subjects, total_max, pre_pct, has_absent):
+    """Upper bound of grace the REGULAR rules (2b / 2c) could give this student."""
+    R = GRACE_RULES
+    if has_absent:
+        return 0.0
+    failing = [s for s in subjects if s['fail_pre']]
+    if not failing:
+        return 0.0
+    if len(failing) == 1:
+        f = failing[0]
+        if f['int_fail'] or not f['sem_fail_pre']:
+            return 0.0
+        return R['single_max_grace'] if (f['shortfall'] <= R['single_max_shortfall'] + 1e-9
+                                         and pre_pct >= R['single_min_overall_pct'] - 1e-9) else 0.0
+    cap_total = min(R['multi_total_cap_abs'], R['multi_total_cap_pct'] * total_max / 100.0)
+    ok = all((not s['int_fail']) and s['sem_fail_pre'] and
+             s['shortfall'] <= R['multi_subject_cap_pct'] * s['comp_max'] / 100.0 + 1e-9 for s in failing)
+    return cap_total if (ok and sum(s['shortfall'] for s in failing) <= cap_total + 1e-9) else 0.0
+
+
+def _audit_grace(A, stu, name, subjects, ld_student):
+    """Applies gracing Rules 1-4 to one student. `subjects` = per-subject facts collected in run_audit."""
+    R = GRACE_RULES
+    graced = [s for s in subjects if s['g'] > 0]
+    total_max = sum(s['comp_max'] for s in subjects if s['comp_max'])
+    pre_marks = sum(s['pre_marks'] for s in subjects if s['comp_max'])
+    pre_pct = (pre_marks * 100.0 / total_max) if total_max else 0.0
+    failing = [s for s in subjects if s['fail_pre']]
+    absent = [s for s in subjects if s['absent']]
+    info = dict(pre_pct=pre_pct, nfail=len(failing), total_grace=sum(s['g'] for s in graced),
+                total_max=total_max)
+    if not graced:
+        return info
+
+    def ctx(s):
+        return dict(student=stu, name=name, module=s['module'], desc=s['desc'], rows=s['grace_rows'])
+
+    # ---- category recognition ------------------------------------------------
+    for s in graced:
+        A.check('GR-12', s['cat_ok'], field='Sem Grace', expected='LD / New Rule MU Autonomy / Ordinance 229',
+                actual=s['remark'] or '(blank)', cols=['Sem Grace'],
+                message=f"Grace {_fmt(s['g'])} has no recognisable category in Appraisal Remarks "
+                        f"('{s['remark'] or 'blank'}') - treated as a regular (Rule 2) grace.", **ctx(s))
+
+    reg = [s for s in graced if s['cat'] == 'REGULAR']
+    ld = [s for s in graced if s['cat'] == 'LD']
+    o229 = [s for s in graced if s['cat'] == 'ORD229']
+    fail_names = ', '.join(s['module'] for s in failing) or 'none'
+
+    # ---- Rule 4: Ordinance 229 -------------------------------------------------
+    if o229:
+        tot = sum(s['g'] for s in o229)
+        A.check('GR-09', tot <= R['ord229_cap'] + 1e-9, field='Sem Grace (Ordinance 229)',
+                expected=f"<= {_fmt(R['ord229_cap'])}", actual=_fmt(tot), cols=['Sem Grace'],
+                message=f"Ordinance 229 grace totals {_fmt(tot)} marks; maximum is {_fmt(R['ord229_cap'])}.",
+                **ctx(o229[0]))
+
+    # ---- Rule 3: LD (PwD) ---------------------------------------------------------
+    if ld:
+        ld_cap = R['ld_cap_pct'] * total_max / 100.0
+        reg_allow = _regular_allowance(subjects, total_max, pre_pct, bool(absent))
+        pool = ld + (reg if ld_student else [])
+        pool_total = sum(s['g'] for s in pool)
+        A.check('GR-08', pool_total <= ld_cap + reg_allow + 1e-9, field='Sem Grace (LD)',
+                expected=f"<= {_fmt(ld_cap + reg_allow)}", actual=_fmt(pool_total), cols=['Sem Grace'],
+                message=f"LD (PwD) student received {_fmt(pool_total)} grace marks; allowed {_fmt(ld_cap)} "
+                        f"({R['ld_cap_pct']:g}% of {_fmt(total_max)}) + {_fmt(reg_allow)} under the regular rules "
+                        f"= {_fmt(ld_cap + reg_allow)}.", **ctx(ld[0]))
+        # distribution: grace should be used where it can turn a fail into a pass
+        fixable = [s for s in failing if (not s['absent']) and (not s['int_fail']) and s['sem_fail_pre']]
+        for s in pool:
+            can_fix = (not s['absent']) and (not s['int_fail']) and s['sem_fail_pre']
+            A.check('GR-11', can_fix, field='Sem Grace', expected='grace in a subject it can help pass',
+                    actual='subject cannot be passed by Sem grace', cols=['Sem Grace'],
+                    message=f"LD grace {_fmt(s['g'])} given in a subject that Sem grace cannot help pass "
+                            f"({'absent' if s['absent'] else 'fails in Internal' if s['int_fail'] else 'already passes in Sem'}).",
+                    **ctx(s))
+        budget = ld_cap + reg_allow
+        left, best = budget, 0
+        for s in sorted(fixable, key=lambda x: x['shortfall']):
+            if s['shortfall'] <= left + 1e-9:
+                left -= s['shortfall']
+                best += 1
+        passed_now = sum(1 for s in fixable if s['post_pass'])
+        if fixable:
+            A.check('GR-11', passed_now >= best, student=stu, name=name, field='Sem Grace (LD distribution)',
+                    rows=ld[0]['grace_rows'], module=ld[0]['module'], desc=ld[0]['desc'],
+                    expected=f"{best} failed subject(s) passed", actual=f"{passed_now} passed", cols=['Sem Grace'],
+                    message=f"LD grace should pass the maximum possible number of failed subjects: within "
+                            f"{_fmt(budget)} marks {best} could be passed, but only {passed_now} are.")
+
+    # ---- Rule 1/2: regular grace ----------------------------------------------------
+    if reg:
+        if absent:
+            for s in reg:
+                A.check('GR-02', False, field='Sem Grace', expected='no grace (student absent)',
+                        actual=_fmt(s['g']), cols=['Sem Grace'],
+                        message=f"Grace {_fmt(s['g'])} awarded but the student is absent in "
+                                f"{', '.join(a['module'] for a in absent)} - not eligible for regular grace.", **ctx(s))
+        else:
+            A.checked['GR-02'] += 1
+            for s in reg:
+                if not s['sem_fail_pre']:
+                    A.check('GR-03', False, field='Sem Grace', expected='grace only in a failing subject',
+                            actual=_fmt(s['g']), cols=['Sem Grace'],
+                            message=f"Grace {_fmt(s['g'])} awarded but the subject does not fail in Sem "
+                                    f"(Sem {_fmt(s['sem'])}/{_fmt(s['sem_max'])} = {s['sem_pre_pct']:.2f}% >= 40%).", **ctx(s))
+                elif s['int_fail']:
+                    A.check('GR-03', False, field='Sem Grace', expected='Internal must pass',
+                            actual=_fmt(s['g']), cols=['Sem Grace', 'Internal Actual'],
+                            message=f"Grace {_fmt(s['g'])} awarded in a subject that also fails Internal "
+                                    f"({s['int_pct']:.2f}% < 40%); Internal cannot be graced, so the subject stays failed.", **ctx(s))
+                else:
+                    A.checked['GR-03'] += 1
+            reg_total = sum(s['g'] for s in reg)
+            if len(failing) == 1:
+                f = failing[0]
+                anchor = next((s for s in reg if s is f), reg[0])
+                if f['sem_fail_pre'] and not f['int_fail']:
+                    A.check('GR-04', f['shortfall'] <= R['single_max_shortfall'] + 1e-9, field='Shortfall',
+                            expected=f"<= {_fmt(R['single_max_shortfall'])}", actual=_fmt(f['shortfall']),
+                            cols=['Sem Grace', 'Sem Actual'],
+                            message=f"Student fails only {f['module']} by {_fmt(f['shortfall'])} marks (Sem {_fmt(f['sem'])}, "
+                                    f"pass {_fmt(f['pass_mark'])}); grace needs a shortfall of {_fmt(R['single_max_shortfall'])} "
+                                    f"marks or less.", **ctx(anchor))
+                A.check('GR-04', pre_pct >= R['single_min_overall_pct'] - 1e-9, field='Overall % before gracing',
+                        expected=f">= {_fmt(R['single_min_overall_pct'])}%", actual=f"{pre_pct:.2f}%", cols=['Sem Grace'],
+                        message=f"Overall percentage before gracing is {pre_pct:.2f}% (< {_fmt(R['single_min_overall_pct'])}%) "
+                                f"- not eligible for grace.", **ctx(anchor))
+                A.check('GR-04', reg_total <= R['single_max_grace'] + 1e-9, field='Sem Grace',
+                        expected=f"<= {_fmt(R['single_max_grace'])}", actual=_fmt(reg_total), cols=['Sem Grace'],
+                        message=f"Grace of {_fmt(reg_total)} marks exceeds the {_fmt(R['single_max_grace'])}-mark limit "
+                                f"for a single failed subject.", **ctx(anchor))
+                if f['sem_fail_pre'] and not f['int_fail']:
+                    g_f = sum(s['g'] for s in reg if s is f)
+                    need = f['shortfall']
+                    A.check('GR-10', abs(g_f - need) < 1e-9, field='Sem Grace',
+                            expected=f"{_fmt(need)} (marks needed to pass)", actual=_fmt(g_f), cols=['Sem Grace'],
+                            message=(f"Grace {_fmt(g_f)} does not lift {f['module']} to the Sem pass mark "
+                                     f"{_fmt(f['pass_mark'])} (needs {_fmt(need)})." if g_f < need else
+                                     f"Grace {_fmt(g_f)} is more than the {_fmt(need)} marks needed to pass {f['module']}."),
+                            **ctx(anchor))
+            elif len(failing) > 1:
+                for f in failing:
+                    anchor = next((s for s in reg if s is f), None)
+                    if anchor is None:
+                        # failing subject got no grace -> it cannot pass
+                        A.check('GR-05', False, student=stu, name=name, module=f['module'], desc=f['desc'],
+                                rows=f['grace_rows'], field='Failed subject', expected='passes after grace',
+                                actual='still fails', cols=['Sem Actual', 'Sem Grace'],
+                                message=f"Student fails {len(failing)} subjects ({fail_names}); regular grace is allowed "
+                                        f"only if ALL failed subjects pass, but {f['module']} gets no grace and still fails.")
+                    else:
+                        A.check('GR-05', f['post_pass'], field='Failed subject', expected='passes after grace',
+                                actual='still fails', cols=['Sem Actual', 'Sem Grace'],
+                                message=f"Student fails {len(failing)} subjects ({fail_names}); regular grace is allowed "
+                                        f"only if ALL failed subjects pass, but {f['module']} still fails after "
+                                        f"grace {_fmt(f['g'])} ({f['post_reason']}).", **ctx(anchor))
+                for s in reg:
+                    cap = R['multi_subject_cap_pct'] * s['comp_max'] / 100.0
+                    A.check('GR-06', s['g'] <= cap + 1e-9, field='Sem Grace', expected=f"<= {_fmt(cap)}",
+                            actual=_fmt(s['g']), cols=['Sem Grace'],
+                            message=f"Grace {_fmt(s['g'])} exceeds {R['multi_subject_cap_pct']:g}% of Composite (Max) "
+                                    f"{_fmt(s['comp_max'])} = {_fmt(cap)} marks.", **ctx(s))
+                cap_t = min(R['multi_total_cap_abs'], R['multi_total_cap_pct'] * total_max / 100.0)
+                A.check('GR-07', reg_total <= cap_t + 1e-9, field='Sem Grace (total)', expected=f"<= {_fmt(cap_t)}",
+                        actual=_fmt(reg_total), cols=['Sem Grace'],
+                        message=f"Total regular grace {_fmt(reg_total)} exceeds the limit {_fmt(cap_t)} (lower of "
+                                f"{_fmt(R['multi_total_cap_abs'])} marks and {R['multi_total_cap_pct']:g}% of total "
+                                f"maximum {_fmt(total_max)}).", **ctx(reg[0]))
+            else:
+                pass   # no failing subject: every grace row already flagged by GR-03
+    return info
+
+
+def _justify_grace(A, stu, name, subjects, ld_student, info):
+    """
+    Writes, for every grace award, a justification against the gracing rules into the Audit Remarks
+    (A.note) and into A.grace_register. Each condition is shown with a tick / cross and the real numbers.
+    """
+    R = GRACE_RULES
+    graced = [s for s in subjects if s['g'] > 0]
+    if not graced:
+        return
+    total_max, pre_pct = info['total_max'], info['pre_pct']
+    failing = [s for s in subjects if s['fail_pre']]
+    absent = [s for s in subjects if s['absent']]
+    reg = [s for s in graced if s['cat'] == 'REGULAR']
+    ld = [s for s in graced if s['cat'] == 'LD']
+    o229 = [s for s in graced if s['cat'] == 'ORD229']
+    fail_names = ', '.join(s['module'] for s in failing) or 'none'
+    reg_total = sum(s['g'] for s in reg)
+    ld_cap = R['ld_cap_pct'] * total_max / 100.0
+    reg_allow = _regular_allowance(subjects, total_max, pre_pct, bool(absent))
+    pool_total = sum(s['g'] for s in (ld + (reg if ld_student else [])))
+
+    for s in graced:
+        conds, outcome = [], ''
+        g, sem, smx = s['g'], s['sem'], s['sem_max']
+        post = (sem + g) * 100.0 / smx if smx else 0.0
+        post_txt = f"Sem {_fmt(sem)} + Grace {_fmt(g)} = {_fmt(sem + g)}/{_fmt(smx)} = {post:.2f}%"
+        outcome = (f"{post_txt} - Sem {'passes' if post >= R['pass_pct'] - 1e-9 else 'still below 40%'}"
+                   f"{'' if s['post_pass'] else ' / subject still fails'}")
+        pre_txt = (f"Sem {_fmt(sem)}/{_fmt(smx)} = {s['sem_pre_pct']:.2f}% (pass mark {_fmt(s['pass_mark'])})"
+                   if s['sem_pre_pct'] is not None else "Sem not available")
+
+        if s['cat'] == 'ORD229':
+            rule = 'Rule 4 - Ordinance 229'
+            tot = sum(x['g'] for x in o229)
+            conds.append((tot <= R['ord229_cap'] + 1e-9,
+                          f"total Ordinance 229 grace {_fmt(tot)} <= {_fmt(R['ord229_cap'])} marks"))
+            conds.append((True, "independent of failure status"))
+        elif s['cat'] == 'LD':
+            rule = 'Rule 3 - LD (PwD)'
+            conds.append((pool_total <= ld_cap + reg_allow + 1e-9,
+                          f"total LD grace {_fmt(pool_total)} <= {_fmt(ld_cap + reg_allow)} "
+                          f"({R['ld_cap_pct']:g}% of total max {_fmt(total_max)} = {_fmt(ld_cap)}"
+                          f"{' + ' + _fmt(reg_allow) + ' regular entitlement' if reg_allow else ''})"))
+            conds.append((True, "no subject-wise cap for LD grace"))
+            conds.append((s['sem_fail_pre'] and not s['int_fail'] and not s['absent'],
+                          f"grace used where it can help pass: {pre_txt}"
+                          if (s['sem_fail_pre'] and not s['int_fail'] and not s['absent']) else
+                          "grace used where it can help pass: subject cannot be passed by Sem grace"))
+        else:
+            conds.append((not absent, "Rule 2a - no absence in any subject" if not absent else
+                          f"Rule 2a - student absent in {', '.join(a['module'] for a in absent)}"))
+            fails_ok = s['sem_fail_pre'] and not s['int_fail']
+            if fails_ok:
+                conds.append((True, f"fails in Sem before grace: {pre_txt}; Internal passes "
+                                    f"({s['int_pct']:.2f}% >= 40%)" if s['int_pct'] is not None else
+                                    f"fails in Sem before grace: {pre_txt}"))
+            elif s['int_fail']:
+                conds.append((False, f"subject also fails Internal ({s['int_pct']:.2f}% < 40%) - Internal cannot be graced"))
+            else:
+                conds.append((False, f"subject does not fail in Sem before grace ({pre_txt})"))
+            if len(failing) == 1:
+                rule = 'Rule 2b - one failed subject' + ('' if s['cat_ok'] else ' (category not stated, treated as regular)')
+                f = failing[0]
+                conds.append((f is s, f"only failed subject is {f['module']}" if f is s else
+                              f"the only failed subject is {f['module']}, not this one"))
+                conds.append((f['shortfall'] <= R['single_max_shortfall'] + 1e-9,
+                              f"shortfall {_fmt(f['shortfall'])} <= {_fmt(R['single_max_shortfall'])} marks"))
+                conds.append((pre_pct >= R['single_min_overall_pct'] - 1e-9,
+                              f"overall % before gracing {pre_pct:.2f}% >= {_fmt(R['single_min_overall_pct'])}%"))
+                conds.append((reg_total <= R['single_max_grace'] + 1e-9,
+                              f"grace {_fmt(reg_total)} <= {_fmt(R['single_max_grace'])} marks"))
+            elif len(failing) > 1:
+                rule = f"Rule 2c - {len(failing)} failed subjects" + ('' if s['cat_ok'] else ' (category not stated, treated as regular)')
+                not_pass = [f['module'] for f in failing if not f['post_pass']]
+                conds.append((not not_pass, f"grace passes ALL failed subjects ({fail_names})" if not not_pass else
+                              f"failed subject(s) still failing after grace: {', '.join(not_pass)}"))
+                cap = R['multi_subject_cap_pct'] * s['comp_max'] / 100.0
+                conds.append((g <= cap + 1e-9, f"grace {_fmt(g)} <= {R['multi_subject_cap_pct']:g}% of Composite (Max) "
+                                               f"{_fmt(s['comp_max'])} = {_fmt(cap)}"))
+                cap_t = min(R['multi_total_cap_abs'], R['multi_total_cap_pct'] * total_max / 100.0)
+                conds.append((reg_total <= cap_t + 1e-9, f"total grace {_fmt(reg_total)} <= {_fmt(cap_t)} "
+                                                         f"(lower of {_fmt(R['multi_total_cap_abs'])} and "
+                                                         f"{R['multi_total_cap_pct']:g}% of {_fmt(total_max)})"))
+            else:
+                rule = 'Rule 2 - regular grace'
+                conds.append((False, "student has no failed subject before grace"))
+
+        ok = all(c[0] for c in conds)
+        verdict = 'JUSTIFIED' if ok else 'NOT JUSTIFIED'
+        body = '; '.join(f"{'✔' if o else '✘'} {t}" for o, t in conds)
+        text = f"[GRACE {verdict}] {rule}: grace {_fmt(g)} marks in {s['module']}. {body}. Result: {outcome}."
+        A.note(stu, s['module'], text, cols=['Sem Grace'])
+        A.grace_register.append({
+            'Student Number': stu, 'Student Name': name, 'Category': 'LD (PwD)' if ld_student else 'Regular',
+            'Grace Category (Remark)': {'REGULAR': 'Regular (Rule 2)', 'LD': 'LD / PwD (Rule 3)',
+                                        'ORD229': 'Ordinance 229 (Rule 4)'}[s['cat']],
+            'Module Code': s['module'], 'Module Desc': s['desc'],
+            'Sem Actual': sem, 'Sem Max': smx, 'Sem Pass Mark': s['pass_mark'], 'Grace Awarded': g,
+            'Sem % After Grace': round(post, 2), 'Overall % Before Gracing': round(pre_pct, 2),
+            'Failed Subjects Before Grace': len(failing), 'Rule Applied': rule, 'Verdict': verdict,
+            'Justification': body + '. Result: ' + outcome + '.',
+        })
+
+    # student-level summary on the header row
+    n_ok = sum(1 for r in A.grace_register if r['Student Number'] == stu and r['Verdict'] == 'JUSTIFIED')
+    n_all = sum(1 for r in A.grace_register if r['Student Number'] == stu)
+    A.note(stu, None, f"GRACE SUMMARY: {'LD (PwD)' if ld_student else 'Regular'} student | failed before grace: "
+                      f"{len(failing)} ({fail_names}) | overall % before gracing {pre_pct:.2f}% | total grace "
+                      f"{_fmt(info['total_grace'])} | {n_ok} of {n_all} grace award(s) justified.",
+           target='header')
+
+
+
 class AuditResult:
     """Container for everything the audit produces."""
 
@@ -266,6 +601,7 @@ class AuditResult:
         self.student_rows = []      # per student audit status rows
         self.stats = {}
         self.ref_max = {}
+        self.grace_register = []    # one row per grace award with its justification
         self._flags = defaultdict(lambda: {'cols': {}, 'remarks': []})
 
     # ---- recording ------------------------------------------------------
@@ -292,6 +628,14 @@ class AuditResult:
             if slot['cols'].get(c) != ERR:
                 slot['cols'][c] = sev
         slot['remarks'].append(f"[{sev}] {rule}: {message}")
+
+    def note(self, student, module, text, cols=(), target='module'):
+        """Adds an informational remark (not a finding). Cells are marked 'OK' unless already flagged."""
+        key = (student, module if target == 'module' else f'#{target.upper()}')
+        slot = self._flags[key]
+        for c in cols:
+            slot['cols'].setdefault(c, 'OK')
+        slot['remarks'].append(text)
 
     # ---- lookups used by the processed-sheet builder --------------------
     def cell_flags(self, student, module=None, target='module'):
@@ -411,6 +755,9 @@ def run_audit(raw_df):
                 _rc[(S(r, 'Module Code'), code)][mx] += 1
     A.ref_max = {k: c.most_common(1)[0][0] for k, c in _rc.items()}
 
+    _og = Counter(S(r, 'Scale') for r in records if S(r, 'Appraisal Type Code') == 'Overall Grade')
+    og_scale_mode = _og.most_common(1)[0][0] if _og else ''
+
     module_obs = defaultdict(list)      # module -> list of (student, name, desc, maxes, rows)
     module_ref = defaultdict(lambda: {'desc': Counter(), 'credit': Counter()})
     student_modules = {}
@@ -482,8 +829,8 @@ def run_audit(raw_df):
 
         student_modules[stu] = set(m for m in by_mod if m)
         s_sum_comp = s_sum_comp_rec = s_sum_max = 0.0
-        s_total_grace = 0.0
-        s_graced_subjects = 0
+        subj_list = []
+        ld_student = any(_is_ld_remark(S(r, 'Appraisal Remarks')) for r in rows)
         s_sum_valid = True
 
         for m_code, m_rows in by_mod.items():
@@ -559,7 +906,8 @@ def run_audit(raw_df):
                 skip_codes |= {'Internal Actual', 'Internal Total Marks'}
             if sem_absent:
                 sem_max = 0.0
-                skip_codes |= {'Sem Actual', 'Semester Total Marks', 'Sem Grace'}
+                # no Sem component => no grace can be given, so 'Grace on Total marks' is not required either
+                skip_codes |= {'Sem Actual', 'Semester Total Marks', 'Sem Grace', 'Grace on Total marks'}
             for code in EXPECTED_APPRAISALS:
                 if code in skip_codes:
                     continue
@@ -602,6 +950,10 @@ def run_audit(raw_df):
             grade = grade_raw.upper()
             status_l = status_raw.lower()
             if g_row is not None:
+                A.check('DI-15', _sv(g_row.get('Scale', '')) == og_scale_mode, rows=xl('Overall Grade'),
+                        field='Scale (Overall Grade)', expected=og_scale_mode, actual=_sv(g_row.get('Scale', '')) or '(blank)',
+                        cols=['Overall Grade'],
+                        message=f"Overall Grade row has scale '{_sv(g_row.get('Scale', '')) or 'blank'}' but the rest of the file uses '{og_scale_mode}'.", **ctx)
                 A.check('DI-10', grade != '', rows=xl('Overall Grade'), field='Overall Grade', expected='grade',
                         actual='blank', cols=['Overall Grade'],
                         message="'Overall Grade' is blank - incomplete subject record.", **ctx)
@@ -640,15 +992,15 @@ def run_audit(raw_df):
                     continue
                 sc = _sv(r_.get('Scale', '')).upper()
                 v_ = vals[code]
-                is_ab = v_['kind'] == 'code' and v_['code'] == 'AB'
+                is_ab = v_['kind'] == 'code'          # Z1 (absent) or Z3 (UFM)
                 if sc == 'NABS':
-                    A.check('BR-08', is_ab, rows=xl(code), field=code, expected='Z1 (absent)', actual=v_['raw'] or '(blank)',
+                    A.check('BR-08', is_ab, rows=xl(code), field=code, expected='Z1 / Z3', actual=v_['raw'] or '(blank)',
                             cols=[col_of[code]],
-                            message=f"'{code}' has scale NABS (absent) but marks are '{v_['raw'] or 'blank'}' - NABS requires Z1.", **ctx)
+                            message=f"'{code}' has scale NABS (absent) but marks are '{v_['raw'] or 'blank'}' - NABS requires a result code (Z1 / Z3).", **ctx)
                 if is_ab:
                     A.check('BR-09', sc == 'NABS', rows=xl(code), field=code, expected='scale NABS',
                             actual=sc or '(blank)', cols=[col_of[code]],
-                            message=f"'{code}' is Z1 (absent) but its scale is '{sc or 'blank'}' instead of NABS.", **ctx)
+                            message=f"'{code}' is {v_['raw']} but its scale is '{sc or 'blank'}' instead of NABS.", **ctx)
             for code in ('Composite Score', 'Sem Grace', 'Grace on Total marks'):
                 r_ = first(code)
                 if r_ is not None and _sv(r_.get('Scale', '')).upper() == 'NABS':
@@ -716,6 +1068,11 @@ def run_audit(raw_df):
                         expected=v_int['raw'] or '(blank)', actual=v_itot['raw'] or '(blank)', cols=['Internal Actual'],
                         message=f"Internal Total Marks '{v_itot['raw'] or 'blank'}' does not match Internal Actual "
                                 f"'{v_int['raw'] or 'blank'}' (absent status must be the same).", **ctx)
+            elif v_itot['kind'] == 'num' and v_int['kind'] == 'num' and v_itot['num'] > i_num + MARK_TOLERANCE:
+                A.check('GR-01', False, rows=xl('Internal Total Marks'), field='Internal Total Marks',
+                        expected=_fmt(i_num), actual=_fmt(v_itot['num']), cols=['Internal Actual'],
+                        message=f"Internal Total Marks {_fmt(v_itot['num'])} is higher than Internal Actual "
+                                f"{_fmt(i_num)} - no grace can be awarded in the Internal component.", **ctx)
             elif v_itot['kind'] == 'num' and v_int['kind'] in ('num', 'code'):
                 A.check('CA-03', abs(v_itot['num'] - i_num) < MARK_TOLERANCE, rows=xl('Internal Total Marks'),
                         field='Internal Total Marks', expected=_fmt(i_num), actual=_fmt(v_itot['num']),
@@ -782,10 +1139,6 @@ def run_audit(raw_df):
                             expected='Completed Unsuccessfuly', actual=status_raw,
                             cols=['Completion Status after Gracing'],
                             message=f"Component carries {'/'.join(sorted(codes))} but status is '{status_raw}'.", **ctx)
-                if v_gr['kind'] == 'num' and g_num > 0:
-                    A.check('BR-07', False, rows=xl('Sem Grace'), field='Sem Grace', expected='0',
-                            actual=_fmt(g_num), cols=['Sem Grace'],
-                            message=f"Grace {_fmt(g_num)} awarded to a candidate marked {'/'.join(sorted(codes))}.", **ctx)
             elif grade in VALID_GRADES and comp_fail:
                 A.check('BR-10', grade == 'F', rows=xl('Overall Grade'), field='Overall Grade', expected='F',
                         actual=grade_raw, cols=['Overall Grade'] + fail_cols,
@@ -840,49 +1193,54 @@ def run_audit(raw_df):
                             message=f"'{code}' was {b['code']} before gracing but is '{a['raw'] or 'blank'}' after.", **ctx)
                 if b['kind'] == 'num' and a['kind'] == 'num':
                     changed = abs(b['num'] - a['num']) >= MARK_TOLERANCE
-                    A.check('GR-06', not changed, rows=xl(code), field=code, expected=_fmt(b['num']),
+                    if code == 'Internal Actual' and a['num'] > b['num'] + MARK_TOLERANCE:
+                        A.check('GR-01', False, rows=xl(code), field=code, expected=_fmt(b['num']),
+                                actual=_fmt(a['num']), cols=[col_of[code]],
+                                message=f"Internal Actual rose from {_fmt(b['num'])} to {_fmt(a['num'])} after gracing - "
+                                        f"no grace can be awarded in the Internal component.", **ctx)
+                        continue
+                    A.check('GR-14', not changed, rows=xl(code), field=code, expected=_fmt(b['num']),
                             actual=_fmt(a['num']), cols=[col_of[code]],
                             message=f"'{code}' changed from {_fmt(b['num'])} (before) to {_fmt(a['num'])} "
                                     f"(after gracing) - actual marks should not change; grace belongs in Sem Grace.", **ctx)
 
             # ---- gracing sanity --------------------------------------------
             if v_gtot['kind'] == 'num':
-                A.check('GR-05', v_gtot['num'] == 0, rows=xl('Grace on Total marks'), field='Grace on Total marks',
+                A.check('GR-13', v_gtot['num'] == 0, rows=xl('Grace on Total marks'), field='Grace on Total marks',
                         expected='0 (not part of composite formula)', actual=_fmt(v_gtot['num']),
                         cols=['Sem Grace'],
                         message=f"'Grace on Total marks' = {_fmt(v_gtot['num'])} is not part of the Composite formula "
                                 f"(Internal + Sem + Sem Grace) - confirm it is correctly reflected.", **ctx)
-            if v_gr['kind'] == 'num' and g_num > 0:
-                s_total_grace += g_num
-                s_graced_subjects += 1
-                lim_pct = (sem_max * MAX_GRACE_PCT_OF_SEM / 100.0) if valid_max['sem'] else MAX_GRACE_ABS
-                limit = min(MAX_GRACE_ABS, lim_pct)
-                A.check('GR-01', g_num <= limit + 1e-9, rows=xl('Sem Grace'), field='Sem Grace',
-                        expected=f'<= {_fmt(limit)}', actual=_fmt(g_num), cols=['Sem Grace'],
-                        message=f"Abnormal grace of {_fmt(g_num)} marks (normal limit {_fmt(limit)}: "
-                                f"{MAX_GRACE_ABS} marks / {MAX_GRACE_PCT_OF_SEM:g}% of Sem Max).", **ctx)
-                pre_sem = (s_num_v * 100.0 / sem_max) if (valid_max['sem'] and sem_max) else None
-                pre_comp = ((i_num + s_num_v) * 100.0 / comp_max) if (valid_max['comp'] and comp_max) else None
-                if pre_sem is not None or pre_comp is not None:
-                    needed = (pre_sem is not None and pre_sem < 40 - 1e-9) or (pre_comp is not None and pre_comp < 40 - 1e-9)
-                    txt = []
-                    if pre_sem is not None:
-                        txt.append(f"Sem {_fmt(s_num_v)}/{_fmt(sem_max)} = {pre_sem:.2f}%")
-                    if pre_comp is not None:
-                        txt.append(f"Composite {pre_comp:.2f}%")
-                    A.check('GR-03', needed, rows=xl('Sem Grace'), field='Sem Grace',
-                            expected='grace only when Sem or subject < 40% before grace',
-                            actual=' / '.join(txt) + ' before grace', cols=['Sem Grace'],
-                            message=f"Grace {_fmt(g_num)} awarded although the subject already clears 40% in Sem and "
-                                    f"overall without it ({' / '.join(txt)}).", **ctx)
-                post_grade = exp_rec if exp_rec is not None else exp_rep
-                if post_grade is not None and not forced_fail:
-                    post_txt = '; '.join(reasons) if reasons else (
-                        f"{(pct_rec if pct_rec is not None else pct_rep):.2f}% after grace")
-                    A.check('GR-04', post_grade != 'F', rows=xl('Sem Grace'), field='Sem Grace',
-                            expected='subject clears pass mark', actual='still F',
-                            cols=['Sem Grace', 'Overall Grade'],
-                            message=f"Grace {_fmt(g_num)} awarded but subject still fails ({post_txt}).", **ctx)
+
+            # ---- facts for the student-level gracing rules --------------------
+            pass_pct = GRACE_RULES['pass_pct']
+            sem_ok = v_sem['kind'] == 'num' and bool(sem_max) and sem_max > 0 and not sem_absent
+            absent_flag = any(v['kind'] == 'code' for v in (v_int, v_sem))
+            int_fail_pre = (int_pct is not None and int_pct < pass_pct - 1e-9)
+            sem_pre_pct = (s_num_v * 100.0 / sem_max) if sem_ok else None
+            sem_fail_pre = (sem_pre_pct is not None and sem_pre_pct < pass_pct - 1e-9)
+            g_row_sem = first('Sem Grace')
+            remark = _sv(g_row_sem.get('Appraisal Remarks', '')) if g_row_sem else ''
+            if not remark and g_row is not None:
+                remark = _sv(g_row.get('Appraisal Remarks', ''))
+            cat, cat_ok = _grace_category(remark)
+            g_val = g_num if (v_gr['kind'] == 'num' and g_num > 0) else 0.0
+            pass_mark = (sem_max * pass_pct / 100.0) if sem_ok else 0.0
+            post_pass_sem = (not sem_ok) or ((s_num_v + g_val) * 100.0 / sem_max >= pass_pct - 1e-9)
+            subj_list.append({
+                'module': m_code, 'desc': m_desc, 'grace_rows': xl('Sem Grace') if g_val else m_xl[:3],
+                'g': g_val, 'cat': cat, 'cat_ok': cat_ok, 'remark': remark,
+                'absent': absent_flag, 'int_fail': int_fail_pre, 'int_pct': int_pct,
+                'sem': s_num_v, 'sem_max': sem_max, 'sem_pre_pct': sem_pre_pct, 'sem_fail_pre': sem_fail_pre,
+                'fail_pre': bool(absent_flag or int_fail_pre or sem_fail_pre),
+                'shortfall': max(0.0, pass_mark - s_num_v) if sem_ok else 0.0, 'pass_mark': pass_mark,
+                'comp_max': comp_max if valid_max['comp'] else 0.0, 'pre_marks': i_num + s_num_v,
+                'post_pass': (not absent_flag) and (not int_fail_pre) and post_pass_sem,
+                'post_reason': ('absent' if absent_flag else
+                                f"Internal {int_pct:.2f}% < 40%" if int_fail_pre else
+                                f"Sem {_fmt(s_num_v + g_val)}/{_fmt(sem_max)} = "
+                                f"{((s_num_v + g_val) * 100.0 / sem_max) if sem_ok else 0:.2f}% < 40%"),
+            })
 
             # ---- accumulate student-level numbers & trail -------------------
             if v_comp['kind'] in ('num', 'code'):
@@ -902,6 +1260,7 @@ def run_audit(raw_df):
                 'Recalculated %': round(pct_rec, 2) if pct_rec is not None else None,
                 'Internal %': round(int_pct, 2) if int_pct is not None else None,
                 'Sem % (Actual+Grace)': round(sem_pct, 2) if sem_pct is not None else None,
+                'Grace Category': (cat if g_val else ''),
                 'Reported Grade': grade_raw,
                 'Recalculated Grade': ('F' if forced_fail else (exp_rec or exp_rep or '')),
                 'Reported Status': status_raw,
@@ -950,15 +1309,9 @@ def run_audit(raw_df):
                             message=f"Percentage {_fmt(rep_pct['num'])} != Total {_fmt(s_sum_comp)} / Max "
                                     f"{_fmt(s_sum_max)} x 100 = {s_pct_exp:.2f}.", **sctx)
 
-        # ---- student-level grace ---------------------------------------------
-        if s_graced_subjects:
-            A.check('GR-02', s_total_grace <= MAX_GRACE_PER_STUDENT and s_graced_subjects <= MAX_GRACED_SUBJECTS,
-                    student=disp_stu, name=name, field='Sem Grace (all subjects)', rows=xl_rows[:3],
-                    expected=f"<= {MAX_GRACE_PER_STUDENT} marks in <= {MAX_GRACED_SUBJECTS} subjects",
-                    actual=f"{_fmt(s_total_grace)} marks in {s_graced_subjects} subjects",
-                    cols=['Module Code'], target='header',
-                    message=f"Total grace {_fmt(s_total_grace)} marks across {s_graced_subjects} subject(s) is "
-                            f"above normal limits ({MAX_GRACE_PER_STUDENT} marks / {MAX_GRACED_SUBJECTS} subjects).")
+        # ---- student-level gracing rules (Rules 1-4) --------------------------
+        g_info = _audit_grace(A, disp_stu, name, subj_list, ld_student)
+        _justify_grace(A, disp_stu, name, subj_list, ld_student, g_info)
 
         e_cnt, w_cnt = A.student_counts(disp_stu)
         A.student_rows.append({
@@ -966,6 +1319,10 @@ def run_audit(raw_df):
             'Reported Total': rep_total['raw'] if rep_total else '', 'Recalculated Total': round(s_sum_comp, 2),
             'Total Max': s_sum_max, 'Reported %': rep_pct['raw'] if rep_pct else '',
             'Recalculated %': round(s_pct_exp, 2) if s_pct_exp is not None else None,
+            'Category': 'LD (PwD)' if ld_student else 'Regular',
+            'Failed Subjects Before Grace': g_info['nfail'],
+            '% Before Gracing': round(g_info['pre_pct'], 2),
+            'Total Grace': g_info['total_grace'],
             'Errors': e_cnt, 'Warnings': w_cnt,
             'Audit Status': 'ERRORS' if e_cnt else ('WARNINGS' if w_cnt else 'CLEAN'),
         })
@@ -1042,6 +1399,8 @@ def run_audit(raw_df):
         'students_error': sum(1 for r in A.student_rows if r['Audit Status'] == 'ERRORS'),
         'students_warning': sum(1 for r in A.student_rows if r['Audit Status'] == 'WARNINGS'),
         'students_clean': sum(1 for r in A.student_rows if r['Audit Status'] == 'CLEAN'),
+        'grace_awards': len(A.grace_register),
+        'grace_justified': sum(1 for r in A.grace_register if r['Verdict'] == 'JUSTIFIED'),
     }
     return A
 
@@ -1055,6 +1414,7 @@ AUDIT_WARN_FILL = PatternFill(start_color="FFC000", end_color="FFC000", fill_typ
 AUDIT_WARN_FONT = Font(color="000000", bold=True)
 AUDIT_ERR_CSS = "background-color: #FF0000; color: #FFFF00; font-weight: bold;"
 AUDIT_WARN_CSS = "background-color: #FFC000; color: #000000; font-weight: bold;"
+AUDIT_OK_CSS = "background-color: #C6EFCE; color: #006100; font-weight: bold;"
 
 _THIN = Side(style="thin", color="000000")
 _BOX = Border(left=_THIN, right=_THIN, top=_THIN, bottom=_THIN)
@@ -1083,11 +1443,11 @@ def _style_table(ws, first_row, last_row, ncols, widths=None, wrap_cols=()):
 
 def _sev_style(cell):
     v = str(cell.value)
-    if v in ('ERROR', 'FAIL', 'ERRORS', 'DISCREPANCY'):
+    if v in ('ERROR', 'FAIL', 'ERRORS', 'DISCREPANCY', 'NOT JUSTIFIED'):
         cell.fill, cell.font = AUDIT_ERR_FILL, AUDIT_ERR_FONT
     elif v in ('WARNING', 'REVIEW', 'WARNINGS'):
         cell.fill, cell.font = AUDIT_WARN_FILL, AUDIT_WARN_FONT
-    elif v in ('PASS', 'CLEAN', 'OK'):
+    elif v in ('PASS', 'CLEAN', 'OK', 'JUSTIFIED'):
         cell.fill, cell.font = _OK_FILL, _OK_FONT
     cell.alignment = Alignment(horizontal="center", vertical="top")
 
@@ -1120,10 +1480,23 @@ def write_audit_detail_sheets(writer, audit):
     ws = writer.book["Student Audit Status"]
     ws.views.sheetView[0].showGridLines = False
     ws.freeze_panes = "A2"
-    _style_table(ws, 1, len(stu) + 1, stu.shape[1], widths=[16, 28, 10, 14, 14, 10, 12, 14, 9, 10, 14])
+    _style_table(ws, 1, len(stu) + 1, stu.shape[1], widths=[16, 28, 10, 14, 14, 10, 12, 14, 12, 14, 12, 12, 9, 10, 14])
     for r in range(2, len(stu) + 2):
         _sev_style(ws.cell(row=r, column=stu.shape[1]))
     ws.auto_filter.ref = f"A1:{get_column_letter(stu.shape[1])}{max(len(stu) + 1, 2)}"
+
+    if audit.grace_register:
+        gj = pd.DataFrame(audit.grace_register)
+        gj.to_excel(writer, index=False, sheet_name="Grace Justification")
+        ws = writer.book["Grace Justification"]
+        ws.views.sheetView[0].showGridLines = False
+        ws.freeze_panes = "A2"
+        _style_table(ws, 1, len(gj) + 1, gj.shape[1],
+                     widths=[16, 26, 10, 20, 13, 30, 10, 9, 10, 10, 11, 12, 11, 30, 19, 110], wrap_cols=(14, 16))
+        vcol = list(gj.columns).index('Verdict') + 1
+        for rr in range(2, len(gj) + 2):
+            _sev_style(ws.cell(row=rr, column=vcol))
+        ws.auto_filter.ref = f"A1:{get_column_letter(gj.shape[1])}{len(gj) + 1}"
 
     trail = pd.DataFrame(audit.trail)
     trail.to_excel(writer, index=False, sheet_name="Recalculation Trail")
@@ -1131,7 +1504,7 @@ def write_audit_detail_sheets(writer, audit):
     ws.views.sheetView[0].showGridLines = False
     ws.freeze_panes = "A2"
     _style_table(ws, 1, len(trail) + 1, trail.shape[1],
-                 widths=[16, 26, 13, 34, 10, 9, 9, 9, 9, 12, 14, 12, 14, 12, 10, 12, 24, 24, 14])
+                 widths=[16, 26, 13, 34, 10, 9, 9, 9, 9, 12, 14, 12, 14, 12, 10, 12, 10, 12, 12, 24, 24, 14])
     for r in range(2, len(trail) + 2):
         _sev_style(ws.cell(row=r, column=trail.shape[1]))
     ws.auto_filter.ref = f"A1:{get_column_letter(trail.shape[1])}{max(len(trail) + 1, 2)}"
@@ -1183,6 +1556,9 @@ def _write_summary_sheet(wb, audit, findings, source_name):
         ("Students - clean", st_['students_clean']),
         ("Students - warnings only", st_['students_warning']),
         ("Students - with errors", st_['students_error']),
+        ("Grace awards audited", st_['grace_awards']),
+        ("Grace awards justified by rules", st_['grace_justified']),
+        ("Grace awards NOT justified", st_['grace_awards'] - st_['grace_justified']),
     ]
     top = r
     for k, v in metrics:
@@ -1194,6 +1570,10 @@ def _write_summary_sheet(wb, audit, findings, source_name):
         ws.cell(row=r, column=1).font = Font(bold=True)
         if k.startswith("Errors") and v:
             ws.cell(row=r, column=3).fill, ws.cell(row=r, column=3).font = AUDIT_ERR_FILL, AUDIT_ERR_FONT
+        if k.startswith("Grace awards NOT") and v:
+            ws.cell(row=r, column=3).fill, ws.cell(row=r, column=3).font = AUDIT_ERR_FILL, AUDIT_ERR_FONT
+        if k.startswith("Grace awards justified") and v:
+            ws.cell(row=r, column=3).fill, ws.cell(row=r, column=3).font = _OK_FILL, _OK_FONT
         if k.startswith("Warnings") and v:
             ws.cell(row=r, column=3).fill, ws.cell(row=r, column=3).font = AUDIT_WARN_FILL, AUDIT_WARN_FONT
         r += 1
@@ -1289,6 +1669,21 @@ def _write_summary_sheet(wb, audit, findings, source_name):
     ws.merge_cells(start_row=r, start_column=2, end_row=r, end_column=7)
     ws.cell(row=r, column=2, value="O 90-100 | A+ 80-<90 | A 70-<80 | B+ 60-<70 | B 55-<60 | C 50-<55 | P 40-<50 | F <40 "
                                    "(percentage = Composite Score / Composite Score (Max) x 100, not rounded)")
+    r += 1
+    ws.cell(row=r, column=1, value="Gracing rules applied:").font = Font(bold=True)
+    rules_txt = (
+        "1) No grace in Internal.  "
+        "2a) Absent in any subject => no regular grace.  "
+        "2b) Failing ONE subject by <= 10 marks and overall % before gracing >= 50 => up to 10 marks in that subject only.  "
+        "2c) Failing several subjects => grace must pass ALL of them; <= 2% of subject Composite (Max); total <= lower of 10 marks "
+        "and 2% of total max.  "
+        "3) LD (PwD): up to 3% of total max (no per-subject cap), plus regular provisions if eligible.  "
+        "4) Ordinance 229: up to 10 additional marks, independent of failure status.  "
+        "Pass mark = 40% in EACH component (Sem % uses Sem Actual + Sem Grace). Category is read from Appraisal Remarks "
+        "(LD / New Rule MU Autonomy / Ordinance 229).")
+    ws.merge_cells(start_row=r, start_column=2, end_row=r, end_column=7)
+    ws.cell(row=r, column=2, value=rules_txt).alignment = Alignment(wrap_text=True, vertical="top")
+    ws.row_dimensions[r].height = 105
 
 
 def audit_only_excel_bytes(audit, source_name=""):
@@ -1728,9 +2123,12 @@ def style_processed_preview(proc_df):
             cells = proc_df.iloc[idx - 1].get('Audit_Cells') or {}
             for col_name, sev in cells.items():
                 if col_name in data.columns:
-                    styles.loc[idx, col_name] += AUDIT_ERR_CSS if sev == ERR else AUDIT_WARN_CSS
+                    styles.loc[idx, col_name] += (AUDIT_ERR_CSS if sev == ERR else AUDIT_WARN_CSS if sev == WARN else AUDIT_OK_CSS)
         if 'Audit Remarks' in data.columns:
-            styles['Audit Remarks'] += "white-space: pre-wrap; color: #C00000; min-width: 380px;"
+            for idx in data.index:
+                txt = str(data.loc[idx, 'Audit Remarks'] or '')
+                color = '#C00000' if '[ERROR]' in txt else ('#9C5700' if ('[WARNING]' in txt or 'NOT JUSTIFIED' in txt) else '#006100')
+                styles.loc[idx, 'Audit Remarks'] += f"white-space: pre-wrap; color: {color}; min-width: 420px;"
 
         return styles
 
@@ -1752,11 +2150,11 @@ def style_audit_table(df, status_col):
     """Colours a status column: ERROR/FAIL = red fill + bold yellow, WARNING/REVIEW = amber, PASS/CLEAN/OK = green."""
     def _css(v):
         v = str(v)
-        if v in ('ERROR', 'FAIL', 'ERRORS', 'DISCREPANCY'):
+        if v in ('ERROR', 'FAIL', 'ERRORS', 'DISCREPANCY', 'NOT JUSTIFIED'):
             return AUDIT_ERR_CSS
         if v in ('WARNING', 'REVIEW', 'WARNINGS'):
             return AUDIT_WARN_CSS
-        if v in ('PASS', 'CLEAN', 'OK'):
+        if v in ('PASS', 'CLEAN', 'OK', 'JUSTIFIED'):
             return "background-color: #C6EFCE; color: #006100; font-weight: bold;"
         return ""
     styler = df.style.format(format_value)
@@ -1904,8 +2302,10 @@ def format_excel_processed_sheet(worksheet, clean_proc, proc_df):
                 t_cell = worksheet.cell(row=row_idx, column=t_idx)
                 if sev == ERR:
                     t_cell.fill, t_cell.font = AUDIT_ERR_FILL, AUDIT_ERR_FONT
-                else:
+                elif sev == WARN:
                     t_cell.fill, t_cell.font = AUDIT_WARN_FILL, AUDIT_WARN_FONT
+                else:                                   # grace justified by the rules
+                    t_cell.fill, t_cell.font = _OK_FILL, _OK_FONT
         if not is_student_header:
             for v_idx in (1, 2):
                 v_cell = worksheet.cell(row=row_idx, column=v_idx)
@@ -1915,7 +2315,10 @@ def format_excel_processed_sheet(worksheet, clean_proc, proc_df):
             a_cell.alignment = Alignment(vertical="center", wrap_text=True)
             has_err = ERR in audit_flags.values()
             if a_cell.value:
-                a_cell.font = Font(color="C00000" if has_err or "[ERROR]" in str(a_cell.value) else "9C5700", bold=False)
+                a_txt = str(a_cell.value)
+                a_color = ("C00000" if (has_err or "[ERROR]" in a_txt) else
+                           "9C5700" if ("[WARNING]" in a_txt or "NOT JUSTIFIED" in a_txt) else "006100")
+                a_cell.font = Font(color=a_color, bold=False)
 
     # Apply specified fixed column widths
     for col_name, width in column_widths.items():
@@ -2089,6 +2492,9 @@ def show():
         a2.metric("Errors", audit.n_errors)
         a3.metric("Warnings", audit.n_warnings)
         a4.metric("Students Needing Attention", audit.stats['students_error'] + audit.stats['students_warning'])
+        if audit.stats['grace_awards']:
+            st.caption(f"🎓 Grace awards justified by the gracing rules: {audit.stats['grace_justified']} of "
+                       f"{audit.stats['grace_awards']}")
 
         st.markdown("---")
 
@@ -2111,6 +2517,15 @@ def show():
             with st.expander("👤 Student-wise audit status", expanded=(audit.n_errors + audit.n_warnings) > 0):
                 stu_df = pd.DataFrame(audit.student_rows)
                 st.write(style_audit_table(stu_df.set_index('Student Number'), 'Audit Status'))
+            with st.expander("🎓 Grace justification register (every grace award vs the gracing rules)",
+                             expanded=bool(audit.grace_register)):
+                if audit.grace_register:
+                    gj_df = pd.DataFrame(audit.grace_register)
+                    st.caption(f"{audit.stats['grace_justified']} of {audit.stats['grace_awards']} grace award(s) are "
+                               f"justified by the gracing rules.")
+                    st.write(style_audit_table(gj_df, 'Verdict'))
+                else:
+                    st.info("No grace marks were awarded in this file.")
             with st.expander("🧮 Recalculation trail (reported vs recalculated, every subject)"):
                 st.write(style_audit_table(pd.DataFrame(audit.trail), 'Audit Result'))
 
