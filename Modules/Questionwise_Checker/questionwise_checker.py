@@ -38,6 +38,8 @@ This Streamlit tool helps exam staff:
      borders between main question groups and around Total Obtained Score, and a Tan fill on
      Examiner-only student rows, and a red SAP ID fill (Examiner + Moderator rows) when the Moderator
      value is 'NA' for a question the Examiner awarded marks for.
+   The Formatted File and the Consolidated Excel (only) also show the 'ExamAssingment_ID' column
+     immediately after SAP ID, headed 'Assignment ID' (width 11); the Cleaned File / ZIP do not include it.
 ==================================================
 """
 
@@ -118,9 +120,10 @@ COLUMNS_TO_DROP_STANDARD = [
 # Columns to drop from the formatted downloaded Excel files.
 # This export keeps UserType, GMR columns, Grade, Change %, etc. - it only
 # drops the columns nobody needs to see (identifiers/admin metadata).
+# NOTE: "ExamAssingment_ID" is intentionally NOT dropped here - the Formatted File and the
+# Consolidated Multi-Sheet Excel show it right next to SAP ID (see process_data_for_download).
 COLUMNS_TO_DROP_FORMATTED = [
     "Semester",
-    "ExamAssingment_ID",
     "OnScreenID",
     "RollNo",
     "Name",
@@ -183,14 +186,16 @@ EXCEL_ROW_HEIGHT = 21          # Fixed height in points for header + data rows (
 
 HEADER_ROW_HEIGHT = 45         # Header row height in points (~60 px).
 TOTAL_SCORE_LABEL = "Total Obtained Score"   # Display label for 'TotalObtainedScore' in the two formatted exports.
+ASSIGNMENT_ID_LABEL = "Assignment ID"         # Display label for 'ExamAssingment_ID' in the two formatted exports.
 
 # Fixed widths (keyed by the column name as it appears in the formatted export).
 FIXED_COLUMN_WIDTHS = {
-    "SrNo": 4.57,
+    "SrNo": 5,
     "Subject code": 11.57,
     "SubjectName": 30,
     "SAP ID": 12,
     "UserType": 10,
+    "ExamAssingment_ID": 13,     # Shown as "Assignment ID" (renamed last, see _apply_enhanced_formatting).
     "TotalObtainedScore": 9,
 }
 
@@ -639,6 +644,17 @@ def process_data_for_download(df, include_all_usertypes=False):
 
     if "PRNNumber" in download_df.columns:
         download_df = download_df.rename(columns={"PRNNumber": "SAP ID"})
+
+    # Formatted / Consolidated exports only: place ExamAssingment_ID immediately after SAP ID
+    # (the Cleaned File drops this column entirely via COLUMNS_TO_DROP_STANDARD).
+    if include_all_usertypes and "ExamAssingment_ID" in download_df.columns and "SAP ID" in download_df.columns:
+        # IDs are exported as numbers where possible so Excel doesn't flag them as text.
+        download_df["ExamAssingment_ID"] = download_df["ExamAssingment_ID"].apply(
+            lambda v: int(float(str(v).strip())) if re.fullmatch(r"\s*\d+(\.0+)?\s*", str(v)) else v
+        )
+        ordered = [c for c in download_df.columns if c != "ExamAssingment_ID"]
+        ordered.insert(ordered.index("SAP ID") + 1, "ExamAssingment_ID")
+        download_df = download_df[ordered]
 
     download_df = download_df.reset_index(drop=True)
 
@@ -1321,7 +1337,7 @@ def _apply_enhanced_formatting(worksheet, download_df, cols, bright_green_font):
       - thick vertical borders between main question groups and around the score column
       - row heights (header 45pt, others 21pt) and vertical-middle alignment (all cells)
       - Total Marks Obtained / Grade validation highlights (red fill + bold yellow font)
-      - the 'TotalObtainedScore' header label (renamed last, after all column lookups)
+      - the 'TotalObtainedScore' and 'ExamAssingment_ID' header labels (renamed last, after all column lookups)
     No data, logic, freeze panes or other existing formatting is changed.
     """
     non_question = (
@@ -1462,9 +1478,11 @@ def _apply_enhanced_formatting(worksheet, download_df, cols, bright_green_font):
                 wrap_text=a.wrap_text, shrink_to_fit=a.shrink_to_fit, indent=a.indent,
             )
 
-    # 8. Rename the header label last (all column lookups above use the original name).
+    # 8. Rename the header labels last (all column lookups above use the original names).
     if "TotalObtainedScore" in cols:
         worksheet.cell(row=1, column=cols.index("TotalObtainedScore") + 1).value = TOTAL_SCORE_LABEL
+    if "ExamAssingment_ID" in cols:
+        worksheet.cell(row=1, column=cols.index("ExamAssingment_ID") + 1).value = ASSIGNMENT_ID_LABEL
 
 
 def to_excel_bytes(df):
@@ -1516,7 +1534,7 @@ def to_excel_bytes_formatted(df):
         worksheet = writer.sheets[sheet_name]
 
         worksheet.views.sheetView[0].showGridLines = False
-        worksheet.freeze_panes = "F2"          # Freeze header row + first 5 identifying columns.
+        worksheet.freeze_panes = "G2"          # Freeze header row + first 6 identifying columns (incl. ExamAssingment_ID).
         worksheet.row_dimensions[1].height = 30
 
         mod_fill = PatternFill(start_color="E2EFDA", end_color="E2EFDA", fill_type="solid")
@@ -1597,7 +1615,7 @@ def create_consolidated_multi_sheet_excel(dfs_list):
             worksheet = writer.sheets[sheet_name]
 
             worksheet.views.sheetView[0].showGridLines = False
-            worksheet.freeze_panes = "F2"
+            worksheet.freeze_panes = "G2"
             worksheet.row_dimensions[1].height = 30
 
             mod_fill = PatternFill(start_color="E2EFDA", end_color="E2EFDA", fill_type="solid")
@@ -2057,7 +2075,7 @@ Moderation"** when more than 50% of Moderator rows show an absolute Change % gre
   non-numeric score (ABSENT / UFM), are left uncoloured.
 - **Layout** (Formatted / Consolidated only): header row 45 pt, all other rows 21 pt, everything
   vertically middle-aligned; question columns width 10; SrNo 4.57, Subject code 11.57, SubjectName 30,
-  SAP ID 12, UserType 10, Total Obtained Score 9; thick vertical borders between main question groups
+  SAP ID 12, UserType 10, Assignment ID 11, Total Obtained Score 9; thick vertical borders between main question groups
   (Q1 | Q2 | ...) and on both sides of **Total Obtained Score** (shown with that label in these two
   outputs; the Cleaned File keeps the original header).
 
@@ -2073,8 +2091,9 @@ Moderation"** when more than 50% of Moderator rows show an absolute Change % gre
 ### 11. Downloadable Outputs
 - **📥 Download Cleaned File** - legacy/simple export. Reval rows removed, Moderator-only rows kept
   where applicable, GMR columns (Internal Marks, Total/Semester Max Marks, **Semester Marks**,
-  Total Marks Obtained, Grade, Change %) **not included**.
-- **🎨 Download Formatted File** - all UserTypes, all GMR columns including **Semester Marks**,
+  Total Marks Obtained, Grade, Change %) and **Assignment ID** **not included**.
+- **🎨 Download Formatted File** - all UserTypes, the **Assignment ID** column (placed right
+  after SAP ID, width 11), all GMR columns including **Semester Marks**,
   Change %, centered alignment, header freeze, thick per-student borders, green/red highlighting,
   Semester Marks match/mismatch fill, the 100% Moderation pop-up if eligible, plus the extra layout and
   highlight rules listed in section 9 (those marked Formatted / Consolidated only).
@@ -2082,7 +2101,7 @@ Moderation"** when more than 50% of Moderator rows show an absolute Change % gre
   bundled into a single ZIP (Semester Marks **not included**, matching the Cleaned File format).
 - **📊 Download Consolidated Multi-Sheet Excel** - one workbook with a separate sheet per uploaded
   file (only offered when 2+ files are uploaded), each sheet formatted the same way as the
-  Formatted File, including **Semester Marks**.
+  Formatted File, including **Semester Marks** and **Assignment ID** (right after SAP ID).
 
 ---
 ### 12. Validation Rules, Assumptions & Processing Workflow

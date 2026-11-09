@@ -1,12 +1,17 @@
+import colorsys
 import io
+import numbers
 import re
-from collections import Counter
+from collections import Counter, defaultdict
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+
 import pandas as pd
 import pdfplumber
 import streamlit as st
+from openpyxl.comments import Comment
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
+from openpyxl.worksheet.properties import PageSetupProperties
 
 # ==============================================================================
 # ACADEMIC VALIDATION CONSTANTS & GRADE / GP LOOKUP HELPERS
@@ -25,18 +30,101 @@ GRADE_POINTS_MAP = {
 
 VALID_GRADES = set(GRADE_POINTS_MAP.keys())
 
+ROMAN_ORDER = [
+    "I",
+    "II",
+    "III",
+    "IV",
+    "V",
+    "VI",
+    "VII",
+    "VIII",
+    "IX",
+    "X",
+]
+
+
+def sem_rank(sem_str):
+    """Return numeric sort rank for a Roman or integer semester token."""
+    s = str(sem_str or "").strip().upper()
+    if s in ROMAN_ORDER:
+        return ROMAN_ORDER.index(s)
+    if s.isdigit():
+        return int(s) - 1
+    return 99
+
 
 def to_decimal(val):
-    """Safely convert a numeric value or string to Decimal."""
+    """Safely convert a numeric value or string to Decimal (returns None for '--', 'AB', etc.)."""
     if val is None:
         return None
-    s = str(val).strip().replace("%", "")
-    if not s or s in ["--", "AB", "NV", "nan", "NaN", "None"]:
+    s = str(val).strip().replace("%", "").replace(",", ".")
+    if not s or s in ["--", "-", "AB", "NV", "nan", "NaN", "None", "AD"]:
+        return None
+    s = (
+        s.replace("$", "")
+        .replace("#", "")
+        .replace("®", "")
+        .replace("*", "")
+        .replace("~", "")
+        .strip()
+    )
+    if not s or s in ["--", "-"]:
         return None
     try:
         return Decimal(s)
     except InvalidOperation:
         return None
+
+
+# --- Special gazette notations (informational, never errors) ----------------------
+#   '#'  after a semester SGPA : candidate eligible for O.229 grace; the unused part of
+#        the 10 grace marks is added to the SGPA (0.01 per unused mark, e.g. 10 unused -> +0.10)
+#   'AD' in a semester SGPA     : Attendance Defaulter in that semester
+#   '$$' after Result Status    : candidate has not cleared a lower semester
+GRACE_MAX_MARKS = 10
+GRACE_SGPA_PER_UNUSED_MARK = Decimal("0.01")
+_SEM_SGPA_COL_RE = re.compile(r"^Sem_[IVXLCDM\d]+_SGPA$")
+
+
+def grace_sgpa_info(row):
+    """Return (used_marks, unused_marks, sgpa_bonus) for the O.229 grace rule of a student row."""
+    used = 0
+    for col in row.index:
+        if re.match(r"^Sub\d+ (IA|TH) Marks$", str(col)):
+            for m in re.finditer(r"\+\s*(\d+)", str(row[col])):
+                used += int(m.group(1))
+    used = min(used, GRACE_MAX_MARKS)
+    unused = GRACE_MAX_MARKS - used
+    return used, unused, Decimal(unused) * GRACE_SGPA_PER_UNUSED_MARK
+
+
+def classify_special_notation(col_name, raw_value):
+    """Return 'grace' ('#'), 'ad' (Attendance Defaulter) or 'lower_unclear' ('$$'), else None."""
+    txt = str(raw_value).strip()
+    if _SEM_SGPA_COL_RE.match(str(col_name)):
+        if "#" in txt:
+            return "grace"
+        if txt.upper() == "AD":
+            return "ad"
+    elif str(col_name) == "Result Status" and "$$" in txt.replace(" ", ""):
+        return "lower_unclear"
+    return None
+
+
+def special_notation_note(kind, row):
+    if kind == "grace":
+        used, unused, bonus = grace_sgpa_info(row)
+        return (
+            "'#' - Eligible for O.229 grace marks (max 10).\n"
+            f"Grace marks used in subjects: {used}; unused: {unused}.\n"
+            f"Unused grace converted to SGPA bonus: +{bonus:.2f} (already included in the printed SGPA)."
+        )
+    if kind == "ad":
+        return "AD - Attendance Defaulter in this semester (SGPA not declared)."
+    if kind == "lower_unclear":
+        return "$$ - Candidate has not cleared a lower semester examination (e.g. AD or failure in an earlier semester)."
+    return None
 
 
 def derive_grade_from_unrounded_percentage(marks_obt, max_marks):
@@ -116,7 +204,9 @@ def normalize_grade_token(grade_str):
         .strip()
         .upper()
     )
-    if base == "0":
+    if base in ["--", "-"]:
+        base = ""
+    elif base == "0":
         base = "O"
     return base, {
         "has_carry": has_carry,
@@ -127,18 +217,18 @@ def normalize_grade_token(grade_str):
 
 def parse_mark_component(raw_val):
     """
-    Parse an IA, TH, or Total mark cell and detect special cases:
+    Parse an IA, TH, or Total mark cell in the background and detect special cases:
     - AB (Absent - valid entry, treated as 0 numeric marks and F grade)
     - NV (Null & Void)
     - $ (Carried forward)
-    - # or + (Ordinance 0.229 / Grace marks e.g. '10 +2', '8 +4', '15 +9' - valid entry)
+    - # or + (Ordinance 0.229 / Grace marks e.g. '17 +7', '10 +2', '8 +4' - valid entry)
     - ® (Revaluation)
     - -- (Not Applicable / Blank)
     """
     s = str(raw_val if raw_val is not None else "").strip()
     info = {
         "raw": s,
-        "is_empty": s in ["", "--", "nan", "NaN", "None"],
+        "is_empty": s in ["", "--", "-", "nan", "NaN", "None"],
         "is_absent": False,
         "is_nv": False,
         "has_carry": "$" in s,
@@ -159,6 +249,7 @@ def parse_mark_component(raw_val):
         .replace("#", "")
         .replace("®", "")
         .replace("~", "")
+        .replace("*", "")
         .strip()
     )
 
@@ -172,7 +263,7 @@ def parse_mark_component(raw_val):
         info["numeric_marks"] = Decimal("0")
         return info
 
-    # Check for grace marks syntax: e.g. "10 +2", "8 +4", "15 +9", "14 + 10", "21+3"
+    # Check for grace marks syntax: e.g. "17 +7", "10 +2", "14 + 10", "21+3"
     m_grace = re.match(r"^(-?\d+(?:\.\d+)?)\s*\+\s*(\d+(?:\.\d+)?)$", cleaned)
     if m_grace:
         base_d = Decimal(m_grace.group(1))
@@ -197,22 +288,22 @@ def parse_mark_component(raw_val):
 
 
 # ==============================================================================
-# HELPER PARSING FUNCTIONS
+# PAGE 1 & PAGE 2 PARSERS (WITH MULTI-LINE & TABLE EXTRACTION SUPPORT)
 # ==============================================================================
 
 
 def clean_text_preserve_symbols(val):
-    """Clean whitespace while preserving academic notations ($, ~, /, #, +, ®)."""
+    """Clean whitespace while preserving exact PDF academic notations ($, ~, /, #, +, ®, --)."""
     if val is None:
         return ""
-    return str(val).strip()
+    return re.sub(r"\s+", " ", str(val)).strip()
 
 
 def clean_dashes_and_artifacts(text):
-    """Remove continuous dash strings (---...) and redundant whitespace."""
+    """Remove long separator lines (4+ dashes/underscores) while preserving '--' tokens."""
     if not text:
         return ""
-    text = re.sub(r"[-_=]{3,}", "", text)
+    text = re.sub(r"[-_=]{4,}", " ", text)
     text = re.sub(r"\s+", " ", text).strip()
     return text
 
@@ -220,41 +311,62 @@ def clean_dashes_and_artifacts(text):
 def parse_page_1(text):
     """Extract metadata key-values and accurately identify Regular vs Re-examination."""
     metadata = []
-    text_clean = re.sub(r"\s+", " ", text)
+    text_clean = re.sub(r"\s+", " ", text or "")
 
     inst_match = re.search(
         r"(Shri Vile Parle Kelavani Mandal[^\n\r]*[\s\S]*?(?:AUTONOMOUS|\(Empowered Autonomous\)|\(Autonomous\)))",
-        text,
+        text or "",
         re.IGNORECASE,
     )
     inst_name = (
-        inst_match.group(1).replace("\n", " ")
+        re.sub(r"\s+", " ", inst_match.group(1)).strip()
         if inst_match
         else "SVKM Educational Institution (AUTONOMOUS)"
     )
     metadata.append({"Property": "Institution / Trust", "Value": inst_name})
 
+    affil_match = re.search(r"^[ \t]*(AFFILIATED\s+TO[^\n\r]*)", text or "", re.IGNORECASE | re.MULTILINE)
+    if affil_match:
+        metadata.append(
+            {"Property": "Affiliation", "Value": re.sub(r"\s+", " ", affil_match.group(1)).strip()}
+        )
+    naac_match = re.search(r"^[ \t]*(NAAC[^\n\r]*)", text or "", re.IGNORECASE | re.MULTILINE)
+    if naac_match:
+        metadata.append(
+            {"Property": "NAAC Accreditation", "Value": re.sub(r"\s+", " ", naac_match.group(1)).strip()}
+        )
+
     prog_match = re.search(
-        r"(Bachelor of [^\n\r,]+|Master of [^\n\r,]+|M\.Com[^\n\r,]*|B\.Sc[^\n\r,]*|B\.Com[^\n\r,]*)",
-        text,
+        r"(Bachelor of [^\n\r]+|Master of [^\n\r]+|M\.Com[^\n\r]*|B\.Sc[^\n\r]*|B\.Com[^\n\r]*|B\.A\.[^\n\r]*|B\.M\.S[^\n\r]*)",
+        text or "",
         re.IGNORECASE,
     )
-    metadata.append(
-        {
-            "Property": "Programme",
-            "Value": prog_match.group(1).strip() if prog_match else "N/A",
-        }
-    )
+    programme_val = "N/A"
+    if prog_match:
+        # Read the whole programme line exactly as printed. A comma only ends the
+        # programme name when it is outside brackets, so
+        # "Bachelor of Arts (Film, Television and New Media Production)" stays intact.
+        depth, end = 0, len(prog_match.group(1))
+        for i, ch in enumerate(prog_match.group(1)):
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth = max(depth - 1, 0)
+            elif ch == "," and depth == 0:
+                end = i
+                break
+        programme_val = re.sub(r"\s+", " ", prog_match.group(1)[:end]).strip()
+    metadata.append({"Property": "Programme", "Value": programme_val})
 
-    sem_match = re.search(r"Semester\s+([IVXLCDM\d]+)", text, re.IGNORECASE)
+    sem_match = re.search(r"Semester\s+([IVXLCDM\d]+)", text or "", re.IGNORECASE)
     metadata.append(
         {
             "Property": "Semester",
-            "Value": f"Semester {sem_match.group(1)}" if sem_match else "N/A",
+            "Value": f"Semester {sem_match.group(1).upper()}" if sem_match else "N/A",
         }
     )
 
-    ncrf_match = re.search(r"NCr?F\s*Level[:\s]*([0-9.]+)", text, re.IGNORECASE)
+    ncrf_match = re.search(r"NCr?F\s*Level[:\s]*([0-9.]+)", text or "", re.IGNORECASE)
     metadata.append(
         {
             "Property": "NCrF Level",
@@ -262,7 +374,7 @@ def parse_page_1(text):
         }
     )
 
-    ay_match = re.search(r"A\.Y\.?\s*([0-9]{4}\s*-\s*[0-9]{4})", text, re.IGNORECASE)
+    ay_match = re.search(r"A\.Y\.?\s*([0-9]{4}\s*-\s*[0-9]{4})", text or "", re.IGNORECASE)
     metadata.append(
         {
             "Property": "Academic Year",
@@ -289,43 +401,177 @@ def parse_page_1(text):
         re.IGNORECASE,
     )
     exam_session = (
-        f"{exam_type} held in {exam_session_match.group(1)}".strip()
+        f"{exam_type} held in {exam_session_match.group(1).strip()}"
         if exam_session_match
         else exam_type
     )
+    exam_session = re.sub(r"\s+", " ", exam_session).strip()
+    # Prefer the examination line exactly as it is printed on the cover page
+    printed_session = re.search(
+        r"^[ \t]*((?:Regular|Re\s*-?\s*|ATKT|Supplementary)\s*examination\s+held\s+in[^\n\r]*)",
+        text or "",
+        re.IGNORECASE | re.MULTILINE,
+    )
+    if printed_session:
+        exam_session = re.sub(r"\s+", " ", printed_session.group(1)).strip()
 
     metadata.append({"Property": "Examination Type", "Value": exam_type})
     metadata.append({"Property": "Examination Session", "Value": exam_session})
 
+    sign_match = re.search(
+        r"^[ \t]*(Controller\s+of\s+Examinations[ \t]+Principal)[ \t]*$",
+        text or "",
+        re.IGNORECASE | re.MULTILINE,
+    )
+    if sign_match:
+        metadata.append(
+            {"Property": "Signatories", "Value": re.sub(r"\s+", " ", sign_match.group(1)).strip()}
+        )
+
     return pd.DataFrame(metadata), exam_type
 
 
+def _cast_pdf_number_or_raw(val):
+    """Preserve exact PDF representation ('--', '', int, or float) without fabricating 0s."""
+    s = clean_text_preserve_symbols(val)
+    if not s:
+        return ""
+    if s in ["--", "-"]:
+        return s
+    if re.fullmatch(r"\d+", s):
+        return int(s)
+    if re.fullmatch(r"\d+\.\d+", s):
+        return float(s)
+    return s
+
+
 def parse_page_2(page):
-    """Extract course catalogue and schema from Page 2 (supports both '--' and blank Sem End Max Marks)."""
-    text = page.extract_text() or ""
-    lines = text.split("\n")
+    """
+    Extract complete course catalogue and schema from Page 2.
+    Uses table extraction first (to capture multi-line wrapped course titles such as
+    UFLRF302, UFMAD306, NHCMU269, NHCDR268, NHCDN267 and blank/'--' Sem End Max Marks
+    such as NHCEP264, NHACW279X), with a multi-line stitch text parser fallback.
+    """
     courses = []
+    seen_codes = set()
 
-    course_pattern = re.compile(
-        r"^([A-Z0-9]{5,12})\s+(.+?)\s+(\d+\.\d{2})\s+(\d+|--)(?:\s+(\d+|--))?\s+(\d+)\b"
+    # 1. Primary Method: pdfplumber table extraction (handles multi-line wrapped titles natively)
+    try:
+        tables = page.extract_tables() or []
+    except Exception:
+        tables = []
+
+    for tbl in tables:
+        for row in tbl:
+            if not row:
+                continue
+            cleaned_cells = [
+                re.sub(r"\s+", " ", (c or "")).strip() for c in row
+            ]
+            non_empty = [c for c in cleaned_cells if c]
+            if len(non_empty) < 4:
+                continue
+
+            # Find cell matching Course Code pattern (e.g. UFIKS301, NHDBM278P, NHACW279X)
+            code_idx = None
+            for idx, cell_val in enumerate(cleaned_cells):
+                if re.fullmatch(r"[A-Z]{2,8}\d{2,4}[A-Z0-9]{0,3}", cell_val):
+                    code_idx = idx
+                    break
+            if code_idx is None:
+                continue
+
+            code = cleaned_cells[code_idx]
+            rem = cleaned_cells[code_idx + 1 :]
+            # Find the Credits cell (matches \d+\.\d{2} or integer credit)
+            cred_rel_idx = None
+            for r_idx, c_val in enumerate(rem):
+                if re.fullmatch(r"\d+(?:\.\d{1,2})?", c_val) and r_idx >= 1:
+                    cred_rel_idx = r_idx
+                    break
+            if cred_rel_idx is None:
+                continue
+
+            title = " ".join(c for c in rem[:cred_rel_idx] if c).strip()
+            creds_raw = rem[cred_rel_idx]
+            marks_Tail = rem[cred_rel_idx + 1 :]
+
+            # Extract Int, Sem, Total columns preserving blank / '--' as-is
+            int_raw = marks_Tail[0] if len(marks_Tail) > 0 else ""
+            sem_raw = marks_Tail[1] if len(marks_Tail) > 1 else ""
+            tot_raw = marks_Tail[2] if len(marks_Tail) > 2 else ""
+
+            # If Total landed in marks_Tail[1] because Sem was merged/omitted
+            if tot_raw == "" and sem_raw != "":
+                tot_raw = sem_raw
+                sem_raw = ""
+
+            if code not in seen_codes:
+                seen_codes.add(code)
+                courses.append(
+                    {
+                        "Course Code": code,
+                        "Course Title": title,
+                        "Credits": _cast_pdf_number_or_raw(creds_raw),
+                        "Internal Max Marks": _cast_pdf_number_or_raw(int_raw),
+                        "Sem End Max Marks": _cast_pdf_number_or_raw(sem_raw),
+                        "Total Max Marks": _cast_pdf_number_or_raw(tot_raw),
+                    }
+                )
+
+    # 2. Fallback / Supplement: Multi-line text stitching parser
+    text = page.extract_text() or ""
+    lines = [l.strip() for l in text.split("\n") if l.strip()]
+
+    course_line_re = re.compile(
+        r"^([A-Z]{2,8}\d{2,4}[A-Z0-9]{0,3})\s+(.+?)\s+(\d+\.\d{2})\s+(\d+|--)(?:\s+(\d+|--))?\s+(\d+)\b"
     )
+    code_only_start_re = re.compile(r"^([A-Z]{2,8}\d{2,4}[A-Z0-9]{0,3})\b")
 
-    for line in lines:
-        m = course_pattern.match(line.strip())
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        m = course_line_re.match(line)
+        if not m and code_only_start_re.match(line) and i + 1 < len(lines):
+            # Try stitching wrapped course title line(s)
+            combined = line + " " + lines[i + 1]
+            m = course_line_re.match(combined)
+            if m:
+                i += 1
         if m:
             code, title, creds, int_m, sem_m, tot_m = m.groups()
-            int_val = int(int_m) if (int_m and int_m != "--") else 0
-            sem_val = int(sem_m) if (sem_m and sem_m != "--") else 0
-            courses.append(
-                {
-                    "Course Code": code.strip(),
-                    "Course Title": title.strip(),
-                    "Credits": float(creds),
-                    "Internal Max Marks": int_val,
-                    "Sem End Max Marks": sem_val,
-                    "Total Max Marks": int(tot_m),
-                }
-            )
+            code = code.strip()
+            # Check if the next line is a trailing wrapped title fragment (e.g. "TV & OTT", "New Media", "Music Level III")
+            if i + 1 < len(lines):
+                nxt = lines[i + 1].strip()
+                if (
+                    nxt
+                    and not code_only_start_re.match(nxt)
+                    and not re.search(
+                        r"Shri Vile Parle|SVKM|AFFILIATED|NAAC|Module Credits|COURSE DETAILS|Maximum Marks|Controller|Principal|Page:",
+                        nxt,
+                        re.I,
+                    )
+                    and not re.search(r"\d+\.\d{2}", nxt)
+                    and len(nxt) < 45
+                ):
+                    title = f"{title.strip()} {nxt}"
+                    i += 1
+            if code not in seen_codes:
+                seen_codes.add(code)
+                courses.append(
+                    {
+                        "Course Code": code,
+                        "Course Title": re.sub(r"\s+", " ", title).strip(),
+                        "Credits": _cast_pdf_number_or_raw(creds),
+                        "Internal Max Marks": _cast_pdf_number_or_raw(int_m),
+                        "Sem End Max Marks": _cast_pdf_number_or_raw(
+                            sem_m if sem_m is not None else ""
+                        ),
+                        "Total Max Marks": _cast_pdf_number_or_raw(tot_m),
+                    }
+                )
+        i += 1
 
     df = pd.DataFrame(courses)
     if df.empty:
@@ -342,9 +588,35 @@ def parse_page_2(page):
     return df
 
 
+# ==============================================================================
+# RESULT PAGES PARSER (COORDINATE-AWARE + PIPE-AWARE, AS-IS PDF FIDELITY)
+# ==============================================================================
+
+_HEADER_SKIP_PATTERNS = [
+    "Shri Vile Parle Kelavani Mandal",
+    "SVKM's",
+    "SVKM'S",
+    "Narsee Monjee College",
+    "UPG College",
+    "MITHIBAI COLLEGE",
+    "AFFILIATED TO UNIVERSITY",
+    "Affiliated to University",
+    "NAAC RE-ACCREDITED",
+    "NAAC Reaccredited",
+    "Module Credits",
+    "Consolidated Result",
+    "COURSE DETAILS",
+    "Candidate's Full Name",
+    "MRK G GP C",
+    "CG ; CG ;",
+]
+
+_COURSE_CODE_RE = re.compile(r"^[A-Z]{2,8}\d{2,4}[A-Z0-9]{0,3}$")
+
+
 def clean_page_lines(raw_text):
     """Filter out non-student header/footer lines, separator dashes, and execution logs."""
-    lines = raw_text.split("\n")
+    lines = (raw_text or "").split("\n")
     cleaned_lines = []
 
     for line in lines:
@@ -352,28 +624,10 @@ def clean_page_lines(raw_text):
         if not l_str:
             continue
 
-        if re.fullmatch(r"[-_=\s]+", l_str):
+        if re.fullmatch(r"[-_=\s\|]+", l_str):
             continue
 
-        if any(
-            h in l_str
-            for h in [
-                "Shri Vile Parle Kelavani Mandal",
-                "SVKM's",
-                "Narsee Monjee College",
-                "UPG College",
-                "MITHIBAI COLLEGE",
-                "AFFILIATED TO UNIVERSITY",
-                "NAAC RE-ACCREDITED",
-                "NAAC Reaccredited",
-                "Module Credits",
-                "Consolidated Result",
-                "COURSE DETAILS",
-                "Candidate's Full Name",
-                "MRK G GP C",
-                "CG ; CG ;",
-            ]
-        ):
+        if any(h in l_str for h in _HEADER_SKIP_PATTERNS):
             continue
 
         if re.search(
@@ -383,58 +637,22 @@ def clean_page_lines(raw_text):
         ):
             continue
 
+        # Page legend row 2 ("O >=90 10 A+ 80-89.99 9 ..."), the "Sub1 Sub2 ... G.T."
+        # column-header row and the wrapped title tail (",2026") repeat on every page.
+        # They must never leak into the last student's chunk (name contamination).
+        if re.search(
+            r"^\s*O\s*>=\s*90\b|\bSub1\s+Sub2\s+Sub3\b|^\s*,\s*\d{4}\s*$|\bG\.T\.\s*$",
+            l_str,
+        ):
+            continue
+
         cleaned_lines.append(l_str)
 
     return cleaned_lines
 
 
-def parse_header_line(line):
-    """Accurately extracts SNo, SAP, Roll, PRN, Name, Gender, ABC ID, Abeyance, and LD/PwD flag."""
-    line_clean = clean_dashes_and_artifacts(line)
-    is_abeyance = bool(re.search(r"Result\s+in\s+abeyance", line_clean, re.I))
-    if is_abeyance:
-        line_clean = re.sub(r"Result\s+in\s+abeyance", "", line_clean, flags=re.I).strip()
-
-    parts = line_clean.split()
-    if len(parts) < 3 or not parts[0].isdigit() or not parts[1].isdigit():
-        return None
-
-    s_no = parts[0]
-    sap_no = parts[1]
-    roll_no = parts[2]
-
-    rem_parts = parts[3:]
-    prn_no = ""
-    abc_id = ""
-
-    if rem_parts and (
-        rem_parts[0].startswith("MU")
-        or (rem_parts[0].isdigit() and len(rem_parts[0]) >= 14)
-    ):
-        prn_no = rem_parts.pop(0)
-
-    if rem_parts and rem_parts[-1].isdigit() and len(rem_parts[-1]) == 12:
-        abc_id = rem_parts.pop()
-
-    full_name = " ".join(rem_parts)
-    gender = "Female" if "/" in full_name else "Male"
-    is_pwd = bool(re.search(r"~", full_name))
-
-    return {
-        "SNo": s_no,
-        "SAP No": sap_no,
-        "Roll No": roll_no,
-        "PRN No": prn_no,
-        "Candidate Full Name": full_name,
-        "Gender": gender,
-        "ABC ID": abc_id,
-        "Is_PwD": is_pwd,
-        "Is_Abeyance": is_abeyance,
-    }
-
-
 def split_pipe_row(raw_line, label):
-    """Split row on '|' preserving empty cells for practicals alignment."""
+    """Split row on '|' preserving empty cells for internal-only / practicals alignment."""
     if raw_line is None:
         return []
     body = raw_line.strip()
@@ -447,29 +665,34 @@ def split_pipe_row(raw_line, label):
 
 
 def robust_parse_total_segment(seg):
-    """Parse a single subject's Total-line segment preserving all marks, grades, and $ symbols."""
+    """
+    Parse a single subject's Total-line segment preserving exact marks, grades, GP,
+    credits, and special symbols ($, #, ®) as printed in the PDF.
+    """
     seg = (seg or "").strip()
     if not seg:
         return "", "", "", ""
 
+    # Normalize glued tokens like F00 -> F 0 0, P$4 -> P$ 4, Grade$ -> Grade$
+    seg_norm = re.sub(r"\$([0-9]+)", r"$ \1", seg)
+    seg_norm = re.sub(r"([A-Za-z0-9\+\-]+)\s+\$", r"\1$", seg_norm)
+    seg_norm = re.sub(r"\bF00\b", "F 0 0", seg_norm)
+    seg_norm = re.sub(r"\bF\s+00\b", "F 0 0", seg_norm)
+    seg_norm = re.sub(r"\bDO\b", "0 0", seg_norm)
+    seg_norm = re.sub(r"\bPS(\d+)\b", r"P$ \1", seg_norm)
+
     m_start = re.match(
-        r"^([0-9]+(?:\s*\+\s*[0-9]+)?|[0-9\+ABNV®#\$]+|\-\-)\s+(.*)$", seg
+        r"^([0-9]+(?:\s*\+\s*[0-9]+)?|[0-9\+ABNV®#\$]+|\-\-)\s+(.*)$",
+        seg_norm,
     )
     if not m_start:
-        tokens = seg.split()
+        tokens = seg_norm.split()
         if len(tokens) == 1:
             return tokens[0], "", "", ""
         return "", "", "", ""
 
-    marks = m_start.group(1)
+    marks = m_start.group(1).strip()
     rest = m_start.group(2).strip()
-
-    rest = re.sub(r"\$([0-9]+)", r"$ \1", rest)
-    rest = re.sub(r"([A-Za-z0-9\+\-]+)\s+\$", r"\1$", rest)
-    rest = re.sub(r"\bF00\b", "F 0 0", rest)
-    rest = re.sub(r"\bF\s+00\b", "F 0 0", rest)
-    rest = re.sub(r"\bPS(\d+)\b", r"P$ \1", rest)
-
     tokens = rest.split()
 
     grade, gp, creds = "", "", ""
@@ -498,8 +721,181 @@ def robust_parse_total_segment(seg):
     return marks, grade, gp, creds
 
 
-def extract_subjects_universal(chunk_lines):
-    """Universally extracts Subject Codes, IA Marks, TH Marks, Total details, and Grand Total across all exam formats."""
+_NAME_TOKEN_RE = re.compile(r"^[~/A-Za-z.'\-]+$")
+
+
+def sanitize_candidate_name(name):
+    """
+    Keep only the genuine name part of a candidate name. Parsing stops at the first
+    token that cannot belong to a name (digits, '>=', ',', ';', 'Sub1' ...), so
+    stray page header / legend text can never be concatenated into the name.
+    """
+    kept = []
+    truncated = False
+    for tok in str(name or "").split():
+        if _NAME_TOKEN_RE.match(tok):
+            kept.append(tok)
+        else:
+            truncated = True
+            break
+    # If text had to be cut, a trailing lone grade letter (O/A/B/C/P/F) is a remnant of
+    # the grade legend ("O >=90 ...") and is removed too. Untouched names are never altered.
+    if truncated:
+        while kept and kept[-1] in ("O", "A", "B", "C", "P", "F"):
+            kept.pop()
+    return re.sub(r"^/\s+", "/", " ".join(kept).strip())
+
+
+def parse_student_demographics_from_chunk(chunk_lines):
+    """
+    Extract SNo, SAP No, Roll No, PRN No, Candidate Full Name, Gender, ABC ID,
+    Is_PwD, and Is_Abeyance across ALL demographic lines of a student chunk.
+    Handles multi-line wrapped names (e.g., NM College where Surname or Father/Mother
+    name wraps to a second line or PRN/Name/ABC ID appear on a separate line).
+    """
+    if not chunk_lines:
+        return None
+
+    full_chunk_text = " ".join(chunk_lines)
+    is_abeyance = bool(
+        re.search(r"Result\s+in\s+abeyance", full_chunk_text, re.I)
+    )
+
+    # Collect candidate header lines (lines before/outside IA, TH, Total, CG, Semester summary)
+    header_fragments = []
+    for idx, l in enumerate(chunk_lines):
+        l_clean = clean_dashes_and_artifacts(l).replace("|", " ").strip()
+        if not l_clean:
+            continue
+        if re.match(r"^(IA|TH|Total)\b", l_clean):
+            break
+        if re.search(r"\[?\bSemester\s+[IVXLCDM\d]+", l_clean, re.I):
+            continue
+        # If line contains 3+ course codes, stop collecting header lines
+        codes_in_line = [
+            tok for tok in l_clean.split() if _COURSE_CODE_RE.match(tok)
+        ]
+        if len(codes_in_line) >= 3:
+            # Check if any demographic token (PRN or 12-digit ABC ID) was mixed into this line
+            continue
+        if re.fullmatch(r"[\d\-\s\.\$#]+", l_clean) and idx > 0:
+            continue
+        header_fragments.append(l_clean)
+
+    # Also check if PRN (MU... or 16-digit) or 12-digit ABC ID got pushed to a lower line in text stream
+    for l in chunk_lines[len(header_fragments) :]:
+        l_clean = clean_dashes_and_artifacts(l).replace("|", " ").strip()
+        if re.search(r"\[?\bSemester\s+[IVXLCDM\d]+", l_clean, re.I):
+            continue
+        if re.search(r"\b(MU\d{10,16}|\d{12}|\d{16})\b", l_clean) and not re.match(
+            r"^(IA|TH|Total)\b", l_clean
+        ):
+            # Line containing PRN / Name / ABC ID displaced in stream (e.g. NM Student 004, 016)
+            codes_in_line = [
+                tok for tok in l_clean.split() if _COURSE_CODE_RE.match(tok)
+            ]
+            if len(codes_in_line) < 3:
+                header_fragments.append(l_clean)
+
+    combined_header = " ".join(header_fragments)
+    combined_header = re.sub(
+        r"Result\s+in\s+abeyance", "", combined_header, flags=re.I
+    ).strip()
+    # Remove any accidental G.T. / Percentage tokens from header fragments
+    combined_header = re.sub(r"\b\d{2,3}/\d{3}\b", "", combined_header)
+    combined_header = re.sub(r"\b\d{2}\.\d{2}%?", "", combined_header)
+
+    tokens = combined_header.split()
+    if len(tokens) < 3:
+        return None
+
+    s_no = ""
+    sap_no = ""
+    roll_no = ""
+    prn_no = ""
+    abc_id = ""
+    name_tokens = []
+
+    # 1. Identify SNo (3-digit or 1-4 digit leading serial) & SAP No (9-12 digit number)
+    used_indices = set()
+    for i, tok in enumerate(tokens):
+        if not s_no and re.fullmatch(r"\d{1,4}", tok):
+            s_no = tok
+            used_indices.add(i)
+            break
+
+    for i, tok in enumerate(tokens):
+        if i in used_indices:
+            continue
+        if re.fullmatch(r"\d{10,11}", tok):
+            sap_no = tok
+            used_indices.add(i)
+            break
+
+    if not s_no or not sap_no:
+        return None
+
+    # 2. Identify Roll No (alphanumeric token like D001, A001 immediately following SAP No or SNo)
+    for i, tok in enumerate(tokens):
+        if i in used_indices:
+            continue
+        if re.fullmatch(r"[A-Z]\d{2,4}", tok):
+            roll_no = tok
+            used_indices.add(i)
+            break
+
+    # 3. Identify PRN No (starts with MU or 15-16 digit university PRN)
+    for i, tok in enumerate(tokens):
+        if i in used_indices:
+            continue
+        if tok.startswith("MU") or (tok.isdigit() and len(tok) >= 14):
+            prn_no = tok
+            used_indices.add(i)
+            break
+
+    # 4. Identify 12-digit ABC / APAAR ID (search from right to left)
+    for i in range(len(tokens) - 1, -1, -1):
+        if i in used_indices:
+            continue
+        if tokens[i].isdigit() and len(tokens[i]) == 12:
+            abc_id = tokens[i]
+            used_indices.add(i)
+            break
+
+    # 5. Remaining tokens form Candidate Full Name (filtering out any stray course codes)
+    for i, tok in enumerate(tokens):
+        if i in used_indices:
+            continue
+        if _COURSE_CODE_RE.match(tok):
+            continue
+        name_tokens.append(tok)
+
+    full_name = " ".join(name_tokens).strip()
+    # Normalize "/ SURNAME" -> "/SURNAME" and drop any non-name trailing text
+    full_name = re.sub(r"^/\s+", "/", full_name)
+    full_name = sanitize_candidate_name(full_name)
+    gender = "Female" if "/" in full_name else "Male"
+    is_pwd = bool(re.search(r"~", full_name))
+
+    return {
+        "SNo": s_no,
+        "SAP No": sap_no,
+        "Roll No": roll_no,
+        "PRN No": prn_no,
+        "Candidate Full Name": full_name,
+        "Gender": gender,
+        "ABC ID": abc_id,
+        "Is_PwD": is_pwd,
+        "Is_Abeyance": is_abeyance,
+    }
+
+
+def extract_subjects_universal(chunk_lines, known_course_codes=None):
+    """
+    Universally extracts Subject Codes, IA Marks, TH Marks, Total details,
+    CG values, Grand Total, and Percentage across all SVKM exam gazette formats.
+    Strictly preserves raw PDF values without auto-calculating missing entries.
+    """
     subj_codes = []
     ia_scores = []
     th_scores = []
@@ -508,16 +904,34 @@ def extract_subjects_universal(chunk_lines):
     gt_score = ""
     percentage = ""
 
+    # 1. Extract Grand Total (e.g. 411/550, 638/700) and Percentage (e.g. 74.73%)
     for l in chunk_lines:
-        gt_match = re.search(r"(\d+/\d+)\s*([\d\.]+%?)?", l)
+        if re.search(r"\[?\bSemester\s+[IVXLCDM\d]+", l, re.I):
+            continue
+        gt_match = re.search(
+            r"\b(\d{2,3}/\d{3})\b(?:\s*([\d\.,]+%?))?", l
+        )
         if gt_match:
             gt_score = gt_match.group(1)
-            percentage = gt_match.group(2) or ""
+            if gt_match.group(2):
+                percentage = gt_match.group(2)
             break
 
+    if gt_score and not percentage:
+        for l in chunk_lines:
+            if re.search(r"\[?\bSemester\s+[IVXLCDM\d]+", l, re.I):
+                continue
+            pct_match = re.search(r"\b(\d{2}[.,]\d{2})%", l)
+            if pct_match:
+                percentage = pct_match.group(1) + "%"
+                break
+
+    # 2. Check if IA line has embedded course codes
     ia_with_codes = None
     for l in chunk_lines:
-        if l.strip().startswith("IA") and re.search(r"[A-Z]{3,8}\d{2,4}", l):
+        if l.strip().startswith("IA") and re.search(
+            r"[A-Z]{2,8}\d{2,4}[A-Z0-9]{0,3}", l
+        ):
             ia_with_codes = l
             break
 
@@ -529,7 +943,7 @@ def extract_subjects_universal(chunk_lines):
         ]
         for seg in segments:
             if "/" in seg and any(c.isdigit() for c in seg):
-                m_gt = re.search(r"(\d+/\d+)\s*([\d\.]+%?)?", seg)
+                m_gt = re.search(r"(\d+/\d+)\s*([\d\.,]+%?)?", seg)
                 if m_gt and not gt_score:
                     gt_score = m_gt.group(1)
                     percentage = m_gt.group(2) or ""
@@ -546,23 +960,68 @@ def extract_subjects_universal(chunk_lines):
                 subj_codes.append(code)
                 ia_scores.append(ia_val)
     else:
+        # Collect all course codes in chunk (handling displaced course codes as in NM Student 054)
         for l in chunk_lines:
-            codes = re.findall(r"\b[A-Z]{2,8}\d{2,4}[A-Z0-9]?\b", l)
-            if len(codes) >= 3:
-                subj_codes = codes
+            if re.search(r"\[?\bSemester\s+[IVXLCDM\d]+", l, re.I):
+                continue
+            tokens = l.replace("|", " ").split()
+            line_codes = [
+                t
+                for t in tokens
+                if _COURSE_CODE_RE.match(t)
+                and (not known_course_codes or t in known_course_codes or len(t) >= 7)
+                and not t.startswith("MU0")
+            ]
+            if len(line_codes) >= 3:
+                subj_codes.extend(line_codes)
                 break
+
+        # Check if any additional course codes were displaced onto another line (e.g. NM Student 054)
+        if subj_codes and known_course_codes:
+            for l in chunk_lines:
+                if re.search(r"\[?\bSemester\s+[IVXLCDM\d]+", l, re.I):
+                    continue
+                tokens = l.replace("|", " ").split()
+                extra_codes = [
+                    t
+                    for t in tokens
+                    if t in known_course_codes and t not in subj_codes
+                ]
+                if extra_codes:
+                    # Re-collect from pipe positions if possible
+                    pass
+
         for l in chunk_lines:
-            if l.startswith("IA"):
+            if l.strip().startswith("IA"):
                 ia_scores = split_pipe_row(l, "IA")
+                break
 
     total_line_idx = None
+    th_line_idx = None
     for i, l in enumerate(chunk_lines):
-        if l.startswith("TH"):
-            th_scores = split_pipe_row(l, "TH")
-        elif l.startswith("Total"):
-            tot_info = split_pipe_row(l, "Total")
+        l_str = l.strip()
+        if l_str.startswith("TH"):
+            th_scores = split_pipe_row(l_str, "TH")
+            th_line_idx = i
+        elif l_str.startswith("Total"):
+            tot_info = split_pipe_row(l_str, "Total")
             total_line_idx = i
 
+    # Handle wrapped grace marks on line between TH and Total (e.g., "+7" in NM Student 053)
+    if (
+        th_line_idx is not None
+        and total_line_idx is not None
+        and total_line_idx > th_line_idx + 1
+    ):
+        for mid_idx in range(th_line_idx + 1, total_line_idx):
+            mid_line = chunk_lines[mid_idx].strip()
+            if re.search(r"\+\s*\d+", mid_line):
+                mid_segs = split_pipe_row(mid_line, "")
+                for s_i, m_seg in enumerate(mid_segs):
+                    if m_seg and s_i < len(th_scores):
+                        th_scores[s_i] = f"{th_scores[s_i]} {m_seg}".strip()
+
+    # Extract CG line immediately following Total line
     if total_line_idx is not None and total_line_idx + 1 < len(chunk_lines):
         candidate = chunk_lines[total_line_idx + 1]
         if candidate.strip() and re.fullmatch(
@@ -581,8 +1040,194 @@ def extract_subjects_universal(chunk_lines):
     )
 
 
+def extract_subjects_coordinate_aware(student_words, known_course_codes=None):
+    """
+    Coordinate-based subject extractor using pdfplumber word bounding boxes.
+    Aligns every IA, TH, Total, and CG token to its exact Subject column (Sub1..SubN)
+    by horizontal X-coordinate, preventing column shifts when TH is blank (e.g. NHCEP264),
+    when grace marks wrap onto a new line (e.g. 17 +7 in Student 053), or when course
+    codes drop below the Total row in the PDF stream (e.g. Student 054).
+    """
+    if not student_words:
+        return None
+
+    # Find all course code words in this student's vertical block
+    code_words = []
+    for w in student_words:
+        txt = w["text"].strip().strip("|")
+        if not txt or txt.startswith("MU0"):
+            continue
+        if known_course_codes and txt in known_course_codes:
+            code_words.append((w["x0"], w["top"], txt))
+        elif not known_course_codes and _COURSE_CODE_RE.match(txt) and len(txt) >= 7:
+            if not re.match(r"^[AD]\d{3}$", txt):
+                code_words.append((w["x0"], w["top"], txt))
+
+    if len(code_words) < 3:
+        return None
+
+    # Sort course codes strictly left-to-right by X coordinate (deduplicating by X proximity)
+    code_words.sort(key=lambda item: item[0])
+    unique_codes = []
+    for x0, top, code in code_words:
+        if not unique_codes or abs(x0 - unique_codes[-1][0]) > 18:
+            unique_codes.append((x0, top, code))
+
+    n_subs = len(unique_codes)
+    if n_subs < 3:
+        return None
+
+    subj_codes = [c[2] for c in unique_codes]
+    col_x_starts = [c[0] for c in unique_codes]
+
+    # Find G.T. token (e.g. 638/700 or 411/550) to bound the rightmost subject column
+    gt_score = ""
+    percentage = ""
+    gt_x0 = 9999.0
+    for w in student_words:
+        txt = w["text"].strip().strip("|")
+        m_gt = re.match(r"^(\d{2,3}/\d{3})$", txt)
+        if m_gt:
+            gt_score = m_gt.group(1)
+            gt_x0 = min(gt_x0, w["x0"])
+        elif re.match(r"^\d{2}[.,]\d{2}%$", txt):
+            percentage = txt
+
+    if not percentage:
+        for w in student_words:
+            txt = w["text"].strip().strip("|")
+            if (
+                gt_score
+                and w["x0"] >= gt_x0 - 5
+                and re.match(r"^\d{2}[.,]\d{2}%?$", txt)
+            ):
+                percentage = txt
+                break
+
+    # Compute horizontal X interval [left_b, right_b) for each subject column
+    col_bounds = []
+    for idx in range(n_subs):
+        left_b = (
+            col_x_starts[0] - 12
+            if idx == 0
+            else (col_x_starts[idx - 1] + col_x_starts[idx]) / 2.0
+        )
+        # Keep left boundary slightly left of the course code start
+        if idx > 0:
+            left_b = min(left_b, col_x_starts[idx] - 4)
+        right_b = (
+            gt_x0 - 4
+            if idx == n_subs - 1
+            else min(
+                (col_x_starts[idx] + col_x_starts[idx + 1]) / 2.0,
+                col_x_starts[idx + 1] - 4,
+            )
+        )
+        col_bounds.append((left_b, right_b))
+
+    # Locate vertical Y coordinates of IA, TH, Total, and Semester rows
+    ia_tops = [
+        w["top"]
+        for w in student_words
+        if w["text"].strip().strip("|") == "IA" and w["x0"] < col_x_starts[0] + 15
+    ]
+    th_tops = [
+        w["top"]
+        for w in student_words
+        if w["text"].strip().strip("|") in ("TH", "HL")
+        and w["x0"] < col_x_starts[0] + 15
+    ]
+    tot_tops = [
+        w["top"]
+        for w in student_words
+        if w["text"].strip().strip("|") == "Total"
+        and w["x0"] < col_x_starts[0] + 15
+    ]
+    sem_tops = [
+        w["top"]
+        for w in student_words
+        if "Semester" in w["text"] or "Remark" in w["text"]
+    ]
+
+    if not ia_tops or not tot_tops:
+        return None
+
+    ia_y = ia_tops[0]
+    tot_y = tot_tops[0]
+    th_y = th_tops[0] if th_tops else (ia_y + tot_y) / 2.0
+    sem_y = min(sem_tops) if sem_tops else tot_y + 25.0
+
+    y_mid_ia_th = (ia_y + th_y) / 2.0
+    y_mid_th_tot = (th_y + tot_y) / 2.0
+    y_cg_min = tot_y + 4.5
+    y_cg_max = min(sem_y - 2.0, tot_y + 20.0)
+
+    ia_buckets = [[] for _ in range(n_subs)]
+    th_buckets = [[] for _ in range(n_subs)]
+    tot_buckets = [[] for _ in range(n_subs)]
+    cg_buckets = [[] for _ in range(n_subs)]
+
+    for w in student_words:
+        txt = w["text"].strip().strip("|").strip()
+        if not txt or txt in ("IA", "TH", "HL", "Total"):
+            continue
+        if txt in subj_codes or txt == gt_score or txt == percentage:
+            continue
+        wx = (w["x0"] + w["x1"]) / 2.0
+        wy = w["top"]
+
+        # Determine which subject column wx falls into
+        sub_idx = None
+        for idx, (lb, rb) in enumerate(col_bounds):
+            if lb <= wx < rb:
+                sub_idx = idx
+                break
+        if sub_idx is None:
+            continue
+
+        if ia_y - 5.0 <= wy < y_mid_ia_th:
+            ia_buckets[sub_idx].append((w["x0"], wy, txt))
+        elif y_mid_ia_th <= wy < y_mid_th_tot:
+            th_buckets[sub_idx].append((w["x0"], wy, txt))
+        elif y_mid_th_tot <= wy <= tot_y + 4.5:
+            tot_buckets[sub_idx].append((w["x0"], wy, txt))
+        elif y_cg_min < wy <= y_cg_max:
+            if re.fullmatch(r"[\d\.\$#\-]+", txt):
+                cg_buckets[sub_idx].append((w["x0"], wy, txt))
+
+    ia_scores = [
+        " ".join(t[2] for t in sorted(b, key=lambda x: (x[1], x[0])))
+        for b in ia_buckets
+    ]
+    th_scores = [
+        " ".join(t[2] for t in sorted(b, key=lambda x: (x[1], x[0])))
+        for b in th_buckets
+    ]
+    tot_info = [
+        " ".join(t[2] for t in sorted(b, key=lambda x: x[0]))
+        for b in tot_buckets
+    ]
+    cg_scores = [
+        " ".join(t[2] for t in sorted(b, key=lambda x: x[0]))
+        for b in cg_buckets
+    ]
+
+    return (
+        subj_codes,
+        ia_scores,
+        th_scores,
+        tot_info,
+        cg_scores,
+        gt_score,
+        percentage,
+    )
+
+
 def extract_semester_and_final_metrics(rem_str):
-    """Dynamically parses semester progression metrics, individual grade value, and clean status."""
+    """
+    Dynamically parses semester progression metrics, individual grade value, and status
+    while preserving raw PDF symbols (such as '--' or '$') as printed.
+    """
     rem_clean = clean_dashes_and_artifacts(rem_str)
 
     sem_data = {}
@@ -598,8 +1243,7 @@ def extract_semester_and_final_metrics(rem_str):
         if (
             sem_raw.endswith("C")
             and len(sem_raw) > 1
-            and sem_raw[:-1]
-            in ["I", "II", "III", "IV", "V", "VI", "VII", "VIII", "IX", "X"]
+            and sem_raw[:-1] in ROMAN_ORDER
         ):
             sem_num = sem_raw[:-1]
         else:
@@ -607,65 +1251,64 @@ def extract_semester_and_final_metrics(rem_str):
 
         body = raw_body[len(m_num.group(1)) :]
 
-        c_m = re.search(r"\bC\s*[-:\.]\s*(\d+|--)", body)
+        c_m = re.search(r"\bC\s*(?:[-:\.]\s*)?(--|\d+)", body)
         if not c_m:
-            c_lead = re.match(r"^[-:\.]\s*(\d+)", body)
+            c_lead = re.match(r"^[-:\.]\s*(--|\d+)", body)
             c_val = c_lead.group(1) if c_lead else ""
         else:
-            c_val = c_m.group(1) if c_m.group(1) != "--" else ""
+            c_val = c_m.group(1)
 
-        cg_m = re.search(r"\bCG\s*[-:\.]\s*(\d+|--)", body)
-        sgpa_m = re.search(r"\bSGPA\s*[-:\.]\s*([0-9\.]+|AD|--)", body)
-        att_m = re.search(r"Attempt[/s]*[-:\.]\s*(\d+)", body, re.I)
+        cg_m = re.search(r"\bCG\s*(?:[-:\.]\s*)?(--|\d+)", body)
+        sgpa_m = re.search(
+            r"\bSGPA\s*(?:[-:\.]\s*)?(--|[0-9]+[.,][0-9]+#?|AD)", body
+        )
+        att_m = re.search(r"Attempt[/s]*\s*[-:\.]\s*(\d{1,3})", body, re.I)
         fail_m = re.search(r"\bF\s*\(\s*(\d+)\s*\)", body, re.I)
 
         sem_key = f"Sem_{sem_num}"
+        # '--' printed in the PDF is preserved as '--'; cells stay blank only when
+        # nothing is printed for them.
         sem_data[f"{sem_key}_Credits"] = c_val
-        sem_data[f"{sem_key}_CG"] = (
-            cg_m.group(1) if (cg_m and cg_m.group(1) != "--") else ""
-        )
+        sem_data[f"{sem_key}_CG"] = cg_m.group(1) if cg_m else ""
         sem_data[f"{sem_key}_SGPA"] = (
-            sgpa_m.group(1) if (sgpa_m and sgpa_m.group(1) != "--") else ""
+            sgpa_m.group(1).replace(",", ".") if sgpa_m else ""
         )
         sem_data[f"{sem_key}_Attempts"] = att_m.group(1) if att_m else ""
         sem_data[f"{sem_key}_Fail_Info"] = (
             f"F({fail_m.group(1)})" if fail_m else ""
         )
 
-    tot_cred = re.search(r"Total\s+Credit\s*:\s*(\d+|--)?", rem_clean, re.I)
-    tot_cg = re.search(r"Total\s+CG\s*:\s*(\d+|--)?", rem_clean, re.I)
-    cgpa = re.search(r"\bCGPA\s*:\s*([0-9\.]+|--)?", rem_clean, re.I)
+    tot_cred = re.search(r"Total\s+Credit\s*:\s*(--|\d+)?", rem_clean, re.I)
+    tot_cg = re.search(r"Total\s+CG\s*:\s*(--|\d+)?", rem_clean, re.I)
+    cgpa = re.search(r"\bCGPA\s*:\s*(--|[0-9\.]+)?", rem_clean, re.I)
 
     final_grade_m = re.search(
-        r"Final\s+Grade\s*:\s*([OABCDPF0][\+\-!]?|--)", rem_clean, re.I
+        r"Final\s+Grade\s*(?:[-:]\s*)?(--|[OABCDPF0][\+\-!]?)",
+        rem_clean,
+        re.I,
     )
-    final_grade_val = (
-        final_grade_m.group(1).strip()
-        if (final_grade_m and final_grade_m.group(1) != "--")
-        else ""
-    )
+    final_grade_val = final_grade_m.group(1).strip() if final_grade_m else ""
     if final_grade_val == "0":
         final_grade_val = "O"
 
+    # Match Grade in Remark block (handles Grade-A, Grade-A+, Grade--, Grade - --)
     sem_grade_m = re.search(
-        r"Grade\s*[-:\s]\s*([OABCDPF0][\+\-!]?|--)(?:\s|$|\]|;|,)", rem_clean, re.I
+        r"(?<!Final\s)Grade\s*(?:[-:\s]\s*)?(--|[OABCDPF0][\+\-!]?)(?=\s|$|\]|;|,|1|l|\)|Eligible|Not\s+Eligible|Program)",
+        rem_clean,
+        re.I,
     )
-    extracted_grade = (
-        sem_grade_m.group(1).strip()
-        if (sem_grade_m and sem_grade_m.group(1) != "--")
-        else ""
-    )
+    extracted_grade = sem_grade_m.group(1).strip() if sem_grade_m else ""
     if extracted_grade == "0":
         extracted_grade = "O"
 
     cum_perc = re.search(
-        r"Cum\.?\s*Perc\.?\s*:\s*([0-9\.]+%?|--)?", rem_clean, re.I
+        r"Cum\.?\s*Perc\.?\s*:\s*(--|[0-9\.]+%?)?", rem_clean, re.I
     )
 
     remark_m = re.search(r"Remark\s*:\s*([^\];]+)", rem_clean, re.I)
     raw_remark = remark_m.group(1).strip() if remark_m else ""
     status_m = re.search(
-        r"\b(Successful|Unsuccessful)([\$]*)", raw_remark, re.I
+        r"\b(Successful|Unsuccessful)(\s*\$+)?", raw_remark, re.I
     )
     if status_m:
         result_status = status_m.group(0).strip()
@@ -689,26 +1332,12 @@ def extract_semester_and_final_metrics(rem_str):
 
     return {
         "semesters": sem_data,
-        "Total Credit": (
-            tot_cred.group(1)
-            if (tot_cred and tot_cred.group(1) and tot_cred.group(1) != "--")
-            else ""
-        ),
-        "Total CG": (
-            tot_cg.group(1)
-            if (tot_cg and tot_cg.group(1) and tot_cg.group(1) != "--")
-            else ""
-        ),
-        "CGPA": (
-            cgpa.group(1)
-            if (cgpa and cgpa.group(1) and cgpa.group(1) != "--")
-            else ""
-        ),
+        "Total Credit": (tot_cred.group(1) if (tot_cred and tot_cred.group(1)) else ""),
+        "Total CG": (tot_cg.group(1) if (tot_cg and tot_cg.group(1)) else ""),
+        "CGPA": (cgpa.group(1) if (cgpa and cgpa.group(1)) else ""),
         "Final Grade": final_grade_val,
         "Cumulative Percentage": (
-            cum_perc.group(1)
-            if (cum_perc and cum_perc.group(1) and cum_perc.group(1) != "--")
-            else ""
+            cum_perc.group(1) if (cum_perc and cum_perc.group(1)) else ""
         ),
         "Result Status": result_status,
         "Grade": extracted_grade,
@@ -716,21 +1345,87 @@ def extract_semester_and_final_metrics(rem_str):
     }
 
 
+def _extract_page_student_word_groups(page):
+    """
+    Slice a PDF result page into per-student word lists keyed by SNo or SAP No,
+    enabling coordinate-aware subject column alignment.
+    """
+    try:
+        words = page.extract_words(x_tolerance=2, y_tolerance=2) or []
+    except Exception:
+        return {}
+
+    if not words:
+        return {}
+
+    # Filter out top page header and bottom page footer
+    footer_top = 9999.0
+    header_bottom = 0.0
+    for w in words:
+        txt = w["text"].strip()
+        if txt in ("Female,", "Execution", "CONTROLLER") and w["top"] > 400:
+            footer_top = min(footer_top, w["top"] - 4)
+        if txt == "CG" and w["top"] < 175:
+            header_bottom = max(header_bottom, w["bottom"] + 1)
+
+    body_words = [
+        w
+        for w in words
+        if w["top"] >= header_bottom and w["top"] < footer_top
+    ]
+    if not body_words:
+        return {}
+
+    # Identify student anchor Y-positions using SNo (leftmost 3-digit token) or 10-11 digit SAP No
+    anchors = []
+    for w in body_words:
+        txt = w["text"].strip().strip("|")
+        if w["x0"] < 52 and re.fullmatch(r"\d{3}", txt):
+            anchors.append((w["top"], txt))
+
+    anchors.sort(key=lambda x: x[0])
+    # Deduplicate anchors within 15pt vertically
+    dedup_anchors = []
+    for top_y, sno in anchors:
+        if not dedup_anchors or abs(top_y - dedup_anchors[-1][0]) > 18:
+            dedup_anchors.append((top_y, sno))
+
+    student_word_map = {}
+    for idx, (top_y, sno) in enumerate(dedup_anchors):
+        y_min = top_y - 8.0
+        y_max = (
+            dedup_anchors[idx + 1][0] - 6.0
+            if idx + 1 < len(dedup_anchors)
+            else footer_top
+        )
+        s_words = [w for w in body_words if y_min <= w["top"] < y_max]
+        student_word_map[sno] = s_words
+
+    return student_word_map
+
+
 def parse_result_pages(
     pdf_pages, course_title_map=None, exam_type="Regular"
 ):
-    """Extract all student records and generate a structured Result_Data dataset."""
+    """
+    Extract all student records and generate the Result_Data dataset.
+    Strictly preserves PDF values as-is without auto-calculating missing fields.
+    Orders the highest (current) semester columns as:
+    Credits, CG, SGPA, Attempts, Fail_Info.
+    """
     if course_title_map is None:
         course_title_map = {}
 
+    known_codes = set(course_title_map.keys())
     all_lines = []
+    global_word_groups_by_sno = {}
 
     for p_idx, page in enumerate(pdf_pages):
         p_no = p_idx + 1
         p_text = page.extract_text() or ""
 
         if "Consolidated Result" not in p_text and not re.search(
-            r"^\d{1,4}\s+\d{9,14}", p_text, re.M
+            r"^\d{1,4}\s+\|?\s*\d{9,14}", p_text, re.M
         ):
             if len(pdf_pages) > 2 and p_no < 3:
                 continue
@@ -738,15 +1433,28 @@ def parse_result_pages(
         cleaned = clean_page_lines(p_text)
         all_lines.extend(cleaned)
 
+        page_word_map = _extract_page_student_word_groups(page)
+        global_word_groups_by_sno.update(page_word_map)
+
+    # Group lines into student chunks
     student_chunks = []
     current_chunk = []
 
+    new_student_line_re = re.compile(
+        r"^\d{3}\b.*?\b\d{10,11}\b|^\d{1,4}\s+\d{9,14}\s+[A-Z0-9]+"
+    )
+
     for line in all_lines:
-        if re.match(r"^\d{1,4}\s+\d{9,14}\s+[A-Z0-9]+", line):
+        l_norm = re.sub(r"\s*\|\s*", " ", line).strip()
+        # Check if this line starts a new student record
+        is_start = bool(new_student_line_re.match(l_norm)) or bool(
+            re.match(r"^\d{3}\s+(?:MU\d{10,16}|\d{10,16})\b", l_norm)
+        )
+        if is_start:
             if current_chunk:
                 student_chunks.append(current_chunk)
                 current_chunk = []
-        if current_chunk or re.match(r"^\d{1,4}\s+\d{9,14}\s+[A-Z0-9]+", line):
+        if current_chunk or is_start:
             current_chunk.append(line)
 
     if current_chunk:
@@ -759,7 +1467,7 @@ def parse_result_pages(
         if not chunk:
             continue
 
-        header_info = parse_header_line(chunk[0])
+        header_info = parse_student_demographics_from_chunk(chunk)
         if not header_info:
             continue
 
@@ -786,15 +1494,39 @@ def parse_result_pages(
             detailed_records.append(detailed_row)
             continue
 
-        (
-            subj_codes,
-            ia_scores,
-            th_scores,
-            tot_info,
-            cg_scores,
-            gt_score,
-            percentage,
-        ) = extract_subjects_universal(chunk)
+        # Primary: coordinate-aware extraction; Fallback/Complement: universal line/pipe extraction
+        coord_res = extract_subjects_coordinate_aware(
+            global_word_groups_by_sno.get(header_info["SNo"]),
+            known_course_codes=known_codes,
+        )
+        pipe_res = extract_subjects_universal(
+            chunk, known_course_codes=known_codes
+        )
+
+        if coord_res and len(coord_res[0]) >= len(pipe_res[0]):
+            (
+                subj_codes,
+                ia_scores,
+                th_scores,
+                tot_info,
+                cg_scores,
+                gt_score,
+                percentage,
+            ) = coord_res
+            if not gt_score and pipe_res[5]:
+                gt_score = pipe_res[5]
+            if not percentage and pipe_res[6]:
+                percentage = pipe_res[6]
+        else:
+            (
+                subj_codes,
+                ia_scores,
+                th_scores,
+                tot_info,
+                cg_scores,
+                gt_score,
+                percentage,
+            ) = pipe_res
 
         rem_str = " ".join(chunk)
         eval_metrics = extract_semester_and_final_metrics(rem_str)
@@ -806,7 +1538,11 @@ def parse_result_pages(
             marks_obt = parts[0].strip()
             max_marks = parts[1].strip()
 
-        raw_percentage_str = percentage.replace("%", "").strip() if percentage else ""
+        raw_percentage_str = (
+            percentage.replace("%", "").replace(",", ".").strip()
+            if percentage
+            else ""
+        )
 
         detailed_row = {
             "SNo": header_info["SNo"],
@@ -833,19 +1569,14 @@ def parse_result_pages(
 
             course_title = course_title_map.get(code, code)
 
-            cg_entry = cg_scores[idx] if idx < len(cg_scores) else ""
-            cg_clean = cg_entry.replace("$", "").replace("#", "").strip()
-            if cg_clean.isdigit():
-                cg_val = int(cg_clean)
-            elif (
-                gp.replace("$", "").replace("#", "").isdigit()
-                and creds.replace("$", "").replace("#", "").isdigit()
-            ):
-                cg_val = int(gp.replace("$", "").replace("#", "")) * int(
-                    creds.replace("$", "").replace("#", "")
-                )
+            # STRICT AS-IS PDF EXTRACTION FOR CG (NO BACKGROUND CALCULATION IN PARSER)
+            cg_entry = clean_text_preserve_symbols(
+                cg_scores[idx] if idx < len(cg_scores) else ""
+            )
+            if cg_entry.isdigit():
+                cg_val = int(cg_entry)
             else:
-                cg_val = ""
+                cg_val = cg_entry
 
             sub_num = idx + 1
             detailed_row[f"Sub{sub_num} Code"] = code
@@ -877,47 +1608,66 @@ def parse_result_pages(
 
         detailed_records.append(detailed_row)
 
-    roman_order = [
-        "I",
-        "II",
-        "III",
-        "IV",
-        "V",
-        "VI",
-        "VII",
-        "VIII",
-        "IX",
-        "X",
+    # Identify all discovered semesters and determine highest (current) semester
+    discovered_sems = sorted(
+        {
+            m.group(1).upper()
+            for k in all_discovered_sem_keys
+            if (m := re.match(r"^Sem_([IVXLCDM\d]+)_", k))
+        },
+        key=sem_rank,
+    )
+    highest_sem = discovered_sems[-1] if discovered_sems else None
+
+    # Ensure all 5 required columns exist for the highest (current) semester
+    highest_sem_required_cols = []
+    if highest_sem:
+        for sfx in ["Credits", "CG", "SGPA", "Attempts", "Fail_Info"]:
+            col_k = f"Sem_{highest_sem}_{sfx}"
+            all_discovered_sem_keys.add(col_k)
+            highest_sem_required_cols.append(col_k)
+
+    # Column order inside semester groups:
+    # Highest semester strictly ordered as: Credits, CG, SGPA, Attempts, Fail_Info
+    highest_sem_suffix_order = [
+        "Credits",
+        "CG",
+        "SGPA",
+        "Attempts",
+        "Fail_Info",
     ]
-
-    def sem_sort_key(col_name):
-        m = re.search(r"Sem_([IVXLCDM\d]+)_", col_name)
-        if m:
-            num = m.group(1).upper()
-            return (
-                roman_order.index(num)
-                if num in roman_order
-                else (int(num) if num.isdigit() else 99)
-            )
-        return 99
-
-    sem_suffix_order = ["Credits", "SGPA", "Attempts", "CG", "Fail_Info"]
+    lower_sem_suffix_order = [
+        "Credits",
+        "CG",
+        "SGPA",
+        "Attempts",
+        "Fail_Info",
+    ]
 
     def sem_col_sort_key(col_name):
         m = re.match(r"^Sem_([IVXLCDM\d]+)_(.*)$", col_name)
-        sem_name = m.group(1) if m else ""
+        sem_name = m.group(1).upper() if m else ""
         suffix = m.group(2) if m else ""
-        suffix_rank = (
-            sem_suffix_order.index(suffix)
-            if suffix in sem_suffix_order
-            else len(sem_suffix_order)
+        order_list = (
+            highest_sem_suffix_order
+            if sem_name == highest_sem
+            else lower_sem_suffix_order
         )
-        return (sem_sort_key(col_name), sem_name, suffix_rank, col_name)
+        suffix_rank = (
+            order_list.index(suffix)
+            if suffix in order_list
+            else len(order_list)
+        )
+        return (sem_rank(sem_name), sem_name, suffix_rank, col_name)
 
     sorted_sem_cols = sorted(all_discovered_sem_keys, key=sem_col_sort_key)
     df_detailed = pd.DataFrame(detailed_records)
 
     if not df_detailed.empty:
+        for req_c in highest_sem_required_cols:
+            if req_c not in df_detailed.columns:
+                df_detailed[req_c] = ""
+
         base_id_cols = [
             c
             for c in [
@@ -935,9 +1685,7 @@ def parse_result_pages(
         ]
 
         sub_cols = [
-            c
-            for c in df_detailed.columns
-            if re.match(r"^Sub\d+", str(c))
+            c for c in df_detailed.columns if re.match(r"^Sub\d+\s", str(c))
         ]
 
         gt_cols = [
@@ -975,17 +1723,20 @@ def parse_result_pages(
         all_ordered = ordered_cols + [
             c for c in df_detailed.columns if c not in ordered_cols
         ]
-        df_detailed = df_detailed.reindex(columns=all_ordered)
+        df_detailed = df_detailed.reindex(columns=all_ordered).fillna("")
 
+        # Keep all non-empty columns PLUS all 5 required columns of the highest semester
         non_empty_cols = [
             c
             for c in df_detailed.columns
-            if not df_detailed[c]
+            if c in highest_sem_required_cols
+            or not df_detailed[c]
             .fillna("")
             .astype(str)
             .str.strip()
-            .eq("")
+            .isin(["", "Result in Abeyance"])
             .all()
+            or c in ["Result Status", "Grade"]
         ]
         df_detailed = df_detailed[non_empty_cols]
 
@@ -993,31 +1744,17 @@ def parse_result_pages(
 
 
 # ==============================================================================
-# INTELLIGENT RESULT VERIFICATION AND AUDIT ENGINE
+# BACKGROUND RESULT VERIFICATION AND AUDIT ENGINE
 # ==============================================================================
 
 
 def verify_and_audit_results(df_result, df_p2):
     """
-    Comprehensive Result Verification and Audit Engine.
-    Validates every calculation, grade, credit, SGPA, CGPA, result status,
-    summary field, and special case in Result_Data.
-
-    Rules Incorporated:
-    1. Lower semester Fail_Info F(n) with n > 0 validly makes Eligibility Status
-       'Not Eligible for next semester' even when the current semester is passed.
-    2. 'AB' in IA Marks or TH Marks is a valid entry (evaluated as 0 marks and F grade).
-    3. Grace marks with '+' sign in TH Marks (or IA Marks) are valid entries and
-       included in Subject Total Marks and component passing checks.
-    4. Component passing requires >= 40% of Internal Max Marks (when > 0) and
-       >= 40% of Sem End Max Marks (when > 0).
-
-    Returns:
-    - df_audited: Result_Data with the 'Verification Errors' column appended
-    - df_verification_report: Detailed row-level error report for 'Verification_Report'
-    - df_verification_summary: High-level KPI summary table
-    - df_error_wise_summary: Error category breakdown table
-    - error_cells_set: Set of (row_idx, col_name) tuples to highlight in red fill + bold yellow font
+    Comprehensive Background Result Verification and Audit Engine.
+    All expected marks, grades, GP, credits, CG, SGPA, CGPA, percentages, and
+    statuses are calculated strictly in the background without altering the
+    extracted PDF values in Result_Data. Only discrepancies and anomalies are
+    flagged and returned for cell highlighting.
     """
     if df_result is None or df_result.empty:
         empty_report = pd.DataFrame(
@@ -1036,7 +1773,7 @@ def verify_and_audit_results(df_result, df_p2):
         empty_cat = pd.DataFrame(
             columns=["Error Category", "Critical", "Warning", "Total"]
         )
-        return df_result, empty_report, empty_summary, empty_cat, set()
+        return df_result, empty_report, empty_summary, empty_cat, set(), {}
 
     df_audited = df_result.copy()
 
@@ -1056,7 +1793,6 @@ def verify_and_audit_results(df_result, df_p2):
                 or Decimal("0"),
             }
 
-    # Discover subject numbers (Sub1..SubN)
     cols = list(df_audited.columns)
     sub_nums = sorted(
         {
@@ -1066,26 +1802,16 @@ def verify_and_audit_results(df_result, df_p2):
         }
     )
 
-    # Discover semester prefixes in ascending order
-    roman_order = ["I", "II", "III", "IV", "V", "VI", "VII", "VIII", "IX", "X"]
     sem_prefixes = []
     for c in cols:
         m = re.match(r"^Sem_([IVXLCDM\d]+)_", str(c))
         if m and m.group(1) not in sem_prefixes:
             sem_prefixes.append(m.group(1))
 
-    def _sem_rank(s):
-        return (
-            roman_order.index(s.upper())
-            if s.upper() in roman_order
-            else (int(s) if s.isdigit() else 99)
-        )
-
-    sem_prefixes.sort(key=_sem_rank)
+    sem_prefixes.sort(key=sem_rank)
     highest_sem = sem_prefixes[-1] if sem_prefixes else None
     lower_sems = sem_prefixes[:-1] if len(sem_prefixes) > 1 else []
 
-    # Check if cumulative columns exist in df_audited
     has_cumulative_cols = any(
         c in df_audited.columns
         for c in ["Total Credit", "Total CG", "CGPA", "Final Grade"]
@@ -1093,6 +1819,7 @@ def verify_and_audit_results(df_result, df_p2):
 
     report_rows = []
     error_cells_set = set()
+    error_messages_map = defaultdict(list)
     category_counter = Counter()
     category_severity_counter = Counter()
     verification_errors_col = []
@@ -1114,10 +1841,13 @@ def verify_and_audit_results(df_result, df_p2):
         ):
             if field_name in df_audited.columns:
                 error_cells_set.add((row_idx, field_name))
+                error_messages_map[(row_idx, field_name)].append(
+                    f"[{severity}] {description} (Expected: {expected_val}, Actual: {actual_val if actual_val != '' else 'Blank'})"
+                )
             error_cells_set.add((row_idx, "Verification Errors"))
-            row_error_messages.append(
-                f"[{severity}] {field_name}: {description} (Expected: {expected_val}, Actual: {actual_val})"
-            )
+            msg_str = f"[{severity}] {field_name}: {description} (Expected: {expected_val}, Actual: {actual_val})"
+            row_error_messages.append(msg_str)
+            error_messages_map[(row_idx, "Verification Errors")].append(msg_str)
             report_rows.append(
                 {
                     "Student SAP No": sap_no,
@@ -1149,7 +1879,18 @@ def verify_and_audit_results(df_result, df_p2):
                     category="Missing Mandatory Value",
                 )
 
-        # Check ABC ID and accidental concatenation of 13-digit ID into Candidate Full Name
+        if "Candidate Full Name" in df_audited.columns and cand_name:
+            clean_nm = sanitize_candidate_name(cand_name)
+            if clean_nm != cand_name:
+                record_issue(
+                    "Candidate Full Name",
+                    clean_nm or "Alphabetic candidate name",
+                    cand_name,
+                    "Candidate Full Name contains non-name text (digits / page header / legend text) picked up from the PDF.",
+                    severity="Critical",
+                    category="Data Contamination / Format Anomaly",
+                )
+
         if "ABC ID" in df_audited.columns:
             abc_val = str(row.get("ABC ID", "")).strip()
             if not abc_val:
@@ -1182,7 +1923,7 @@ def verify_and_audit_results(df_result, df_p2):
                         category="Missing / Malformed Mandatory Value",
                     )
 
-        # Check Result in Abeyance special case
+        # Result in Abeyance special case
         status_raw = str(row.get("Result Status", "")).strip()
         is_abeyance = "abeyance" in status_raw.lower()
         if is_abeyance:
@@ -1212,7 +1953,7 @@ def verify_and_audit_results(df_result, df_p2):
             continue
 
         # ------------------------------------------------------------------
-        # 2. SUBJECT-LEVEL INDEPENDENT VALIDATIONS (Sub1..SubN)
+        # 2. SUBJECT-LEVEL INDEPENDENT BACKGROUND VALIDATIONS (Sub1..SubN)
         # ------------------------------------------------------------------
         sum_sub_total_marks = Decimal("0")
         sum_sub_max_marks = Decimal("0")
@@ -1270,7 +2011,7 @@ def verify_and_audit_results(df_result, df_p2):
             th_info = parse_mark_component(row.get(col_th, ""))
             tot_info = parse_mark_component(row.get(col_tot, ""))
 
-            # Validate IA Marks ('AB' and '+' grace marks are valid entries)
+            # Validate IA Marks
             if ia_info["is_empty"] and int_max > Decimal("0"):
                 record_issue(
                     col_ia,
@@ -1281,7 +2022,6 @@ def verify_and_audit_results(df_result, df_p2):
                     category="Missing Mandatory Value",
                 )
             elif ia_info["is_absent"]:
-                # Valid 'AB' entry in IA Marks
                 pass
             elif ia_info["is_nv"]:
                 record_issue(
@@ -1316,9 +2056,8 @@ def verify_and_audit_results(df_result, df_p2):
                     category="Invalid Data Format",
                 )
 
-            # Validate TH Marks ('AB' and '+' grace marks are valid entries)
+            # Validate TH Marks
             if sem_max == Decimal("0"):
-                # Internal-only course (e.g., UBNSS174, UBYOG176, Field Project)
                 if not th_info["is_empty"]:
                     record_issue(
                         col_th,
@@ -1339,7 +2078,6 @@ def verify_and_audit_results(df_result, df_p2):
                         category="Missing Mandatory Value",
                     )
                 elif th_info["is_absent"]:
-                    # Valid 'AB' entry in TH Marks
                     pass
                 elif th_info["is_nv"]:
                     record_issue(
@@ -1374,7 +2112,7 @@ def verify_and_audit_results(df_result, df_p2):
                         category="Invalid Data Format",
                     )
 
-            # Compute Expected Subject Total Marks = Subject IA Marks + Subject TH Marks (including valid '+' grace marks)
+            # Compute Expected Subject Total Marks in background
             ia_val = (
                 ia_info["numeric_marks"]
                 if ia_info["numeric_marks"] is not None
@@ -1420,7 +2158,7 @@ def verify_and_audit_results(df_result, df_p2):
 
             sum_sub_total_marks += actual_sub_total
 
-            # Validate Subject Grade (accounting for AB/NV and 40% component-level minimum passing criteria)
+            # Validate Subject Grade (40% component passing + unrounded percentage mapping)
             raw_sub_grade = str(row.get(col_grd, "")).strip()
             actual_sub_grade, _ = normalize_grade_token(raw_sub_grade)
 
@@ -1557,7 +2295,7 @@ def verify_and_audit_results(df_result, df_p2):
                         category="Subject GP Mismatch",
                     )
 
-            # Validate Subject Credits (C) against Page 2 Scheme (0 is valid when Grade is F)
+            # Validate Subject Credits (C) against Page 2 Scheme
             raw_cred = (
                 str(row.get(col_cred, ""))
                 .strip()
@@ -1600,7 +2338,7 @@ def verify_and_audit_results(df_result, df_p2):
                             category="Subject Credit Scheme Mismatch",
                         )
 
-            # Validate Subject CG = Subject GP * Subject Credit (0 if Grade = F)
+            # Validate Subject CG = Subject GP * Subject Credit in background
             raw_cg = (
                 str(row.get(col_cg, ""))
                 .strip()
@@ -1624,7 +2362,7 @@ def verify_and_audit_results(df_result, df_p2):
                     col_cg,
                     str(int(expected_cg)),
                     str(row.get(col_cg, "")),
-                    f"Missing Subject CG for {sub_code}.",
+                    f"Missing Subject CG in PDF for {sub_code} (Expected {int(expected_cg)}).",
                     severity="Critical",
                     category="Subject CG Calculation Mismatch",
                 )
@@ -1663,9 +2401,8 @@ def verify_and_audit_results(df_result, df_p2):
                     )
 
         # ------------------------------------------------------------------
-        # 3. SEMESTER-LEVEL VALIDATIONS (HIGHEST SEMESTER & LOWER SEMESTERS)
+        # 3. SEMESTER-LEVEL BACKGROUND VALIDATIONS
         # ------------------------------------------------------------------
-        # Check if any lower semester has Fail_Info = F(n) where n > 0
         lower_sem_fail_counts = {}
         for s in lower_sems:
             f_col = f"Sem_{s}_Fail_Info"
@@ -1674,7 +2411,13 @@ def verify_and_audit_results(df_result, df_p2):
                 m_f = re.search(r"F\s*\(\s*(\d+)\s*\)", f_val, re.I)
                 if m_f and int(m_f.group(1)) > 0:
                     lower_sem_fail_counts[s] = int(m_f.group(1))
-        has_lower_sem_fail = len(lower_sem_fail_counts) > 0
+        # Attendance Defaulter ('AD') in a lower semester also means that semester is not cleared
+        lower_sem_ad_sems = []
+        for s in lower_sems:
+            sg_col = f"Sem_{s}_SGPA"
+            if sg_col in df_audited.columns and str(row.get(sg_col, "")).strip().upper() == "AD":
+                lower_sem_ad_sems.append(s)
+        has_lower_sem_fail = len(lower_sem_fail_counts) > 0 or len(lower_sem_ad_sems) > 0
 
         if highest_sem:
             col_sem_cred = f"Sem_{highest_sem}_Credits"
@@ -1691,7 +2434,6 @@ def verify_and_audit_results(df_result, df_p2):
                 else ""
             )
 
-            # Highest Semester Credits = sum of all subject credits (blank '--' is valid when failed_subject_count > 0)
             if col_sem_cred in df_audited.columns:
                 if failed_subject_count > 0:
                     if actual_sem_cred is not None and actual_sem_cred not in (
@@ -1726,7 +2468,6 @@ def verify_and_audit_results(df_result, df_p2):
                             category="Semester Credits Mismatch",
                         )
 
-            # Highest Semester CG = sum of all subject CG values (blank '--' is valid when failed_subject_count > 0)
             if col_sem_cg in df_audited.columns:
                 if failed_subject_count > 0:
                     if actual_sem_cg is not None and actual_sem_cg != sum_sub_cg:
@@ -1758,7 +2499,6 @@ def verify_and_audit_results(df_result, df_p2):
                             category="Semester CG Mismatch",
                         )
 
-            # Highest Semester SGPA = Highest Semester CG / Highest Semester Credits (blank '--' is valid when failed_subject_count > 0)
             expected_sgpa = (
                 (sum_sub_cg / sum_sub_scheme_credits).quantize(
                     Decimal("0.01"), rounding=ROUND_HALF_UP
@@ -1792,19 +2532,43 @@ def verify_and_audit_results(df_result, df_p2):
                             severity="Critical",
                             category="Missing Mandatory Semester Summary",
                         )
-                    elif expected_sgpa is not None and abs(
-                        actual_sem_sgpa - expected_sgpa
-                    ) > Decimal("0.01"):
-                        record_issue(
-                            col_sem_sgpa,
-                            f"{expected_sgpa:.2f}",
-                            str(row.get(col_sem_sgpa, "")),
-                            f"{col_sem_sgpa} mismatch: {int(sum_sub_cg)} / {int(sum_sub_scheme_credits)} = {expected_sgpa:.2f}, but found {actual_sem_sgpa:.2f}.",
-                            severity="Critical",
-                            category="Semester SGPA Mismatch",
-                        )
+                    elif expected_sgpa is not None:
+                        sgpa_has_hash = "#" in str(row.get(col_sem_sgpa, ""))
+                        if sgpa_has_hash:
+                            # '#': eligible for O.229 grace -> unused grace marks are added to SGPA
+                            g_used, g_unused, g_bonus = grace_sgpa_info(row)
+                            raw_sgpa = sum_sub_cg / sum_sub_scheme_credits
+                            candidates = [
+                                min(expected_sgpa + g_bonus, Decimal("10.00")),
+                                min(
+                                    (raw_sgpa + g_bonus).quantize(
+                                        Decimal("0.01"), rounding=ROUND_HALF_UP
+                                    ),
+                                    Decimal("10.00"),
+                                ),
+                            ]
+                            if all(
+                                abs(actual_sem_sgpa - c) >= Decimal("0.005")
+                                for c in candidates
+                            ):
+                                record_issue(
+                                    col_sem_sgpa,
+                                    f"{candidates[0]:.2f}",
+                                    str(row.get(col_sem_sgpa, "")),
+                                    f"{col_sem_sgpa} mismatch for O.229 ('#') candidate: {int(sum_sub_cg)} / {int(sum_sub_scheme_credits)} = {expected_sgpa:.2f}, plus unused grace bonus {g_bonus:.2f} ({g_unused} of {GRACE_MAX_MARKS} grace marks unused) = {candidates[0]:.2f}, but found {actual_sem_sgpa:.2f}.",
+                                    severity="Critical",
+                                    category="Semester SGPA Mismatch",
+                                )
+                        elif abs(actual_sem_sgpa - expected_sgpa) > Decimal("0.01"):
+                            record_issue(
+                                col_sem_sgpa,
+                                f"{expected_sgpa:.2f}",
+                                str(row.get(col_sem_sgpa, "")),
+                                f"{col_sem_sgpa} mismatch: {int(sum_sub_cg)} / {int(sum_sub_scheme_credits)} = {expected_sgpa:.2f}, but found {actual_sem_sgpa:.2f}.",
+                                severity="Critical",
+                                category="Semester SGPA Mismatch",
+                            )
 
-            # Semester Fail_Info must equal F(n) where n is count of subjects with Grade F
             expected_fail_info = (
                 f"F({failed_subject_count})" if failed_subject_count > 0 else ""
             )
@@ -1823,7 +2587,6 @@ def verify_and_audit_results(df_result, df_p2):
                         category="Fail_Info Mismatch",
                     )
 
-            # Semester Grade derived from Semester SGPA (blank '--' or 'F' is valid if failed_subject_count > 0)
             if "Grade" in df_audited.columns:
                 actual_sem_grade_raw = str(row.get("Grade", "")).strip()
                 actual_sem_grade, _ = normalize_grade_token(
@@ -1866,7 +2629,7 @@ def verify_and_audit_results(df_result, df_p2):
                         )
 
         # ------------------------------------------------------------------
-        # 4. OVERALL RESULT CALCULATIONS (GRAND TOTAL, PERCENTAGE, STATUS)
+        # 4. OVERALL RESULT BACKGROUND CALCULATIONS
         # ------------------------------------------------------------------
         if "Total Marks Obt." in df_audited.columns:
             actual_tot_obt = to_decimal(row.get("Total Marks Obt.", ""))
@@ -1919,7 +2682,6 @@ def verify_and_audit_results(df_result, df_p2):
             )
             actual_pct = to_decimal(row.get("Percentage", ""))
             if actual_pct is None:
-                # Percentage is intentionally omitted in Gazette for Unsuccessful students
                 if failed_subject_count == 0:
                     record_issue(
                         "Percentage",
@@ -1939,7 +2701,6 @@ def verify_and_audit_results(df_result, df_p2):
                     category="Overall Percentage Mismatch",
                 )
 
-        # Cumulative validations (when Total Credit / Total CG / CGPA / Final Grade exist)
         if has_cumulative_cols:
             sem_credits_list = [
                 to_decimal(row.get(f"Sem_{s}_Credits", ""))
@@ -2087,7 +2848,7 @@ def verify_and_audit_results(df_result, df_p2):
                         category="Cumulative Calculation Mismatch",
                     )
 
-        # Result Status validation (current semester status)
+        # Result Status validation
         if "Result Status" in df_audited.columns:
             clean_status = status_raw.replace("$", "").strip()
             expected_status = (
@@ -2112,7 +2873,7 @@ def verify_and_audit_results(df_result, df_p2):
                     category="Result Status / Fail Anomaly",
                 )
 
-        # Eligibility Status consistency check (incorporating lower semester F(n) with n > 0)
+        # Eligibility Status consistency check
         if "Eligibility Status" in df_audited.columns:
             elig_raw = str(row.get("Eligibility Status", "")).strip()
             if elig_raw:
@@ -2123,11 +2884,12 @@ def verify_and_audit_results(df_result, df_p2):
                     reason_str = (
                         f"{failed_subject_count} failed subject(s) in current semester"
                         if failed_subject_count > 0
-                        else "lower semester Fail_Info "
+                        else "lower semester not cleared ("
                         + ", ".join(
-                            f"Sem {k}: F({v})"
-                            for k, v in lower_sem_fail_counts.items()
+                            [f"Sem {k}: F({v})" for k, v in lower_sem_fail_counts.items()]
+                            + [f"Sem {k}: AD" for k in lower_sem_ad_sems]
                         )
+                        + ")"
                     )
                     record_issue(
                         "Eligibility Status",
@@ -2145,10 +2907,27 @@ def verify_and_audit_results(df_result, df_p2):
                         "Eligibility Status",
                         "Eligible for next semester / Program Completed Successfully",
                         elig_raw,
-                        f"Eligibility Status '{elig_raw}' conflicts with Successful Result Status (0 failed subjects in current and lower semesters).",
+                        f"Eligibility Status '{elig_raw}' conflicts with Successful Result Status (0 failed subjects in current semester and all lower semesters cleared).",
                         severity="Critical",
                         category="Eligibility Status Inconsistency",
                     )
+
+        # '$$' notation must agree with the lower-semester clearance status
+        if "Result Status" in df_audited.columns:
+            has_dd = "$$" in status_raw.replace(" ", "")
+            if has_dd != has_lower_sem_fail:
+                record_issue(
+                    "Result Status",
+                    "With '$$' (lower semester not cleared)"
+                    if has_lower_sem_fail
+                    else "Without '$$' (all lower semesters cleared)",
+                    status_raw,
+                    "'$$' in Result Status is printed but no lower-semester failure / AD is recorded."
+                    if has_dd
+                    else "Lower semester not cleared (F/AD in an earlier semester) but '$$' is missing in Result Status.",
+                    severity="Warning",
+                    category="Lower Semester Clearance Notation",
+                )
 
         if row_error_messages:
             students_with_errors_count += 1
@@ -2222,11 +3001,13 @@ def verify_and_audit_results(df_result, df_p2):
         df_verification_summary,
         df_error_wise_summary,
         error_cells_set,
+        dict(error_messages_map),
     )
 
 
 # ==============================================================================
-# EXCEL WORKBOOK FORMATTING & EXPORT (WITH ERROR HIGHLIGHTING & AUDIT SHEETS)
+# EXCEL WORKBOOK FORMATTING & EXPORT
+# (2-ROW MERGED GROUP HEADERS, HOVER COMMENTS, & STUDENT_WISE_VIEW ORDERING)
 # ==============================================================================
 
 _SUBJECT_PASTEL_PALETTE = [
@@ -2247,8 +3028,6 @@ _SUBJECT_PASTEL_PALETTE = [
 
 def generate_pastel_palette(n):
     """Return n unique pastel hex colours (curated first, then generated dynamically)."""
-    import colorsys
-
     palette = list(_SUBJECT_PASTEL_PALETTE[:n])
     used = set(palette)
     i = 0
@@ -2263,19 +3042,157 @@ def generate_pastel_palette(n):
     return palette
 
 
+def _compute_header_groups(cols):
+    """
+    Build group spans for Row 1 & Row 2 headers in Result_Data:
+    - Subject groups: merged across all columns of each SubN ('Subject 1'..'Subject N')
+    - Semester groups: merged across all columns of each Sem_X ('Semester I'..'Semester V')
+    - Standalone columns: merged vertically across Row 1 & Row 2
+    """
+    col_meta = []
+    for idx, c in enumerate(cols, start=1):
+        c_str = str(c)
+        m_sub = re.match(r"^Sub(\d+)\s+(.*)$", c_str)
+        m_sem = re.match(r"^Sem_([IVXLCDM\d]+)_(.*)$", c_str)
+        if m_sub:
+            col_meta.append(
+                {
+                    "col_idx": idx,
+                    "col_name": c_str,
+                    "group_type": "subject",
+                    "group_key": int(m_sub.group(1)),
+                    "group_label": f"Subject {m_sub.group(1)}",
+                    "sub_label": m_sub.group(2),
+                }
+            )
+        elif m_sem:
+            col_meta.append(
+                {
+                    "col_idx": idx,
+                    "col_name": c_str,
+                    "group_type": "semester",
+                    "group_key": m_sem.group(1),
+                    "group_label": f"Semester {m_sem.group(1)}",
+                    "sub_label": m_sem.group(2),
+                }
+            )
+        else:
+            col_meta.append(
+                {
+                    "col_idx": idx,
+                    "col_name": c_str,
+                    "group_type": "single",
+                    "group_key": c_str,
+                    "group_label": c_str,
+                    "sub_label": c_str,
+                }
+            )
+
+    spans = []
+    for item in col_meta:
+        if (
+            spans
+            and item["group_type"] in ("subject", "semester")
+            and spans[-1]["group_type"] == item["group_type"]
+            and spans[-1]["group_key"] == item["group_key"]
+        ):
+            spans[-1]["end_col"] = item["col_idx"]
+            spans[-1]["items"].append(item)
+        else:
+            spans.append(
+                {
+                    "group_type": item["group_type"],
+                    "group_key": item["group_key"],
+                    "group_label": item["group_label"],
+                    "start_col": item["col_idx"],
+                    "end_col": item["col_idx"],
+                    "items": [item],
+                }
+            )
+    return col_meta, spans
+
+
+_EXCEL_NUMERIC_COL_RE = re.compile(
+    r"^(Sub\d+ (IA Marks|TH Marks|Total Marks|GP|Credits \(C\)|CG)"
+    r"|Sem_[IVXLCDM\d]+_(Credits|CG|SGPA)"
+    r"|Total Marks Obt\.|Max Total Marks|Percentage|Total Credit|Total CG"
+    r"|CGPA|Cumulative Percentage)$"
+)
+_EXCEL_DECIMAL_COL_RE = re.compile(r"(SGPA|CGPA|Percentage)$")
+
+
+def _cell_text(value):
+    """String form of an openpyxl cell value ('' for None, keeps numeric 0 as '0')."""
+    return "" if value is None else str(value).strip()
+
+
+def _coerce_numeric_for_excel(df):
+    """
+    Write purely numeric marks / GP / credits / CG / SGPA / percentage values as real
+    Excel numbers (so SUM, sort, filter work) instead of text. IDs, Attempts and any
+    special-notation values ('AB', '17 +7', '$', '--', blanks) stay exactly as extracted.
+    The audit engine keeps working on the original text DataFrame.
+    """
+    out = df.copy()
+    for c in out.columns:
+        c_str = str(c)
+        if not _EXCEL_NUMERIC_COL_RE.match(c_str):
+            continue
+        keep_decimal = bool(_EXCEL_DECIMAL_COL_RE.search(c_str))
+
+        def _conv(v, keep_decimal=keep_decimal):
+            if isinstance(v, bool):
+                return v
+            if isinstance(v, str):
+                t = v.strip().replace("%", "")
+                if keep_decimal and t.endswith("#"):
+                    t = t[:-1]  # '#' (O.229) is shown through a number format instead
+                if re.fullmatch(r"\d+", t):
+                    return int(t)
+                if re.fullmatch(r"\d+\.\d+", t):
+                    return float(t)
+                return v
+            if isinstance(v, float) and v.is_integer() and not keep_decimal:
+                return int(v)
+            return v
+
+        out[c] = out[c].map(_conv).astype(object)
+    return out
+
+
 def save_to_formatted_excel(
-    sheets_dict, exam_type="Regular", error_cells_set=None
+    sheets_dict,
+    exam_type="Regular",
+    error_cells_set=None,
+    error_messages_map=None,
 ):
-    """Export formatted Excel workbook with verification highlighting (solid red fill + bold yellow font) and audit sheets."""
+    """
+    Export formatted Excel workbook:
+    - Sheet order: Page_1, Page_2, Result_Data, Student_Wise_View,
+      Verification_Report, Verification_Summary, Error_Wise_Summary.
+    - Result_Data features 2-row merged Subject & Semester group headers.
+    - Discrepancy cells are highlighted with Solid Red Fill + Bold Yellow Font
+      and include an Excel Hover Comment detailing Expected vs Actual values.
+    """
     if error_cells_set is None:
         error_cells_set = set()
+    if error_messages_map is None:
+        error_messages_map = {}
 
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
         for sheet_name, df in sheets_dict.items():
-            df.to_excel(writer, sheet_name=sheet_name, index=False)
+            start_row_idx = 1 if sheet_name == "Result_Data" else 0
+            df_to_write = (
+                _coerce_numeric_for_excel(df) if sheet_name == "Result_Data" else df
+            )
+            df_to_write.to_excel(
+                writer,
+                sheet_name=sheet_name,
+                index=False,
+                startrow=start_row_idx,
+            )
             ws = writer.sheets[sheet_name]
-
             ws.views.sheetView[0].showGridLines = False
 
             thin_side = Side(style="thin", color="D9D9D9")
@@ -2306,6 +3223,9 @@ def save_to_formatted_excel(
                 start_color="7B241C", end_color="7B241C", fill_type="solid"
             )
             header_font = Font(name="Calibri", size=11, bold=True, color="FFFFFF")
+            header_font_subject = Font(
+                name="Calibri", size=11, bold=True, color="1F1F1F"
+            )
 
             pwd_row_fill = PatternFill(
                 start_color="E8F4F8", end_color="E8F4F8", fill_type="solid"
@@ -2323,13 +3243,23 @@ def save_to_formatted_excel(
             unsuccessful_row_font = Font(name="Calibri", size=11, color="C00000")
             normal_font = Font(name="Calibri", size=11, color="000000")
 
-            # Mandatory Verification Discrepancy Style: Solid Red Fill + Bold Yellow Font
             verification_error_fill = PatternFill(
                 start_color="FF0000", end_color="FF0000", fill_type="solid"
             )
             verification_error_font = Font(
                 name="Calibri", size=11, bold=True, color="FFFF00"
             )
+            # Special notations (informational, NOT errors)
+            special_fills = {
+                "grace": PatternFill(start_color="D9C3F0", end_color="D9C3F0", fill_type="solid"),
+                "ad": PatternFill(start_color="F8CBAD", end_color="F8CBAD", fill_type="solid"),
+                "lower_unclear": PatternFill(start_color="F8CBAD", end_color="F8CBAD", fill_type="solid"),
+            }
+            special_fonts = {
+                "grace": Font(name="Calibri", size=11, bold=True, color="4B1E78"),
+                "ad": Font(name="Calibri", size=11, bold=True, color="843C0C"),
+                "lower_unclear": Font(name="Calibri", size=11, bold=True, color="843C0C"),
+            }
 
             if sheet_name == "Page_1":
                 for col_idx in range(1, len(df.columns) + 1):
@@ -2341,14 +3271,12 @@ def save_to_formatted_excel(
                     )
 
                 for row_idx in range(2, ws.max_row + 1):
-                    ws.cell(row=row_idx, column=1).border = thin_border
-                    ws.cell(row=row_idx, column=1).alignment = Alignment(
-                        vertical="center", horizontal="left"
-                    )
-                    ws.cell(row=row_idx, column=2).border = thin_border
-                    ws.cell(row=row_idx, column=2).alignment = Alignment(
-                        vertical="center", horizontal="left"
-                    )
+                    for c_i in (1, 2):
+                        c_cell = ws.cell(row=row_idx, column=c_i)
+                        c_cell.border = thin_border
+                        c_cell.alignment = Alignment(
+                            vertical="center", horizontal="left"
+                        )
 
             elif sheet_name == "Page_2":
                 for col_idx in range(1, len(df.columns) + 1):
@@ -2363,6 +3291,8 @@ def save_to_formatted_excel(
                     for col_idx, col_name in enumerate(df.columns, start=1):
                         cell = ws.cell(row=row_idx, column=col_idx)
                         cell.border = thin_border
+                        if col_name == "Credits" and isinstance(cell.value, (int, float)):
+                            cell.number_format = "0.00"  # shown as printed: 2.00 / 4.00
                         if col_name in [
                             "Credits",
                             "Internal Max Marks",
@@ -2379,15 +3309,14 @@ def save_to_formatted_excel(
                             )
 
             elif sheet_name == "Result_Data":
-                name_col_idx = (
-                    list(df.columns).index("Candidate Full Name") + 1
-                    if "Candidate Full Name" in df.columns
-                    else 5
-                )
-                freeze_col_letter = get_column_letter(name_col_idx + 1)
-                ws.freeze_panes = f"{freeze_col_letter}2"
+                cols_list = list(df.columns)
+                col_index_map = {c: i + 1 for i, c in enumerate(cols_list)}
 
-                final_section_cols = [
+                name_col_idx = col_index_map.get("Candidate Full Name", 5)
+                freeze_col_letter = get_column_letter(name_col_idx + 1)
+                ws.freeze_panes = f"{freeze_col_letter}3"
+
+                final_section_cols = {
                     "Total Credit",
                     "Total CG",
                     "CGPA",
@@ -2396,33 +3325,25 @@ def save_to_formatted_excel(
                     "Result Status",
                     "Grade",
                     "Eligibility Status",
-                ]
+                }
+
+                col_meta, header_spans = _compute_header_groups(cols_list)
 
                 subject_end_col_indices = [
-                    idx + 1
-                    for idx, c in enumerate(df.columns)
-                    if str(c).endswith(" CG")
+                    sp["end_col"]
+                    for sp in header_spans
+                    if sp["group_type"] == "subject"
                 ]
-
-                sem_end_col_indices = []
-                current_sem = None
-                last_idx = None
-                for idx, c in enumerate(df.columns, start=1):
-                    m = re.match(r"^Sem_([IVXLCDM\d]+)_", str(c))
-                    if m:
-                        s_name = m.group(1)
-                        if current_sem and s_name != current_sem:
-                            sem_end_col_indices.append(last_idx)
-                        current_sem = s_name
-                        last_idx = idx
-                if last_idx and last_idx not in sem_end_col_indices:
-                    sem_end_col_indices.append(last_idx)
-
+                sem_end_col_indices = [
+                    sp["end_col"]
+                    for sp in header_spans
+                    if sp["group_type"] == "semester"
+                ]
                 pre_total_credit_col_indices = []
-                if "Total Credit" in df.columns:
-                    tc_idx = list(df.columns).index("Total Credit")
-                    if tc_idx > 0:
-                        pre_total_credit_col_indices.append(tc_idx)
+                if "Total Credit" in col_index_map and col_index_map["Total Credit"] > 1:
+                    pre_total_credit_col_indices.append(
+                        col_index_map["Total Credit"] - 1
+                    )
 
                 all_thick_right_col_indices = set(
                     subject_end_col_indices
@@ -2430,11 +3351,11 @@ def save_to_formatted_excel(
                     + pre_total_credit_col_indices
                 )
 
-                subject_numbers = []
-                for c in df.columns:
-                    m_sub = re.match(r"^Sub(\d+)\s", str(c))
-                    if m_sub and int(m_sub.group(1)) not in subject_numbers:
-                        subject_numbers.append(int(m_sub.group(1)))
+                subject_numbers = [
+                    sp["group_key"]
+                    for sp in header_spans
+                    if sp["group_type"] == "subject"
+                ]
                 subject_pastel_fills = {
                     num: PatternFill(
                         start_color=hex_c, end_color=hex_c, fill_type="solid"
@@ -2444,111 +3365,177 @@ def save_to_formatted_excel(
                         generate_pastel_palette(len(subject_numbers)),
                     )
                 }
-                header_font_subject = Font(
-                    name="Calibri", size=11, bold=True, color="1F1F1F"
-                )
 
-                for col_idx, col_name in enumerate(df.columns, start=1):
-                    cell = ws.cell(row=1, column=col_idx)
-                    cell.font = header_font
+                ws.row_dimensions[1].height = 24
+                ws.row_dimensions[2].height = 28
 
-                    if col_name == "Verification Errors":
-                        cell.fill = header_fill_audit
-                    elif str(col_name).startswith("Sem_"):
-                        cell.fill = header_fill_semester
-                    elif col_name in final_section_cols:
-                        cell.fill = header_fill_final
-                    elif col_name in [
-                        "Total Marks Obt.",
-                        "Max Total Marks",
-                        "Percentage",
-                    ]:
-                        cell.fill = header_fill_marks
-                    elif str(col_name).startswith("Sub"):
-                        m_sub = re.match(r"^Sub(\d+)\s", str(col_name))
-                        if m_sub and int(m_sub.group(1)) in subject_pastel_fills:
-                            cell.fill = subject_pastel_fills[
-                                int(m_sub.group(1))
-                            ]
-                            cell.font = header_font_subject
-                        else:
-                            cell.fill = header_fill_subject
+                # Build 2-Row Merged Group Headers (Row 1: Group Banners, Row 2: Sub-Headers)
+                for sp in header_spans:
+                    g_type = sp["group_type"]
+                    c1, c2 = sp["start_col"], sp["end_col"]
+
+                    if g_type == "subject":
+                        sub_num = sp["group_key"]
+                        fill_to_use = subject_pastel_fills.get(
+                            sub_num, header_fill_subject
+                        )
+                        font_to_use = (
+                            header_font_subject
+                            if sub_num in subject_pastel_fills
+                            else header_font
+                        )
+                        if c1 != c2:
+                            ws.merge_cells(
+                                start_row=1,
+                                start_column=c1,
+                                end_row=1,
+                                end_column=c2,
+                            )
+                        ws.cell(row=1, column=c1).value = sp["group_label"]
+                        for item in sp["items"]:
+                            ci = item["col_idx"]
+                            ws.cell(row=2, column=ci).value = item["sub_label"]
+                            r_side = (
+                                thick_right_side
+                                if ci in all_thick_right_col_indices
+                                else thin_side
+                            )
+                            for r_hdr in (1, 2):
+                                h_cell = ws.cell(row=r_hdr, column=ci)
+                                h_cell.fill = fill_to_use
+                                h_cell.font = font_to_use
+                                h_cell.border = Border(
+                                    left=thin_side,
+                                    right=r_side if (r_hdr == 2 or ci == c2) else thin_side,
+                                    top=thin_side,
+                                    bottom=thin_side,
+                                )
+                                h_cell.alignment = Alignment(
+                                    horizontal="center",
+                                    vertical="center",
+                                    wrap_text=True,
+                                )
+
+                    elif g_type == "semester":
+                        if c1 != c2:
+                            ws.merge_cells(
+                                start_row=1,
+                                start_column=c1,
+                                end_row=1,
+                                end_column=c2,
+                            )
+                        ws.cell(row=1, column=c1).value = sp["group_label"]
+                        for item in sp["items"]:
+                            ci = item["col_idx"]
+                            ws.cell(row=2, column=ci).value = item["sub_label"]
+                            r_side = (
+                                thick_right_side
+                                if ci in all_thick_right_col_indices
+                                else thin_side
+                            )
+                            for r_hdr in (1, 2):
+                                h_cell = ws.cell(row=r_hdr, column=ci)
+                                h_cell.fill = header_fill_semester
+                                h_cell.font = header_font
+                                h_cell.border = Border(
+                                    left=thin_side,
+                                    right=r_side if (r_hdr == 2 or ci == c2) else thin_side,
+                                    top=thin_side,
+                                    bottom=thin_side,
+                                )
+                                h_cell.alignment = Alignment(
+                                    horizontal="center",
+                                    vertical="center",
+                                    wrap_text=True,
+                                )
+
                     else:
-                        cell.fill = header_fill_navy
+                        col_name = sp["group_label"]
+                        ws.merge_cells(
+                            start_row=1,
+                            start_column=c1,
+                            end_row=2,
+                            end_column=c1,
+                        )
+                        ws.cell(row=1, column=c1).value = col_name
+                        if col_name == "Verification Errors":
+                            fill_s = header_fill_audit
+                        elif col_name in final_section_cols:
+                            fill_s = header_fill_final
+                        elif col_name in (
+                            "Total Marks Obt.",
+                            "Max Total Marks",
+                            "Percentage",
+                        ):
+                            fill_s = header_fill_marks
+                        else:
+                            fill_s = header_fill_navy
 
-                    r_side = (
-                        thick_right_side
-                        if col_idx in all_thick_right_col_indices
-                        else thin_side
-                    )
-                    cell.border = Border(
-                        left=thin_side,
-                        right=r_side,
-                        top=thin_side,
-                        bottom=thin_side,
-                    )
-                    cell.alignment = Alignment(
-                        horizontal="center", vertical="center", wrap_text=True
-                    )
+                        r_side = (
+                            thick_right_side
+                            if c1 in all_thick_right_col_indices
+                            else thin_side
+                        )
+                        for r_hdr in (1, 2):
+                            h_cell = ws.cell(row=r_hdr, column=c1)
+                            h_cell.fill = fill_s
+                            h_cell.font = header_font
+                            h_cell.border = Border(
+                                left=thin_side,
+                                right=r_side,
+                                top=thin_side,
+                                bottom=thin_side,
+                            )
+                            h_cell.alignment = Alignment(
+                                horizontal="center",
+                                vertical="center",
+                                wrap_text=True,
+                            )
 
-                grade_col_indices = [
-                    idx + 1
-                    for idx, c in enumerate(df.columns)
-                    if str(c).endswith(" Grade")
-                    and not str(c).startswith("Final")
-                    and not str(c).startswith("Overall")
-                    and str(c) != "Grade"
-                ]
-
+                # Precompute subject blocks dynamically from header_spans
                 sub_blocks = []
-                for g_col in grade_col_indices:
-                    start_col = g_col - 5
-                    end_col = g_col + 3
-                    sub_blocks.append((g_col, start_col, end_col))
+                for sp in header_spans:
+                    if sp["group_type"] == "subject":
+                        g_col = next(
+                            (
+                                it["col_idx"]
+                                for it in sp["items"]
+                                if it["sub_label"] == "Grade"
+                            ),
+                            None,
+                        )
+                        if g_col:
+                            sub_blocks.append(
+                                (g_col, sp["start_col"], sp["end_col"])
+                            )
 
-                is_pwd_col_idx = (
-                    list(df.columns).index("Is_PwD") + 1
-                    if "Is_PwD" in df.columns
-                    else None
-                )
+                is_pwd_col_idx = col_index_map.get("Is_PwD")
+                status_col_idx = col_index_map.get("Result Status")
+                grade_col_idx = col_index_map.get("Grade")
+                final_grade_col_idx = col_index_map.get("Final Grade")
+                elig_col_idx = col_index_map.get("Eligibility Status")
 
-                for row_idx in range(2, ws.max_row + 1):
-                    df_row_idx = row_idx - 2
-                    status_val = str(
-                        ws.cell(
-                            row=row_idx,
-                            column=list(df.columns).index("Result Status") + 1,
-                        ).value
-                        or ""
-                        if "Result Status" in df.columns
+                # Format Data Rows (starting at Row 3)
+                for row_idx in range(3, ws.max_row + 1):
+                    df_row_idx = row_idx - 3
+                    status_val = (
+                        str(ws.cell(row=row_idx, column=status_col_idx).value or "")
+                        if status_col_idx
                         else ""
                     )
-                    grade_val = str(
-                        ws.cell(
-                            row=row_idx,
-                            column=list(df.columns).index("Grade") + 1,
-                        ).value
-                        or ""
-                        if "Grade" in df.columns
+                    grade_val = (
+                        str(ws.cell(row=row_idx, column=grade_col_idx).value or "")
+                        if grade_col_idx
                         else ""
                     )
-                    final_grade_val = str(
-                        ws.cell(
-                            row=row_idx,
-                            column=list(df.columns).index("Final Grade") + 1,
-                        ).value
-                        or ""
-                        if "Final Grade" in df.columns
+                    final_grade_val = (
+                        str(ws.cell(row=row_idx, column=final_grade_col_idx).value or "")
+                        if final_grade_col_idx
                         else ""
                     )
-                    eligibility_val = str(
-                        ws.cell(
-                            row=row_idx,
-                            column=list(df.columns).index("Eligibility Status")
-                            + 1,
-                        ).value
-                        or ""
-                        if "Eligibility Status" in df.columns
+                    eligibility_val = (
+                        str(ws.cell(row=row_idx, column=elig_col_idx).value or "")
+                        if elig_col_idx
                         else ""
                     )
 
@@ -2559,17 +3546,12 @@ def save_to_formatted_excel(
                         or final_grade_val.strip() == "F"
                     )
 
-                    is_pwd_row = False
-                    if is_pwd_col_idx:
-                        is_pwd_row = (
-                            str(
-                                ws.cell(
-                                    row=row_idx, column=is_pwd_col_idx
-                                ).value
-                                or ""
-                            ).strip()
-                            == "Yes"
-                        )
+                    is_pwd_row = (
+                        str(ws.cell(row=row_idx, column=is_pwd_col_idx).value or "").strip()
+                        == "Yes"
+                        if is_pwd_col_idx
+                        else False
+                    )
 
                     failed_cols_in_row = set()
                     carried_cols_in_row = set()
@@ -2584,15 +3566,15 @@ def save_to_formatted_excel(
                                 failed_cols_in_row.add(c)
 
                         for c in range(start_col, end_col + 1):
-                            c_name = df.columns[c - 1]
-                            c_val = str(
-                                ws.cell(row=row_idx, column=c).value or ""
-                            ).strip()
+                            c_name = cols_list[c - 1]
+                            c_val = _cell_text(
+                                ws.cell(row=row_idx, column=c).value
+                            )
 
                             if "$" in c_val:
                                 carried_cols_in_row.add(c)
                             elif (
-                                exam_type == "Re-examination"
+                                "Re-examination" in exam_type
                                 and (
                                     "IA Marks" in c_name or "TH Marks" in c_name
                                 )
@@ -2601,7 +3583,7 @@ def save_to_formatted_excel(
                             ):
                                 fresh_mark_cols_in_row.add(c)
 
-                    for col_idx in range(1, len(df.columns) + 1):
+                    for col_idx, col_name in enumerate(cols_list, start=1):
                         cell = ws.cell(row=row_idx, column=col_idx)
                         r_side = (
                             thick_right_side
@@ -2615,9 +3597,8 @@ def save_to_formatted_excel(
                             bottom=thin_side,
                         )
 
-                        col_name = df.columns[col_idx - 1]
                         if (
-                            col_name in ["Candidate Full Name", "Verification Errors"]
+                            col_name in ("Candidate Full Name", "Verification Errors")
                             or "Course Title" in col_name
                         ):
                             cell.alignment = Alignment(
@@ -2627,6 +3608,11 @@ def save_to_formatted_excel(
                             cell.alignment = Alignment(
                                 vertical="center", horizontal="center"
                             )
+
+                        if isinstance(cell.value, float) and _EXCEL_DECIMAL_COL_RE.search(
+                            str(col_name)
+                        ):
+                            cell.number_format = "0.00"
 
                         if col_idx in failed_cols_in_row:
                             cell.font = fail_font
@@ -2644,10 +3630,35 @@ def save_to_formatted_excel(
                         elif is_pwd_row:
                             cell.fill = pwd_row_fill
 
-                        # HIGHEST PRIORITY: Highlight verification errors with solid red fill & bold yellow font
+                        # Special notations ('#', 'AD', '$$') get their own colour and hover note
+                        if (df_row_idx, col_name) not in error_cells_set and (
+                            col_name == "Result Status"
+                            or _SEM_SGPA_COL_RE.match(str(col_name))
+                        ):
+                            raw_row = df.iloc[df_row_idx]
+                            sp_kind = classify_special_notation(col_name, raw_row[col_name])
+                            if sp_kind:
+                                cell.fill = special_fills[sp_kind]
+                                cell.font = special_fonts[sp_kind]
+                                cell.comment = Comment(
+                                    special_notation_note(sp_kind, raw_row),
+                                    "Result Verification Tool",
+                                )
+                                if sp_kind == "grace" and isinstance(cell.value, (int, float)):
+                                    cell.number_format = '0.00"#"'
+
+                        # HIGHEST PRIORITY: Highlight verification errors with solid red fill, bold yellow font, & hover note
                         if (df_row_idx, col_name) in error_cells_set:
                             cell.fill = verification_error_fill
                             cell.font = verification_error_font
+                            err_notes = error_messages_map.get(
+                                (df_row_idx, col_name)
+                            )
+                            if err_notes and col_name != "Verification Errors":
+                                cell.comment = Comment(
+                                    "\n".join(err_notes),
+                                    "Verification Audit Engine",
+                                )
 
             elif sheet_name in [
                 "Verification_Report",
@@ -2673,13 +3684,18 @@ def save_to_formatted_excel(
                 )
                 warn_font = Font(name="Calibri", size=11, bold=True, color="7D6608")
 
+                sev_col_i = (
+                    list(df.columns).index("Severity") + 1
+                    if "Severity" in df.columns
+                    else None
+                )
+
                 for row_idx in range(2, ws.max_row + 1):
-                    sev_val = ""
-                    if "Severity" in df.columns:
-                        sev_col_i = list(df.columns).index("Severity") + 1
-                        sev_val = str(
-                            ws.cell(row=row_idx, column=sev_col_i).value or ""
-                        ).strip()
+                    sev_val = (
+                        str(ws.cell(row=row_idx, column=sev_col_i).value or "").strip()
+                        if sev_col_i
+                        else ""
+                    )
 
                     for col_idx, col_name in enumerate(df.columns, start=1):
                         cell = ws.cell(row=row_idx, column=col_idx)
@@ -2701,37 +3717,46 @@ def save_to_formatted_excel(
 
                         if sev_val == "Critical":
                             cell.fill = crit_fill
-                            cell.font = crit_font if col_name == "Severity" else normal_font
+                            cell.font = (
+                                crit_font if col_name == "Severity" else normal_font
+                            )
                         elif sev_val == "Warning":
                             cell.fill = warn_fill
-                            cell.font = warn_font if col_name == "Severity" else normal_font
+                            cell.font = (
+                                warn_font if col_name == "Severity" else normal_font
+                            )
                         else:
                             cell.font = normal_font
 
-            # Auto-fit columns
-            for col in ws.columns:
+            # Auto-fit columns (skipping Row 1 merged group banners on Result_Data)
+            min_row_for_width = 2 if sheet_name == "Result_Data" else 1
+            for col_idx in range(1, len(df.columns) + 1):
                 max_len = 0
-                col_letter = get_column_letter(col[0].column)
-                for cell in col:
-                    val_len = len(str(cell.value or ""))
+                col_letter = get_column_letter(col_idx)
+                for r_i in range(min_row_for_width, ws.max_row + 1):
+                    val_len = len(str(ws.cell(row=r_i, column=col_idx).value or ""))
                     if val_len > max_len:
                         max_len = val_len
-                ws.column_dimensions[col_letter].width = min(max(max_len + 3, 8), 65)
+                ws.column_dimensions[col_letter].width = min(
+                    max(max_len + 3, 9), 65
+                )
 
-        # Build Student_Wise_View with error cell highlighting propagated
-        _add_student_wise_view_sheet(
-            writer,
-            sheets_dict.get("Result_Data"),
-            exam_type=exam_type,
-            error_cells_set=error_cells_set,
-        )
+            # IMMEDIATELY ADD Student_Wise_View AFTER Result_Data
+            if sheet_name == "Result_Data":
+                _add_student_wise_view_sheet(
+                    writer,
+                    df,
+                    exam_type=exam_type,
+                    error_cells_set=error_cells_set,
+                    error_messages_map=error_messages_map,
+                )
 
     output.seek(0)
     return output
 
 
 # ==============================================================================
-# STUDENT-WISE VIEW SHEET (WITH VERIFICATION HIGHLIGHTING)
+# STUDENT-WISE VIEW SHEET (POSITIONED IMMEDIATELY AFTER RESULT_DATA)
 # ==============================================================================
 
 _SWV_SHEET_NAME = "Student_Wise_View"
@@ -2739,8 +3764,6 @@ _SWV_SHEET_NAME = "Student_Wise_View"
 
 def _swv_value(val, numeric=False):
     """Normalise a Result_Data cell for display (NaN -> '', optional numeric cast)."""
-    import numbers
-
     if val is None:
         return ""
     try:
@@ -2762,25 +3785,45 @@ def _swv_value(val, numeric=False):
 
 
 def _add_student_wise_view_sheet(
-    writer, df, exam_type="Regular", error_cells_set=None
+    writer,
+    df,
+    exam_type="Regular",
+    error_cells_set=None,
+    error_messages_map=None,
 ):
-    """Append the 'Student_Wise_View' worksheet with verification error highlighting."""
-    from openpyxl.worksheet.properties import PageSetupProperties
-
+    """Create the 'Student_Wise_View' worksheet immediately after 'Result_Data'."""
     if error_cells_set is None:
         error_cells_set = set()
+    if error_messages_map is None:
+        error_messages_map = {}
 
     ws = writer.book.create_sheet(_SWV_SHEET_NAME)
     ws.views.sheetView[0].showGridLines = False
 
-    for col_letter, width in zip(
-        "ABCDEFGHI", [20, 50, 12, 12, 12, 12, 12, 12, 12]
-    ):
-        ws.column_dimensions[col_letter].width = width
-
     if df is None or df.empty:
         ws["A1"] = "No student records available."
         return ws
+
+    # Column widths are sized from the actual data so that nothing wraps unnecessarily
+    # (e.g. 'Unsuccessful$$', 'Not Eligible for next semester', long course titles/names).
+    def _max_len(col_names):
+        longest = 0
+        for cn in col_names:
+            if cn in df.columns:
+                for val in df[cn].tolist():
+                    longest = max(longest, len(str(_swv_value(val))))
+        return longest
+
+    title_cols = [c for c in df.columns if re.match(r"^Sub\d+ Course Title$", str(c))]
+    name_cols = ["Candidate Full Name", "PRN No"]
+    col_a_w = 21
+    col_b_w = min(max(_max_len(title_cols + name_cols) + 4, 24), 60)
+    col_i_w = min(
+        max(_max_len(["Result Status", "Eligibility Status", "Grade"]) + 4, 12), 45
+    )
+    swv_widths = [col_a_w, col_b_w, 12, 12, 12, 12, 12, 12, col_i_w]
+    for col_letter, width in zip("ABCDEFGHI", swv_widths):
+        ws.column_dimensions[col_letter].width = width
 
     thin_side = Side(style="thin", color="D9D9D9")
     border = Border(
@@ -2793,6 +3836,10 @@ def _add_student_wise_view_sheet(
     fill_label = PatternFill(start_color="D6EAF8", end_color="D6EAF8", fill_type="solid")
     fill_fail = PatternFill(start_color="FADBD8", end_color="FADBD8", fill_type="solid")
     fill_carried = PatternFill(start_color="EAECEE", end_color="EAECEE", fill_type="solid")
+    fill_grace = PatternFill(start_color="D9C3F0", end_color="D9C3F0", fill_type="solid")
+    fill_ad = PatternFill(start_color="F8CBAD", end_color="F8CBAD", fill_type="solid")
+    font_grace = Font(name="Calibri", size=11, bold=True, color="4B1E78")
+    font_ad = Font(name="Calibri", size=11, bold=True, color="843C0C")
     fill_fresh = PatternFill(start_color="FFF3CD", end_color="FFF3CD", fill_type="solid")
     fill_error = PatternFill(start_color="FF0000", end_color="FF0000", fill_type="solid")
 
@@ -2808,7 +3855,18 @@ def _add_student_wise_view_sheet(
     center = Alignment(horizontal="center", vertical="center", wrap_text=True)
     left = Alignment(horizontal="left", vertical="center", wrap_text=True)
 
-    def put(r1, c1, r2, c2, value=None, font=None, fill=None, align=None, fmt=None):
+    def put(
+        r1,
+        c1,
+        r2,
+        c2,
+        value=None,
+        font=None,
+        fill=None,
+        align=None,
+        fmt=None,
+        comment_text=None,
+    ):
         if (r1, c1) != (r2, c2):
             ws.merge_cells(
                 start_row=r1, start_column=c1, end_row=r2, end_column=c2
@@ -2827,32 +3885,48 @@ def _add_student_wise_view_sheet(
         top_left.value = value
         if fmt and value != "":
             top_left.number_format = fmt
+        if comment_text:
+            top_left.comment = Comment(comment_text, "Verification Audit Engine")
         return top_left
 
     cols = list(df.columns)
-    sub_nums = []
-    for c in cols:
-        m = re.match(r"^Sub(\d+)\s", str(c))
-        if m and int(m.group(1)) not in sub_nums:
-            sub_nums.append(int(m.group(1)))
-    sub_nums.sort()
+    sub_nums = sorted(
+        {
+            int(m.group(1))
+            for c in cols
+            if (m := re.match(r"^Sub(\d+)\s", str(c)))
+        }
+    )
 
     sem_names = []
     for c in cols:
         m = re.match(
-            r"^Sem_([IVXLCDM\d]+)_(Credits|SGPA|Attempts|Fail_Info)$", str(c)
+            r"^Sem_([IVXLCDM\d]+)_(Credits|CG|SGPA|Attempts|Fail_Info)$",
+            str(c),
         )
         if m and m.group(1) not in sem_names:
             sem_names.append(m.group(1))
+    sem_names.sort(key=sem_rank)
 
     def get(row, col, numeric=False):
         if col not in row.index:
             return ""
         return _swv_value(row[col], numeric=numeric)
 
+    # The ID column is labelled exactly as the gazette prints it (ABC ID / APAAR ID)
+    swv_id_label = "APAAR ID" if "APAAR ID" in df.columns else "ABC ID"
+
     info_layout = [
-        [("SNo", (1, 1), (2, 2)), ("SAP No", (3, 4), (5, 6)), ("Roll No", (7, 7), (8, 9))],
-        [("PRN No", (1, 1), (2, 2)), ("ABC ID", (3, 4), (5, 6)), ("Gender", (7, 7), (8, 9))],
+        [
+            ("SNo", (1, 1), (2, 2)),
+            ("SAP No", (3, 4), (5, 6)),
+            ("Roll No", (7, 7), (8, 9)),
+        ],
+        [
+            ("PRN No", (1, 1), (2, 2)),
+            (swv_id_label, (3, 4), (5, 6)),
+            ("Gender", (7, 7), (8, 9)),
+        ],
         [
             ("Candidate Full Name", (1, 1), (2, 2)),
             ("Examination Type", (3, 4), (5, 6)),
@@ -2860,10 +3934,17 @@ def _add_student_wise_view_sheet(
         ],
     ]
     sub_headers = [
-        "Sub Code", "Course Title", "IA Marks", "TH Marks",
-        "Total Marks", "Grade", "GP", "Credits", "CG",
+        "Sub Code",
+        "Course Title",
+        "IA Marks",
+        "TH Marks",
+        "Total Marks",
+        "Grade",
+        "GP",
+        "Credits",
+        "CG",
     ]
-    sem_headers = ["Semester", "Credits", "SGPA", "Attempts", "Fail_Info"]
+    sem_headers = ["Semester", "Credits", "CG", "SGPA", "Attempts", "Fail_Info"]
     overall_items = [
         ("Grade", False, None),
         ("Total Marks Obt.", True, None),
@@ -2876,13 +3957,25 @@ def _add_student_wise_view_sheet(
     total_students = len(df)
     r = 1
     for s_idx, (df_row_idx, row) in enumerate(df.iterrows(), start=1):
-        put(r, 1, r, 9, f"Student {s_idx} of {total_students}", font_banner, fill_navy, center)
+        put(
+            r,
+            1,
+            r,
+            9,
+            f"Student {s_idx} of {total_students}",
+            font_banner,
+            fill_navy,
+            center,
+        )
         ws.row_dimensions[r].height = 24
         r += 1
         for info_row in info_layout:
             for label, (lc1, lc2), (vc1, vc2) in info_row:
                 put(r, lc1, r, lc2, label, font_label, fill_label, left)
                 is_err = (df_row_idx, label) in error_cells_set
+                c_notes = "\n".join(
+                    error_messages_map.get((df_row_idx, label), [])
+                )
                 put(
                     r,
                     vc1,
@@ -2892,10 +3985,20 @@ def _add_student_wise_view_sheet(
                     font_error if is_err else font_value_bold,
                     fill_error if is_err else None,
                     left,
+                    comment_text=c_notes if is_err else None,
                 )
             r += 1
 
-        put(r, 1, r, 9, "Subject-Wise Performance", font_header, fill_subject, center)
+        put(
+            r,
+            1,
+            r,
+            9,
+            "Subject-Wise Performance",
+            font_header,
+            fill_subject,
+            center,
+        )
         r += 1
         for c_idx, h in enumerate(sub_headers, start=1):
             put(r, c_idx, r, c_idx, h, font_header, fill_subject, center)
@@ -2930,45 +4033,71 @@ def _add_student_wise_view_sheet(
                 get(row, f"Sub{n} CG", True),
             ]
             is_failed = "F" in str(values[5]).strip()
-            for c_idx, (v, src_col) in enumerate(zip(values, col_names_for_sub), start=1):
+            for c_idx, (v, src_col) in enumerate(
+                zip(values, col_names_for_sub), start=1
+            ):
                 v_str = str(v)
-                if (df_row_idx, src_col) in error_cells_set:
+                is_err = (df_row_idx, src_col) in error_cells_set
+                c_notes = "\n".join(
+                    error_messages_map.get((df_row_idx, src_col), [])
+                )
+                if is_err:
                     fill_c, font_c = fill_error, font_error
                 elif is_failed:
                     fill_c, font_c = fill_fail, font_fail
                 elif "$" in v_str:
                     fill_c, font_c = fill_carried, font_normal
                 elif (
-                    exam_type == "Re-examination"
+                    "Re-examination" in exam_type
                     and c_idx in (3, 4)
                     and v_str not in ["", "--", "NV", "AB", "NaN", "nan"]
                 ):
                     fill_c, font_c = fill_fresh, font_normal
                 else:
                     fill_c, font_c = None, font_normal
-                put(r, c_idx, r, c_idx, v, font_c, fill_c, left if c_idx == 2 else center)
-            if len(str(title)) > 52:
+                put(
+                    r,
+                    c_idx,
+                    r,
+                    c_idx,
+                    v,
+                    font_c,
+                    fill_c,
+                    left if c_idx == 2 else center,
+                    comment_text=c_notes if is_err else None,
+                )
+            if len(str(title)) > col_b_w - 3:
                 ws.row_dimensions[r].height = 30
             r += 1
             subject_rows += 1
 
         if subject_rows == 0:
-            put(r, 1, r, 9, "No subject-wise data available for this student.", font_normal, None, center)
+            put(
+                r,
+                1,
+                r,
+                9,
+                "No subject-wise data available for this student.",
+                font_normal,
+                None,
+                center,
+            )
             r += 1
 
-        put(r, 1, r, 5, "Semester Details", font_header, fill_semester, center)
-        put(r, 6, r, 9, "Overall Result Details", font_header, fill_final, center)
+        put(r, 1, r, 6, "Semester Details", font_header, fill_semester, center)
+        put(r, 7, r, 9, "Overall Result Details", font_header, fill_final, center)
         r += 1
         for c_idx, h in enumerate(sem_headers, start=1):
             put(r, c_idx, r, c_idx, h, font_header, fill_semester, center)
-        put(r, 6, r, 7, "Metric", font_header, fill_final, center)
-        put(r, 8, r, 9, "Value", font_header, fill_final, center)
+        put(r, 7, r, 8, "Metric", font_header, fill_final, center)
+        put(r, 9, r, 9, "Value", font_header, fill_final, center)
         r += 1
 
         sem_rows = []
         for s in sem_names:
             s_cols = [
                 f"Sem_{s}_Credits",
+                f"Sem_{s}_CG",
                 f"Sem_{s}_SGPA",
                 f"Sem_{s}_Attempts",
                 f"Sem_{s}_Fail_Info",
@@ -2976,8 +4105,9 @@ def _add_student_wise_view_sheet(
             vals = [
                 get(row, s_cols[0], True),
                 get(row, s_cols[1], True),
-                get(row, s_cols[2]),
+                get(row, s_cols[2], True),
                 get(row, s_cols[3]),
+                get(row, s_cols[4]),
             ]
             if any(str(v).strip() != "" for v in vals) or any(
                 (df_row_idx, sc) in error_cells_set for sc in s_cols
@@ -2988,51 +4118,101 @@ def _add_student_wise_view_sheet(
         for k in range(block_rows):
             if k < len(sem_rows):
                 _, s_vals, s_src_cols = sem_rows[k]
-                for c_idx, (v, sc_name) in enumerate(zip(s_vals, s_src_cols), start=1):
-                    is_err = sc_name is not None and (df_row_idx, sc_name) in error_cells_set
+                for c_idx, (v, sc_name) in enumerate(
+                    zip(s_vals, s_src_cols), start=1
+                ):
+                    is_err = (
+                        sc_name is not None
+                        and (df_row_idx, sc_name) in error_cells_set
+                    )
+                    c_notes = (
+                        "\n".join(
+                            error_messages_map.get((df_row_idx, sc_name), [])
+                        )
+                        if is_err
+                        else None
+                    )
+                    sp_kind = (
+                        classify_special_notation(sc_name, row.get(sc_name, ""))
+                        if (sc_name is not None and c_idx == 4 and not is_err)
+                        else None
+                    )
+                    cell_val, cell_fmt = v, ("0.00" if c_idx == 4 else None)
+                    cell_font = font_error if is_err else font_normal
+                    cell_fill = fill_error if is_err else None
+                    if sp_kind == "grace":
+                        cell_val = _swv_value(str(v).replace("#", ""), numeric=True)
+                        cell_fmt = '0.00"#"'
+                        cell_font, cell_fill = font_grace, fill_grace
+                        c_notes = special_notation_note(sp_kind, row)
+                    elif sp_kind == "ad":
+                        cell_font, cell_fill = font_ad, fill_ad
+                        c_notes = special_notation_note(sp_kind, row)
                     put(
                         r + k,
                         c_idx,
                         r + k,
                         c_idx,
-                        v,
-                        font_error if is_err else font_normal,
-                        fill_error if is_err else None,
+                        cell_val,
+                        cell_font,
+                        cell_fill,
                         center,
-                        fmt="0.00" if c_idx == 3 else None,
+                        fmt=cell_fmt,
+                        comment_text=c_notes,
                     )
             elif k == 0:
-                put(r, 1, r, 5, "No semester data available.", font_normal, None, center)
+                put(
+                    r,
+                    1,
+                    r,
+                    6,
+                    "No semester data available.",
+                    font_normal,
+                    None,
+                    center,
+                )
 
             if k < len(overall_items):
                 label, numeric, fmt = overall_items[k]
                 v = get(row, label, numeric)
                 is_err = (df_row_idx, label) in error_cells_set
+                c_notes = (
+                    "\n".join(error_messages_map.get((df_row_idx, label), []))
+                    if is_err
+                    else None
+                )
+                lower_unclear = (
+                    not is_err and classify_special_notation(label, v) == "lower_unclear"
+                )
                 bad = label in ("Result Status", "Eligibility Status") and (
                     "Unsuccessful" in str(v) or "Not Eligible" in str(v)
                 )
-                put(r + k, 6, r + k, 7, label, font_label, fill_label, left)
+                put(r + k, 7, r + k, 8, label, font_label, fill_label, left)
                 put(
                     r + k,
-                    8,
+                    9,
                     r + k,
                     9,
                     v,
                     font_error if is_err else (font_bad if bad else font_value_bold),
-                    fill_error if is_err else None,
+                    fill_error if is_err else (fill_ad if lower_unclear else None),
                     center,
                     fmt=fmt if isinstance(v, (int, float)) else None,
+                    comment_text=c_notes
+                    or (special_notation_note("lower_unclear", row) if lower_unclear else None),
                 )
-                if label == "Eligibility Status" and len(str(v)) > 22:
+                if len(str(v)) > col_i_w - 3:
                     ws.row_dimensions[r + k].height = 30
         r += block_rows
 
-        # Display Verification Errors banner if any exist for this student
         ver_err_text = str(get(row, "Verification Errors")).strip()
         if ver_err_text:
             put(r, 1, r, 2, "Verification Errors", font_error, fill_error, center)
             put(r, 3, r, 9, ver_err_text, font_error, fill_error, left)
-            ws.row_dimensions[r].height = 32
+            # Height follows the amount of text (merged C:I width) so long error lists are not cut off
+            err_chars_per_line = max(sum(swv_widths[2:]) - 4, 20)
+            err_lines = max(1, -(-len(ver_err_text) // err_chars_per_line))
+            ws.row_dimensions[r].height = max(32, 15 * err_lines + 4)
             r += 1
 
         r += 2
@@ -3045,21 +4225,27 @@ def _add_student_wise_view_sheet(
 
 
 # ==============================================================================
-# INTERACTIVE STREAMLIT HTML PREVIEW (WITH RED FILL + BOLD YELLOW FONT ERRORS)
+# INTERACTIVE STREAMLIT HTML PREVIEW (WITH 2-ROW MERGED HEADERS & HOVER TOOLTIPS)
 # ==============================================================================
 
 
-def render_detailed_table_html(df, exam_type="Regular", error_cells_set=None):
-    """Renders interactive HTML preview in Streamlit with visual cues and red/yellow error cells."""
+def render_detailed_table_html(
+    df, exam_type="Regular", error_cells_set=None, error_messages_map=None
+):
+    """Renders interactive HTML preview in Streamlit with 2-row merged Subject/Semester headers."""
     if df.empty:
         st.info("No result records found.")
         return
 
     if error_cells_set is None:
         error_cells_set = set()
+    if error_messages_map is None:
+        error_messages_map = {}
 
     cols = list(df.columns)
-    final_section_cols = [
+    _, header_spans = _compute_header_groups(cols)
+
+    final_section_cols = {
         "Total Credit",
         "Total CG",
         "CGPA",
@@ -3068,22 +4254,18 @@ def render_detailed_table_html(df, exam_type="Regular", error_cells_set=None):
         "Result Status",
         "Grade",
         "Eligibility Status",
-    ]
+    }
 
-    subject_end_cols = [c for c in cols if str(c).endswith(" CG")]
-    sem_end_cols = []
-    current_sem = None
-    last_col = None
-    for c in cols:
-        m = re.match(r"^Sem_([IVXLCDM\d]+)_", str(c))
-        if m:
-            s_name = m.group(1)
-            if current_sem and s_name != current_sem:
-                sem_end_cols.append(last_col)
-            current_sem = s_name
-            last_col = c
-    if last_col and last_col not in sem_end_cols:
-        sem_end_cols.append(last_col)
+    subject_end_cols = [
+        cols[sp["end_col"] - 1]
+        for sp in header_spans
+        if sp["group_type"] == "subject"
+    ]
+    sem_end_cols = [
+        cols[sp["end_col"] - 1]
+        for sp in header_spans
+        if sp["group_type"] == "semester"
+    ]
 
     pre_tc_cols = []
     if "Total Credit" in cols:
@@ -3093,28 +4275,28 @@ def render_detailed_table_html(df, exam_type="Regular", error_cells_set=None):
 
     all_thick_cols = set(subject_end_cols + sem_end_cols + pre_tc_cols)
 
-    grade_cols = [
-        c
-        for c in cols
-        if str(c).endswith(" Grade")
-        and not str(c).startswith("Final")
-        and not str(c).startswith("Overall")
-        and str(c) != "Grade"
-    ]
-
     sub_ranges = []
-    for g in grade_cols:
-        g_idx = cols.index(g)
-        s_code_col = cols[g_idx - 5]
-        e_cg_col = cols[g_idx + 3]
-        sub_ranges.append((g, s_code_col, e_cg_col, g_idx - 5, g_idx + 3))
+    for sp in header_spans:
+        if sp["group_type"] == "subject":
+            g_col = next(
+                (
+                    it["col_name"]
+                    for it in sp["items"]
+                    if it["sub_label"] == "Grade"
+                ),
+                None,
+            )
+            if g_col:
+                sub_ranges.append(
+                    (g_col, sp["start_col"] - 1, sp["end_col"] - 1)
+                )
 
     html = """
     <style>
     .detailed-table-container {
         width: 100%;
         overflow-x: auto;
-        max-height: 550px;
+        max-height: 580px;
         border: 1px solid #d3d3d3;
         border-radius: 6px;
         margin-top: 10px;
@@ -3128,13 +4310,20 @@ def render_detailed_table_html(df, exam_type="Regular", error_cells_set=None):
     }
     .detailed-table th {
         color: white;
-        padding: 8px 10px;
+        padding: 6px 10px;
         text-align: center;
-        position: sticky;
-        top: 0;
-        z-index: 2;
         border: 1px solid #d9d9d9;
         font-weight: bold;
+    }
+    .detailed-table thead tr:first-child th {
+        position: sticky;
+        top: 0;
+        z-index: 3;
+    }
+    .detailed-table thead tr:nth-child(2) th {
+        position: sticky;
+        top: 31px;
+        z-index: 2;
     }
     .th-navy { background-color: #1B365D; }
     .th-subject { background-color: #1A5276; }
@@ -3151,19 +4340,12 @@ def render_detailed_table_html(df, exam_type="Regular", error_cells_set=None):
     }
     .text-left-cell { text-align: left !important; }
     .unsuccessful-row-text { color: #C00000 !important; }
-
-    .thick-right {
-        border-right: 3px solid #1F4E79 !important;
-    }
-    .pwd-row {
-        background-color: #E8F4F8 !important;
-    }
-    .carried-forward-cell {
-        background-color: #EAECEE !important;
-    }
-    .fresh-mark-cell {
-        background-color: #FFF3CD !important;
-    }
+    .thick-right { border-right: 3px solid #1F4E79 !important; }
+    .pwd-row { background-color: #E8F4F8 !important; }
+    .carried-forward-cell { background-color: #EAECEE !important; }
+    .fresh-mark-cell { background-color: #FFF3CD !important; }
+    .grace-cell { background-color: #D9C3F0 !important; color: #4B1E78 !important; font-weight: bold; }
+    .ad-cell { background-color: #F8CBAD !important; color: #843C0C !important; font-weight: bold; }
     .fail-cell {
         background-color: #FADBD8 !important;
         color: #9C0006 !important;
@@ -3172,6 +4354,7 @@ def render_detailed_table_html(df, exam_type="Regular", error_cells_set=None):
         background-color: #FF0000 !important;
         color: #FFFF00 !important;
         font-weight: bold !important;
+        cursor: help;
     }
     </style>
     <div class="detailed-table-container">
@@ -3179,22 +4362,43 @@ def render_detailed_table_html(df, exam_type="Regular", error_cells_set=None):
     <thead>
     <tr>
     """
-    for col in cols:
-        th_cls = ["thick-right"] if col in all_thick_cols else []
-        if col == "Verification Errors":
-            th_cls.append("th-audit")
-        elif str(col).startswith("Sem_"):
-            th_cls.append("th-semester")
-        elif col in final_section_cols:
-            th_cls.append("th-final")
-        elif col in ["Total Marks Obt.", "Max Total Marks", "Percentage"]:
-            th_cls.append("th-marks")
-        elif str(col).startswith("Sub"):
-            th_cls.append("th-subject")
-        else:
-            th_cls.append("th-navy")
 
-        html += f'<th class="{" ".join(th_cls)}">{col}</th>'
+    # Row 1 of thead (merged group headers + rowspan=2 for standalone columns)
+    for sp in header_spans:
+        g_type = sp["group_type"]
+        span_len = sp["end_col"] - sp["start_col"] + 1
+        end_col_name = cols[sp["end_col"] - 1]
+        thick_cls = " thick-right" if end_col_name in all_thick_cols else ""
+
+        if g_type == "subject":
+            html += f'<th colspan="{span_len}" class="th-subject{thick_cls}">{sp["group_label"]}</th>'
+        elif g_type == "semester":
+            html += f'<th colspan="{span_len}" class="th-semester{thick_cls}">{sp["group_label"]}</th>'
+        else:
+            col = sp["group_label"]
+            if col == "Verification Errors":
+                cls_name = "th-audit"
+            elif col in final_section_cols:
+                cls_name = "th-final"
+            elif col in ("Total Marks Obt.", "Max Total Marks", "Percentage"):
+                cls_name = "th-marks"
+            else:
+                cls_name = "th-navy"
+            html += f'<th rowspan="2" class="{cls_name}{thick_cls}">{col}</th>'
+
+    html += "</tr><tr>"
+
+    # Row 2 of thead (sub-headers for Subject and Semester groups)
+    for sp in header_spans:
+        if sp["group_type"] in ("subject", "semester"):
+            base_cls = (
+                "th-subject" if sp["group_type"] == "subject" else "th-semester"
+            )
+            for it in sp["items"]:
+                c_name = it["col_name"]
+                thick_cls = " thick-right" if c_name in all_thick_cols else ""
+                html += f'<th class="{base_cls}{thick_cls}">{it["sub_label"]}</th>'
+
     html += "</tr></thead><tbody>"
 
     for df_row_idx, row in df.iterrows():
@@ -3215,7 +4419,7 @@ def render_detailed_table_html(df, exam_type="Regular", error_cells_set=None):
         carried_cols = set()
         fresh_cols = set()
 
-        for g_col, _, _, start_i, end_i in sub_ranges:
+        for g_col, start_i, end_i in sub_ranges:
             if "F" in str(row.get(g_col, "")).strip():
                 for col_name in cols[start_i : end_i + 1]:
                     failed_cols.add(col_name)
@@ -3225,7 +4429,7 @@ def render_detailed_table_html(df, exam_type="Regular", error_cells_set=None):
                 if "$" in c_val:
                     carried_cols.add(col_name)
                 elif (
-                    exam_type == "Re-examination"
+                    "Re-examination" in exam_type
                     and ("IA Marks" in col_name or "TH Marks" in col_name)
                     and c_val
                     and c_val not in ["--", "NV", "AB", "NaN", "nan"]
@@ -3237,9 +4441,7 @@ def render_detailed_table_html(df, exam_type="Regular", error_cells_set=None):
             row_classes.append("pwd-row")
         if is_unsuccessful_row:
             row_classes.append("unsuccessful-row-text")
-        row_cls_str = (
-            f' class="{" ".join(row_classes)}"' if row_classes else ""
-        )
+        row_cls_str = f' class="{" ".join(row_classes)}"' if row_classes else ""
 
         html += f"<tr{row_cls_str}>"
         for col in cols:
@@ -3248,13 +4450,23 @@ def render_detailed_table_html(df, exam_type="Regular", error_cells_set=None):
             if col in all_thick_cols:
                 classes.append("thick-right")
             if (
-                col in ["Candidate Full Name", "Verification Errors"]
+                col in ("Candidate Full Name", "Verification Errors")
                 or "Course Title" in col
             ):
                 classes.append("text-left-cell")
 
+            title_attr = ""
             if (df_row_idx, col) in error_cells_set:
                 classes.append("verification-error-cell")
+                notes = error_messages_map.get((df_row_idx, col), [])
+                if notes:
+                    escaped_notes = (
+                        "&#10;".join(notes)
+                        .replace('"', "&quot;")
+                        .replace("<", "&lt;")
+                        .replace(">", "&gt;")
+                    )
+                    title_attr = f' title="{escaped_notes}"'
             elif col in failed_cols:
                 classes.append("fail-cell")
             elif col in fresh_cols:
@@ -3262,8 +4474,15 @@ def render_detailed_table_html(df, exam_type="Regular", error_cells_set=None):
             elif col in carried_cols:
                 classes.append("carried-forward-cell")
 
+            if "verification-error-cell" not in classes:
+                sp_kind = classify_special_notation(col, val)
+                if sp_kind:
+                    classes.append("grace-cell" if sp_kind == "grace" else "ad-cell")
+                    note = special_notation_note(sp_kind, row).replace('"', "&quot;").replace("\n", "&#10;")
+                    title_attr = f' title="{note}"'
+
             cls_str = f' class="{" ".join(classes)}"' if classes else ""
-            html += f"<td{cls_str}>{val}</td>"
+            html += f"<td{cls_str}{title_attr}>{val}</td>"
         html += "</tr>"
 
     html += "</tbody></table></div>"
@@ -3271,15 +4490,159 @@ def render_detailed_table_html(df, exam_type="Regular", error_cells_set=None):
 
 
 # ==============================================================================
-# MAIN ENTRY POINTS
+# CACHED PIPELINE & MAIN STREAMLIT ENTRY POINTS
 # ==============================================================================
+
+
+@st.cache_data(show_spinner=False)
+def process_gazette_pdf_bytes(file_bytes):
+    """
+    Cached end-to-end extraction, background verification, and Excel generation
+    so tab switching and filtering in Streamlit are instantaneous.
+    """
+    with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
+        total_pages = len(pdf.pages)
+
+        p1_text = pdf.pages[0].extract_text() or ""
+        df_p1, exam_type = parse_page_1(p1_text)
+
+        p2_page = pdf.pages[1] if total_pages > 1 else pdf.pages[0]
+        df_p2 = parse_page_2(p2_page)
+
+        course_map = {}
+        if (
+            not df_p2.empty
+            and "Course Code" in df_p2.columns
+            and "Course Title" in df_p2.columns
+        ):
+            course_map = dict(zip(df_p2["Course Code"], df_p2["Course Title"]))
+
+        df_result_raw = parse_result_pages(
+            pdf.pages,
+            course_title_map=course_map,
+            exam_type=exam_type,
+        )
+
+        (
+            df_result_audited,
+            df_verification_report,
+            df_verification_summary,
+            df_error_wise_summary,
+            error_cells_set,
+            error_messages_map,
+        ) = verify_and_audit_results(df_result_raw, df_p2)
+
+        # Label the ID column exactly as the result pages print it (ABC ID vs APAAR ID)
+        header_probe = ""
+        for _pg in pdf.pages[2:4]:
+            header_probe += _pg.extract_text() or ""
+        if re.search(r"APAAR\s*ID", header_probe, re.IGNORECASE) and (
+            "ABC ID" in df_result_audited.columns
+        ):
+            df_result_audited = df_result_audited.rename(columns={"ABC ID": "APAAR ID"})
+            error_cells_set = {
+                (i, "APAAR ID" if c == "ABC ID" else c) for i, c in error_cells_set
+            }
+            error_messages_map = {
+                (k[0], "APAAR ID" if k[1] == "ABC ID" else k[1]): v
+                for k, v in error_messages_map.items()
+            }
+            if "Field Name" in df_verification_report.columns:
+                df_verification_report = df_verification_report.copy()
+                df_verification_report["Field Name"] = df_verification_report[
+                    "Field Name"
+                ].replace({"ABC ID": "APAAR ID"})
+
+        sheets_data = {
+            "Page_1": df_p1,
+            "Page_2": df_p2,
+            "Result_Data": df_result_audited,
+            "Verification_Report": df_verification_report,
+            "Verification_Summary": df_verification_summary,
+            "Error_Wise_Summary": df_error_wise_summary,
+        }
+
+        excel_bytes_io = save_to_formatted_excel(
+            sheets_data,
+            exam_type=exam_type,
+            error_cells_set=error_cells_set,
+            error_messages_map=error_messages_map,
+        )
+
+        return {
+            "total_pages": total_pages,
+            "exam_type": exam_type,
+            "df_p1": df_p1,
+            "df_p2": df_p2,
+            "df_result_audited": df_result_audited,
+            "df_verification_report": df_verification_report,
+            "df_verification_summary": df_verification_summary,
+            "df_error_wise_summary": df_error_wise_summary,
+            "error_cells_set": error_cells_set,
+            "error_messages_map": error_messages_map,
+            "excel_bytes": excel_bytes_io.getvalue(),
+        }
+
+
+TOOL_DESCRIPTION_MD = """
+**What this tool does**
+
+Upload an SVKM Result Gazette PDF (Regular, ATKT or Re-examination) and the tool will:
+
+1. **Extract** every student's details, subject-wise marks, grades, GP, credits, CG, semester summaries and
+   final result exactly as printed in the PDF (values such as `--`, `AB`, `$`, `~`, `17 +7` are preserved as they appear).
+2. **Verify** the gazette in the background by independently recalculating totals, grades, GP, credits, CG, SGPA,
+   CGPA, percentage, fail counts, result status and eligibility against the Page 2 course scheme.
+3. **Export** a formatted Excel workbook with the audit results highlighted.
+
+**How to use it**
+
+1. Upload one or more gazette PDFs (page 1 = details, page 2 = course scheme, remaining pages = results).
+2. Review the KPI banner and the preview tabs.
+3. Click **Download Audited Excel Report**.
+
+**Excel workbook contents**
+
+| Sheet | Contents |
+|---|---|
+| `Page_1` | Institution, programme, semester, academic year and examination details |
+| `Page_2` | Course codes, titles, credits and maximum marks |
+| `Result_Data` | One row per student with merged Subject / Semester headers |
+| `Student_Wise_View` | One printable section per student (details, subjects, semester and overall summary) |
+| `Verification_Report` | Every discrepancy: student, field, expected value, actual value, description, severity |
+| `Verification_Summary` | Students verified, clean vs flagged, total errors, critical vs warning counts |
+| `Error_Wise_Summary` | Error counts by category |
+
+**Colour guide**
+
+- 🟥 **Solid red cell with bold yellow text** - value failed verification (hover over it for expected vs actual).
+- 🟫 **Light red** - failed subject (grade F).
+- ⬜ **Grey** - carried-forward (`$`) value.
+- 🟪 **Purple** - SGPA marked `#`: eligible for O.229 grace marks. The unused part of the 10 grace marks is added to the SGPA (0.01 per unused mark, e.g. 10 unused = +0.10). Not an error; the tool checks the SGPA including this bonus.
+- 🟧 **Orange** - `AD` (Attendance Defaulter in a lower semester) or `$$` after the Result Status (lower semester not cleared). Not an error; such a candidate is correctly *Not Eligible for next semester* even if successful in the current semester.
+- 🟨 **Yellow** - fresh marks in a Re-examination.
+- 🟦 **Light blue row** - candidate with disability (`~`).
+
+**Good to know**
+
+- *Critical* flags are calculation or data errors; *Warning* flags are special cases such as **Result in Abeyance**.
+- A blank cell means nothing is printed in the PDF; `--` means `--` is printed in the PDF.
+- Numeric marks are written to Excel as real numbers, so they can be summed, sorted and filtered.
+- The tool reads the PDF only; it never alters the gazette values, it only flags discrepancies.
+"""
+
+
+def render_tool_description():
+    """Collapsible user-facing description shown at the top of the page."""
+    with st.expander("ℹ️ About this tool - what it does and how to read the output", expanded=False):
+        st.markdown(TOOL_DESCRIPTION_MD)
 
 
 def show():
     """Main view function invoked by app.py router."""
     st.title("🛡️ Intelligent Result Verification & Audit Tool")
     st.caption(
-        "Automated Result Gazette Extraction, Mathematical & Rule Verification, and Discrepancy Audit Engine."
+        "Automated Result Gazette Extraction (As-Is PDF Fidelity), Background Mathematical & Rule Verification, and Discrepancy Audit Engine."
     )
 
     uploaded_files = st.file_uploader(
@@ -3289,132 +4652,122 @@ def show():
     )
 
     if uploaded_files:
-        for uploaded_file in uploaded_files:
+        for f_idx, uploaded_file in enumerate(uploaded_files):
             st.subheader(f"📄 Auditing: {uploaded_file.name}")
 
-            with pdfplumber.open(uploaded_file) as pdf:
-                total_pages = len(pdf.pages)
-                st.info(f"Total Pages Detected: **{total_pages}**")
+            with st.spinner(f"Extracting & auditing {uploaded_file.name}..."):
+                res = process_gazette_pdf_bytes(uploaded_file.getvalue())
 
-                # 1. Page 1 Metadata & Exam Type Detection
-                p1_text = pdf.pages[0].extract_text() or ""
-                df_p1, exam_type = parse_page_1(p1_text)
+            total_pages = res["total_pages"]
+            exam_type = res["exam_type"]
+            df_p1 = res["df_p1"]
+            df_p2 = res["df_p2"]
+            df_result_audited = res["df_result_audited"]
+            df_verification_report = res["df_verification_report"]
+            df_verification_summary = res["df_verification_summary"]
+            df_error_wise_summary = res["df_error_wise_summary"]
+            error_cells_set = res["error_cells_set"]
+            error_messages_map = res["error_messages_map"]
+            excel_bytes = res["excel_bytes"]
 
-                # 2. Page 2 Course Scheme
-                p2_page = pdf.pages[1] if total_pages > 1 else pdf.pages[0]
-                df_p2 = parse_page_2(p2_page)
+            st.info(f"Total Pages Detected: **{total_pages}**")
 
-                course_map = {}
-                if (
-                    not df_p2.empty
-                    and "Course Code" in df_p2.columns
-                    and "Course Title" in df_p2.columns
-                ):
-                    course_map = dict(
-                        zip(df_p2["Course Code"], df_p2["Course Title"])
-                    )
+            # Executive KPI Metrics Banner
+            total_verified = len(df_result_audited)
+            total_errors = len(df_verification_report)
+            students_with_err = (
+                df_verification_report["Student SAP No"].nunique()
+                if not df_verification_report.empty
+                else 0
+            )
+            crit_errors = (
+                int((df_verification_report["Severity"] == "Critical").sum())
+                if not df_verification_report.empty
+                else 0
+            )
 
-                # 3. Dynamic Results Parsing
-                df_result_raw = parse_result_pages(
-                    pdf.pages,
-                    course_title_map=course_map,
-                    exam_type=exam_type,
-                )
+            k1, k2, k3, k4 = st.columns(4)
+            k1.metric("Total Students Verified", total_verified)
+            k2.metric("Total Errors / Flags Found", total_errors)
+            k3.metric("Students with Discrepancies", students_with_err)
+            k4.metric("Critical Rule Violations", crit_errors)
 
-                # 4. Run Intelligent Result Verification and Audit Engine
-                (
-                    df_result_audited,
-                    df_verification_report,
-                    df_verification_summary,
-                    df_error_wise_summary,
-                    error_cells_set,
-                ) = verify_and_audit_results(df_result_raw, df_p2)
+            # Preview Tabs
+            t1, t2, t3, t4, t5 = st.tabs(
+                [
+                    "📊 Audited Result Data",
+                    "🚨 Verification Report",
+                    "📈 Verification Summary",
+                    "📋 Metadata (Page 1)",
+                    "📚 Courses (Page 2)",
+                ]
+            )
 
-                # 5. Executive KPI Metrics Banner
-                total_verified = len(df_result_audited)
-                total_errors = len(df_verification_report)
-                students_with_err = (
-                    df_verification_report["Student SAP No"].nunique()
-                    if not df_verification_report.empty
-                    else 0
-                )
-                crit_errors = (
-                    int((df_verification_report["Severity"] == "Critical").sum())
-                    if not df_verification_report.empty
-                    else 0
-                )
-
-                k1, k2, k3, k4 = st.columns(4)
-                k1.metric("Total Students Verified", total_verified)
-                k2.metric("Total Errors / Flags Found", total_errors)
-                k3.metric("Students with Discrepancies", students_with_err)
-                k4.metric("Critical Rule Violations", crit_errors)
-
-                # 6. Preview Tabs
-                t1, t2, t3, t4, t5 = st.tabs(
-                    [
-                        "📊 Audited Result Data",
-                        "🚨 Verification Report",
-                        "📈 Verification Summary",
-                        "📋 Metadata (Page 1)",
-                        "📚 Courses (Page 2)",
-                    ]
-                )
-
-                with t1:
+            with t1:
+                col_hdr, col_flt = st.columns([3, 1])
+                with col_hdr:
                     st.markdown(
-                        "##### 📌 Audited Student Results (Erroneous cells highlighted in **Solid Red Fill & Bold Yellow Font**)"
+                        "##### 📌 Audited Student Results (Erroneous cells highlighted in **Solid Red Fill & Bold Yellow Font** — hover over red cells for details)"
                     )
-                    render_detailed_table_html(
-                        df_result_audited,
-                        exam_type=exam_type,
-                        error_cells_set=error_cells_set,
+                with col_flt:
+                    only_errors = st.checkbox(
+                        "🔍 Show Only Discrepancy Rows",
+                        value=False,
+                        key=f"flt_err_{f_idx}_{uploaded_file.name}",
                     )
-                with t2:
-                    st.markdown("##### 🚨 Detailed Verification Report (`Verification_Report`)")
-                    if df_verification_report.empty:
-                        st.success("All student records passed 100% of verification checks with zero discrepancies!")
-                    else:
-                        st.dataframe(df_verification_report, use_container_width=True)
-                with t3:
-                    col_s1, col_s2 = st.columns(2)
-                    with col_s1:
-                        st.markdown("##### 📌 Overall Verification Summary")
-                        st.dataframe(df_verification_summary, use_container_width=True)
-                    with col_s2:
-                        st.markdown("##### 📂 Error-Wise Category Summary")
-                        st.dataframe(df_error_wise_summary, use_container_width=True)
-                with t4:
-                    st.dataframe(df_p1, use_container_width=True)
-                with t5:
-                    st.dataframe(df_p2, use_container_width=True)
 
-                # 7. Save & Download Audited Excel Workbook
-                sheets_data = {
-                    "Page_1": df_p1,
-                    "Page_2": df_p2,
-                    "Result_Data": df_result_audited,
-                    "Verification_Report": df_verification_report,
-                    "Verification_Summary": df_verification_summary,
-                    "Error_Wise_Summary": df_error_wise_summary,
-                }
+                if only_errors and "Verification Errors" in df_result_audited.columns:
+                    df_preview = df_result_audited[
+                        df_result_audited["Verification Errors"]
+                        .astype(str)
+                        .str.strip()
+                        != ""
+                    ]
+                else:
+                    df_preview = df_result_audited
 
-                excel_bytes = save_to_formatted_excel(
-                    sheets_data,
+                render_detailed_table_html(
+                    df_preview,
                     exam_type=exam_type,
                     error_cells_set=error_cells_set,
+                    error_messages_map=error_messages_map,
                 )
+            with t2:
+                st.markdown(
+                    "##### 🚨 Detailed Verification Report (`Verification_Report`)"
+                )
+                if df_verification_report.empty:
+                    st.success(
+                        "All student records passed 100% of verification checks with zero discrepancies!"
+                    )
+                else:
+                    st.dataframe(df_verification_report, use_container_width=True)
+            with t3:
+                col_s1, col_s2 = st.columns(2)
+                with col_s1:
+                    st.markdown("##### 📌 Overall Verification Summary")
+                    st.dataframe(df_verification_summary, use_container_width=True)
+                with col_s2:
+                    st.markdown("##### 📂 Error-Wise Category Summary")
+                    st.dataframe(df_error_wise_summary, use_container_width=True)
+            with t4:
+                st.dataframe(df_p1, use_container_width=True)
+            with t5:
+                st.dataframe(df_p2, use_container_width=True)
 
-                export_file_name = (
-                    f"{uploaded_file.name.rsplit('.', 1)[0]}_Audited_Report.xlsx"
-                )
-                st.download_button(
-                    label=f"⬇️ Download Audited Excel Report ({export_file_name})",
-                    data=excel_bytes,
-                    file_name=export_file_name,
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                )
-                st.divider()
+            export_file_name = (
+                f"{uploaded_file.name.rsplit('.', 1)[0]}_Audited_Report.xlsx"
+            )
+            st.download_button(
+                label=f"⬇️ Download Audited Excel Report ({export_file_name})",
+                data=excel_bytes,
+                file_name=export_file_name,
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key=f"dl_btn_{f_idx}_{uploaded_file.name}",
+            )
+            st.divider()
+
+    render_tool_description()
 
 
 def main():
