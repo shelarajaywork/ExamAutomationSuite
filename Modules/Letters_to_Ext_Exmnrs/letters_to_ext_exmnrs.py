@@ -3,13 +3,8 @@ import os
 import re
 import struct
 import zipfile
-import smtplib
 import urllib.parse
 from datetime import datetime
-from email import encoders
-from email.mime.base import MIMEBase
-from email.mime.multipart import MIMEMultipart
-from email.mime.text import MIMEText
 
 import pandas as pd
 import streamlit as st
@@ -538,6 +533,59 @@ def fmt_date_xml(dt):
     return f"{dt.day}<super>{suf}</super> {dt.strftime('%B, %Y')}"
 
 
+def _to_dt(v):
+    """Safely converts None / NaT / pandas Timestamp / datetime into datetime or None."""
+    if v is None:
+        return None
+    try:
+        if pd.isna(v):
+            return None
+    except Exception:
+        pass
+    if isinstance(v, pd.Timestamp):
+        return v.to_pydatetime()
+    return v if isinstance(v, datetime) else None
+
+
+def sort_by_assigned(records):
+    """Ascending order of Assigned Date (rows without a date go last; Excel order kept on ties)."""
+    return sorted(
+        records,
+        key=lambda r: (_to_dt(r.get("assigned_dt")) is None,
+                       _to_dt(r.get("assigned_dt")) or datetime.min),
+    )
+
+
+def semester_roman_only(value):
+    """'Semester IV' / 'Trimester II' -> 'IV' / 'II' (for the Thanking Letter table)."""
+    s = re.sub(r"(?i)\b(semester|trimester|sem)\b\.?\s*[-:]?\s*", "", str(value or ""))
+    return s.strip()
+
+
+def build_address_lines(name, details):
+    """
+    Addressee block lines. Comma after Institute Name if Address Line 1 or Address Line 2 is entered;
+    comma after Address Line 1 only if Address Line 2 is entered.
+    """
+    def _c(v):
+        return str(v or "").strip()
+
+    def _with_comma(text, add):
+        text = _c(text)
+        if text and add and not text.endswith(","):
+            text += ","
+        return text
+
+    institute, addr1, addr2 = _c(details.get("institute")), _c(details.get("addr1")), _c(details.get("addr2"))
+    return [
+        _c(name),
+        _c(details.get("designation")),
+        _with_comma(institute, bool(addr1 or addr2)),
+        _with_comma(addr1, bool(addr2)),
+        addr2,
+    ]
+
+
 # ==========================================
 # EXCEL LOADING ("EVALUATION DASHBOARD DETAILS" FORMAT)
 # ==========================================
@@ -630,6 +678,19 @@ def infer_exam_month_year(df_rows):
 # ==========================================
 # PDF GENERATOR FUNCTIONS
 # ==========================================
+
+def build_eml_draft(to_addr, subject, body, pdf_bytes, pdf_filename):
+    """Builds an unsent email draft (.eml) with the PDF already attached."""
+    from email.message import EmailMessage
+
+    msg = EmailMessage()
+    msg["To"] = (to_addr or "").strip()
+    msg["Subject"] = subject
+    msg["X-Unsent"] = "1"          # makes Outlook open it as an editable draft
+    msg.set_content(body)
+    msg.add_attachment(pdf_bytes, maintype="application", subtype="pdf", filename=pdf_filename)
+    return msg.as_bytes()
+
 
 def _esc(text):
     """Escapes special characters for ReportLab Paragraph XML markup."""
@@ -781,13 +842,7 @@ def build_appointment_letter_story(college_key, rec, details, styles, page_width
 
     # 2. Addressee Block
     story.append(Paragraph("To,", base))
-    addr_lines = [
-        rec["examiner_name"],
-        details.get("designation", ""),
-        details.get("institute", ""),
-        details.get("addr1", ""),
-        details.get("addr2", ""),
-    ]
+    addr_lines = build_address_lines(rec["examiner_name"], details)
     for line in addr_lines:
         if line and line.strip():
             story.append(Paragraph(_esc(line.strip()), base))
@@ -882,13 +937,7 @@ def build_thanking_letter_story(
     # 2. Addressee Block
     story.append(Paragraph("To,", base))
     first_rec = records[0]
-    addr_lines = [
-        first_rec["examiner_name"],
-        details.get("designation", ""),
-        details.get("institute", ""),
-        details.get("addr1", ""),
-        details.get("addr2", ""),
-    ]
+    addr_lines = build_address_lines(first_rec["examiner_name"], details)
     for line in addr_lines:
         if line and line.strip():
             story.append(Paragraph(_esc(line.strip()), base))
@@ -947,7 +996,7 @@ def build_thanking_letter_story(
     for r in records:
         table_data.append([
             Paragraph(_esc(r["course"]), td_left),
-            Paragraph(_esc(r["semester"]), td_center),
+            Paragraph(_esc(semester_roman_only(r["semester"])), td_center),
             Paragraph(_esc(r["subject"]), td_left),
             Paragraph(str(r.get("checked", 0)), td_center),
         ])
@@ -1031,75 +1080,28 @@ def generate_letter_pdf(
     page_height = A4[1] - 2 * margin
     styles = getSampleStyleSheet()
 
+    records = sort_by_assigned(records)   # ascending Assigned Date everywhere
+
     story = []
-    if letter_type == "Thanking Letter":
-        story.extend(
-            build_thanking_letter_story(
-                college_key,
-                records,
-                details,
-                thank_date_xml,
-                exam_month_year,
-                styles,
-                page_width,
-                page_height,
-            )
-        )
-    else:
+    if letter_type in ("Appointment Letter", "All Letters"):
         for i, rec in enumerate(records):
             if i > 0:
                 story.append(PageBreak())
             story.extend(build_appointment_letter_story(college_key, rec, details, styles, page_width))
 
+    if letter_type in ("Thanking Letter", "All Letters"):
+        if story:
+            story.append(PageBreak())   # Thanking Letter always on the last page
+        story.extend(
+            build_thanking_letter_story(
+                college_key, records, details, thank_date_xml,
+                exam_month_year, styles, page_width, page_height,
+            )
+        )
+
     doc.build(story)
     buffer.seek(0)
     return buffer.getvalue()
-
-
-# ==========================================
-# SMTP SEND-WITH-ATTACHMENTS
-# ==========================================
-
-def send_email_with_attachments(
-    smtp_host, smtp_port, smtp_user, smtp_pass,
-    to_addr, subject, body, attachments
-):
-    msg = MIMEMultipart()
-    msg["From"] = smtp_user
-    msg["To"] = to_addr
-    msg["Subject"] = subject
-    msg.attach(MIMEText(body, "plain"))
-
-    for filename, file_bytes in attachments:
-        part = MIMEBase("application", "octet-stream")
-        part.set_payload(file_bytes)
-        encoders.encode_base64(part)
-        part.add_header("Content-Disposition", f'attachment; filename="{filename}"')
-        msg.attach(part)
-
-    with smtplib.SMTP(smtp_host, smtp_port, timeout=20) as server:
-        server.starttls()
-        server.login(smtp_user, smtp_pass)
-        server.sendmail(smtp_user, [to_addr], msg.as_string())
-
-
-def get_smtp_credentials():
-    try:
-        has_secret = "smtp" in st.secrets
-    except Exception:
-        has_secret = False
-
-    if has_secret:
-        cfg = st.secrets["smtp"]
-        return cfg["host"], int(cfg["port"]), cfg["user"], cfg["password"], True
-
-    with st.expander("\U0001F510 SMTP Credentials (not found in secrets \u2014 enter manually)"):
-        c1, c2, c3, c4 = st.columns([2, 1, 2, 2])
-        host = c1.text_input("SMTP Host", value="smtp.office365.com", key="smtp_host_manual")
-        port = c2.number_input("Port", value=587, key="smtp_port_manual")
-        user = c3.text_input("Sender Email", key="smtp_user_manual")
-        pw = c4.text_input("Password / App Password", type="password", key="smtp_pass_manual")
-    return host, int(port), user, pw, False
 
 
 # ==========================================
@@ -1351,7 +1353,7 @@ def show():
     for i in chosen_idx:
         r = ex_rows.iloc[i]
         if date_mode.startswith("Excel"):
-            appt_dt = r["assigned_dt"] or datetime.now()
+            appt_dt = _to_dt(r["assigned_dt"]) or datetime.now()
         elif date_mode == "Today's date":
             appt_dt = datetime.now()
         else:
@@ -1369,7 +1371,10 @@ def show():
             "date_text": fmt_date_plain(appt_dt),
             "date_xml": fmt_date_xml(appt_dt),
             "thank_date_text": thank_date_plain,
+            "assigned_dt": _to_dt(r["assigned_dt"]),
         })
+
+    final_records = sort_by_assigned(final_records)
 
     details = {
         "designation": designation,
@@ -1394,65 +1399,41 @@ def show():
         st.dataframe(preview_df, use_container_width=True, hide_index=True)
 
     # ------------------------------------------------------------------
-    # Two Generation Buttons: Appointment Letters vs. Thanking Letter
+    # Single Generation Button: all Appointment Letters + Thanking Letter (last page)
     # ------------------------------------------------------------------
     base_sig = repr((college_key, sel_key, final_records, details, thank_date_xml, exam_month_year))
     clean_name = re.sub(r"[^A-Za-z0-9]+", "_", letter_name.strip() or default_name).strip("_")
 
-    btn_c1, btn_c2 = st.columns(2)
-    gen_appt = btn_c1.button(
-        "\u26A1 Generate Appointment Letters",
-        type="primary",
-        use_container_width=True,
-    )
-    gen_thank = btn_c2.button(
-        "\U0001F31F Generate Thanking Letter",
+    gen_all = st.button(
+        "\u26A1 Generate All Letters (Appointment + Thanking) \u2014 Single PDF",
         type="primary",
         use_container_width=True,
     )
 
-    if gen_appt:
+    if gen_all:
         try:
-            pdf_filename = f"{college_cfg['code']}_Appointment_Letters_{clean_name}.pdf"
             st.session_state["appt_pdf"] = generate_letter_pdf(
                 college_key=college_key,
-                letter_type="Appointment Letter",
+                letter_type="All Letters",
                 records=final_records,
                 details=details,
                 thank_date_xml=thank_date_xml,
                 exam_month_year=exam_month_year,
             )
             st.session_state["appt_sig"] = base_sig
-            st.session_state["generated_type"] = "Appointment Letter"
-            st.session_state["pdf_filename"] = pdf_filename
+            st.session_state["pdf_filename"] = f"{college_cfg['code']}_Letters_{clean_name}.pdf"
         except Exception as e:
-            st.error(f"Appointment Letter PDF generation failed: {e}")
-
-    if gen_thank:
-        try:
-            pdf_filename = f"{college_cfg['code']}_Thanking_Letter_{clean_name}.pdf"
-            st.session_state["appt_pdf"] = generate_letter_pdf(
-                college_key=college_key,
-                letter_type="Thanking Letter",
-                records=final_records,
-                details=details,
-                thank_date_xml=thank_date_xml,
-                exam_month_year=exam_month_year,
-            )
-            st.session_state["appt_sig"] = base_sig
-            st.session_state["generated_type"] = "Thanking Letter"
-            st.session_state["pdf_filename"] = pdf_filename
-        except Exception as e:
-            st.error(f"Thanking Letter PDF generation failed: {e}")
+            st.error(f"PDF generation failed: {e}")
 
     pdf_ready = ("appt_pdf" in st.session_state and st.session_state.get("appt_sig") == base_sig)
     if not pdf_ready:
         if "appt_pdf" in st.session_state:
-            st.caption("\u2139\ufe0f Inputs changed since last generation \u2014 click one of the generate buttons above.")
+            st.caption("\u2139\ufe0f Inputs changed since last generation \u2014 click the generate button above.")
         return
 
-    active_letter_type = st.session_state.get("generated_type", "Appointment Letter")
     active_filename = st.session_state.get("pdf_filename", f"{college_cfg['code']}_Letters_{clean_name}.pdf")
+    n_pages = len(final_records) + 1
+    st.caption(f"{len(final_records)} appointment letter page(s) + 1 thanking letter page = {n_pages} page(s).")
 
     st.download_button(
         label=f"\U0001F4C4 Download {active_filename}",
@@ -1466,95 +1447,54 @@ def show():
     # Compact Email Section
     # ------------------------------------------------------------------
     with st.container(border=True):
-        st.caption(f"**Send {active_letter_type} via Email**")
+        st.caption("**Send Letters (Appointment + Thanking) via Email** \u2014 use the .eml draft for an auto-attached PDF, or the buttons (PDF must be attached manually).")
         excel_email = ex_rows["examiner_email"].iloc[0] if len(ex_rows) else ""
         roles_txt = " / ".join(dict.fromkeys(r["role"] for r in final_records))
 
-        if active_letter_type == "Thanking Letter":
-            email_subject = (
-                f"Thanking Letter ({college_cfg['code']}) \u2014 {roles_txt} \u2014 "
-                f"End Semester Examinations ({exam_month_year})"
-            )
-            default_body = (
-                f"Dear {letter_name.strip() or default_name},\n\n"
-                f"Greetings from the Examination Department, {college_cfg['short_name']}.\n\n"
-                f"Please find attached our letter of appreciation for your valuable contribution as "
-                f"{roles_txt} for the End Semester Examinations held in {exam_month_year}.\n\n"
-                f"Thank you once again and looking forward to your continued support.\n\n"
-                f"Warm regards,\n"
-                f"{SIGNATORY['title']}\n"
-                f"{college_cfg['short_name']}"
-            )
-        else:
-            email_subject = (
-                f"Appointment Letter ({college_cfg['code']}) \u2014 {roles_txt} \u2014 End Semester Examination"
-            )
-            default_body = (
-                f"Dear {letter_name.strip() or default_name},\n\n"
-                f"Greetings from the Examination Department, {college_cfg['short_name']}.\n\n"
-                f"Please find attached your appointment letter(s) as {roles_txt} for the End Semester "
-                f"Examination ({len(final_records)} subject(s)).\n\n"
-                f"If you have any queries, please feel free to reach out to the Examination Cell.\n\n"
-                f"Warm regards,\n"
-                f"{SIGNATORY['title']}\n"
-                f"{college_cfg['short_name']}"
-            )
-
-        em_c1, em_c2 = st.columns([1.4, 1.6])
-        email_to = em_c1.text_input("Recipient Email", value=excel_email, key=f"email_{sel_key}")
-        send_mode = em_c2.radio(
-            "Dispatch Mode",
-            [
-                "SMTP (auto-attach PDF)",
-                "Outlook Web / Mail App (manual attach)",
-            ],
-            horizontal=True,
-            key=f"sendmode_{sel_key}",
+        email_subject = (
+            f"Appointment & Thanking Letters ({college_cfg['code']}) - {roles_txt} - "
+            f"End Semester Examinations ({exam_month_year})"
+        )
+        default_body = (
+            f"Dear {salutation},\n\n"
+            f"Greetings from the Examination Department.\n\n"
+            f"Please find attached your appointment letter(s) as {roles_txt} for the End Semester "
+            f"Examination ({len(final_records)} subject(s)), followed by our letter of appreciation "
+            f"for your valuable contribution to the End Semester Examinations held in {exam_month_year}.\n\n"
+            f"If you have any queries, please feel free to reach out to the Examination Cell.\n\n"
+            f"Warm regards,"
         )
 
+        email_to = st.text_input("Recipient Email", value=excel_email, key=f"email_{sel_key}")
         email_body = st.text_area(
             "Email Message",
             value=default_body,
             height=135,
-            key=f"emailbody_{college_key}_{active_letter_type}_{sel_key}",
+            key=f"emailbody_{college_key}_{sel_key}_{salutation.replace('/', '_')}",
         )
 
-        attachments = [(active_filename, st.session_state["appt_pdf"])]
+        encoded_subject = urllib.parse.quote(email_subject)
+        encoded_body = urllib.parse.quote(email_body)
+        mailto_url = f"mailto:{email_to}?subject={encoded_subject}&body={encoded_body}"
+        owa_url = (
+            f"https://outlook.office.com/mail/deeplink/compose?"
+            f"to={urllib.parse.quote(email_to)}&subject={encoded_subject}&body={encoded_body}"
+        )
+        m_c1, m_c2 = st.columns(2)
+        m_c1.link_button("\U0001F310 Open in Outlook Web", owa_url, use_container_width=True)
+        m_c2.link_button("\u2709\ufe0f Open in Default Mail App", mailto_url, use_container_width=True)
 
-        if send_mode.startswith("SMTP"):
-            smtp_host, smtp_port, smtp_user, smtp_pass, from_secrets = get_smtp_credentials()
-            s_c1, s_c2 = st.columns([1.5, 1.5])
-            confirm = s_c1.checkbox(
-                f"Confirm send to {email_to or '(enter email)'}",
-                key=f"confirm_{active_letter_type}_{sel_key}",
-            )
-            if s_c2.button(
-                "\U0001F4E4 Send Email with PDF",
-                type="primary",
-                disabled=not (email_to and confirm),
-                use_container_width=True,
-            ):
-                try:
-                    send_email_with_attachments(
-                        smtp_host, smtp_port, smtp_user, smtp_pass,
-                        email_to, email_subject, email_body, attachments,
-                    )
-                    st.success(f"\u2705 Email sent to {email_to} with `{active_filename}` attached.")
-                except Exception as e:
-                    st.error(f"Send failed: {e}")
-        else:
-            encoded_subject = urllib.parse.quote(email_subject)
-            encoded_body = urllib.parse.quote(email_body)
-            mailto_url = f"mailto:{email_to}?subject={encoded_subject}&body={encoded_body}"
-            owa_url = (
-                f"https://outlook.office.com/mail/deeplink/compose?"
-                f"to={urllib.parse.quote(email_to)}&subject={encoded_subject}&body={encoded_body}"
-            )
-            m_c1, m_c2 = st.columns(2)
-            m_c1.link_button("\U0001F310 Open in Outlook Web", owa_url, type="primary", use_container_width=True)
-            m_c2.link_button("\u2709\ufe0f Open in Default Mail App", mailto_url, use_container_width=True)
+        st.download_button(
+            "\U0001F4CE Download Email Draft (.eml) \u2014 PDF already attached",
+            data=build_eml_draft(email_to, email_subject, email_body, st.session_state["appt_pdf"], active_filename),
+            file_name=f"{college_cfg['code']}_Email_Draft_{clean_name}.eml",
+            mime="message/rfc822",
+            type="primary",
+            use_container_width=True,
+            help="Double-click the downloaded file to open a ready-to-send draft with the PDF attached "
+                 "(Outlook desktop, Apple Mail, Thunderbird).",
+        )
 
 
 if __name__ == "__main__":
     show()
-
