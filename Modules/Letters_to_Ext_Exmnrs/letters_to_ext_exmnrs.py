@@ -931,7 +931,7 @@ def build_thanking_letter_story(
     sp_para = 4 if compact else 6
     tbl_font_size = 9.5 if compact else 10.5
     tbl_leading = 11.5 if compact else 13.0
-    tbl_pad = 3 if compact else 4.5
+    tbl_pad = 2 if compact else 3
 
     base = ParagraphStyle(
         "ThankBody",
