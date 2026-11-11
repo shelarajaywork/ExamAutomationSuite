@@ -5,6 +5,9 @@ import struct
 import zipfile
 import urllib.parse
 from datetime import datetime
+from email.message import EmailMessage
+from email.policy import SMTP as SMTP_POLICY
+from email.utils import formatdate
 
 import pandas as pd
 import streamlit as st
@@ -75,7 +78,7 @@ COLLEGE_CONFIGS = {
                 "color": "#000000",
             },
             {
-                "text": "NAAC Re-Accredited \u201cA+\u201d Grade with CGPA: 3.27",
+                "text": "NAAC Re-Accredited \"A+\" Grade with CGPA: 3.27",
                 "font": "Times-Roman",
                 "size": 10,
                 "leading": 12.5,
@@ -130,7 +133,7 @@ COLLEGE_CONFIGS = {
                 "color": "#000000",
             },
             {
-                "text": "NAAC Reaccredited \u201cA++\u201d Grade with CGPA: 3.55 (November 2024)",
+                "text": "NAAC Reaccredited \"A++\" Grade with CGPA: 3.55 (November 2024)",
                 "font": "Times-Roman",
                 "size": 10,
                 "leading": 12.5,
@@ -179,7 +182,7 @@ COLLEGE_CONFIGS = {
                 "color": "#000000",
             },
             {
-                "text": "NAAC Reaccredited \u201cA\u201d Grade with CGPA: 3.42",
+                "text": "NAAC Reaccredited \"A\" Grade with CGPA: 3.42",
                 "font": "Times-Roman",
                 "size": 10,
                 "leading": 12.5,
@@ -319,14 +322,14 @@ for _ckey in COLLEGE_CONFIGS:
 # ==========================================
 
 _BRACKET_WITH_DIGITS = re.compile(r"[\(\[\{][^\)\]\}]*\d[^\)\]\}]*[\)\]\}]")
-_NAME_PREFIXES = r"(?:Dr|Prof|Mr|Mrs|Ms|Miss|Shri|Smt)"
 
+_NAME_PREFIXES = r"(?:Dr|Prof|Mr|Mrs|Ms|Miss|Shri|Smt)"
 
 def clean_text(value, restore_ampersand=False):
     """Strips bracketed numeric codes and stray numbers; optionally restores ERP-stripped '&'."""
     if value is None or (not isinstance(value, str) and pd.isna(value)):
         return ""
-    s = str(value).replace("\u00a0", " ")
+    s = str(value).replace(" ", " ")
     s = _BRACKET_WITH_DIGITS.sub(" ", s)
     s = re.sub(r"\d+", " ", s)
     s = re.sub(r"\(\s*\)|\[\s*\]|\{\s*\}", " ", s)
@@ -335,7 +338,7 @@ def clean_text(value, restore_ampersand=False):
     s = re.sub(r"(?:^|\s)[.,;:]+(?=\s|$)", " ", s)
     s = re.sub(r"\s+", " ", s).strip()
     s = re.sub(r"\s+([,.;:])", r"\1", s)
-    s = s.strip(" -\u2013,;:")
+    s = s.strip(" -–,;:")
     return s
 
 
@@ -454,7 +457,7 @@ def format_academic_year(value):
     if value is None or (not isinstance(value, str) and pd.isna(value)):
         return ""
     s = str(value).strip()
-    m = re.search(r"(\d{4})\s*[-/\u2013]\s*(\d{2,4})", s)
+    m = re.search(r"(\d{4})\s*[-/–]\s*(\d{2,4})", s)
     if m:
         return f"{m.group(1)}-{m.group(2)[-2:]}"
     m = re.search(r"\d{4}", s)
@@ -676,20 +679,27 @@ def infer_exam_month_year(df_rows):
 
 
 # ==========================================
-# PDF GENERATOR FUNCTIONS
+# EMAIL DRAFT (.EML) & PDF GENERATOR FUNCTIONS
 # ==========================================
 
 def build_eml_draft(to_addr, subject, body, pdf_bytes, pdf_filename):
-    """Builds an unsent email draft (.eml) with the PDF already attached."""
-    from email.message import EmailMessage
-
+    """
+    Builds a standards-compliant unsent email draft (.eml) with CRLF line endings
+    and the PDF already attached so Outlook Desktop / New Outlook / Mail apps open it cleanly.
+    """
     msg = EmailMessage()
     msg["To"] = (to_addr or "").strip()
-    msg["Subject"] = subject
-    msg["X-Unsent"] = "1"          # makes Outlook open it as an editable draft
+    msg["Subject"] = re.sub(r"[\r\n]+", " ", str(subject or "")).strip()
+    msg["Date"] = formatdate(localtime=True)
+    msg["X-Unsent"] = "1"          # Opens as an editable compose window in Outlook / mail clients
     msg.set_content(body)
-    msg.add_attachment(pdf_bytes, maintype="application", subtype="pdf", filename=pdf_filename)
-    return msg.as_bytes()
+    msg.add_attachment(
+        pdf_bytes,
+        maintype="application",
+        subtype="pdf",
+        filename=pdf_filename,
+    )
+    return msg.as_bytes(policy=SMTP_POLICY)
 
 
 def _esc(text):
@@ -794,7 +804,7 @@ def _build_signature_block(styles, page_width, container_inset):
     return sig_table
 
 
-def build_appointment_letter_story(college_key, rec, details, styles, page_width):
+def build_appointment_letter_story(college_key, rec, details, exam_month_year, styles, page_width):
     """Builds flowables for ONE Appointment Letter page (one subject per page)."""
     container_inset = 26.0
     inner_indent = 36.0
@@ -821,7 +831,7 @@ def build_appointment_letter_story(college_key, rec, details, styles, page_width
         "Sub",
         parent=base,
         fontName="Times-Bold",
-        leftIndent=container_inset + inner_indent,
+        leftIndent=container_inset,
         rightIndent=container_inset,
         alignment=TA_CENTER,
         spaceBefore=4,
@@ -849,40 +859,55 @@ def build_appointment_letter_story(college_key, rec, details, styles, page_width
 
     story.append(Spacer(1, 6))
 
-    # 3. Subject Block (exact 2-line format from Word templates)
+    # 3. Subject Block (updated: single-line with Role and Exam Month & Year)
     role = _esc(rec["role"])
+    exam_my_esc = _esc(exam_month_year)
     story.append(Paragraph(
-        f"Sub: Appointment as Examiner ({role}) for End Semester Examination of",
+        f"Sub: Appointment as Examiner ({role}) for End Semester Examination, {exam_my_esc}",
         centred_bold,
     ))
-    course_sem_line = f"{_esc(rec['course'])} {_esc(rec['semester'])}".strip()
-    if rec["academic_year"]:
-        course_sem_line += f" ({_esc(rec['academic_year'])})"
-    story.append(Paragraph(course_sem_line, centred_bold))
 
     story.append(Spacer(1, 6))
 
-    # 4. Salutation & Body
+    # 4. Salutation & Body (updated wording + Academic Year below Semester)
     story.append(Paragraph(f"Respected {_esc(rec['salutation'])},", justified))
+
+    story.append(Spacer(1, 6))
+
     story.append(Paragraph(
-        f"We are pleased to appoint you as Examiner ({role}) for the End Semester "
-        f"Examination of the above-mentioned program and semester, for the following subject.",
+        f"     We are pleased to appoint you as Examiner ({role}) for the End Semester "
+        f"Examination held in {_esc(exam_month_year)}.",
         justified,
     ))
+
+    story.append(Spacer(1, 6))
+
     story.append(Paragraph(f"<b>Program:</b> {_esc(rec['course'])}", indented_justified))
     story.append(Paragraph(f"<b>Semester:</b> {_esc(rec['semester'])}", indented_justified))
+    story.append(Paragraph(f"<b>Academic Year:</b> {_esc(rec['academic_year'])}", indented_justified))
     story.append(Paragraph(f"<b>Subject:</b> {_esc(rec['subject'])}", indented_justified))
+    
+    story.append(Spacer(1, 6))
+    
     story.append(Paragraph(
-        "Evaluation is in online mode (Onscreen Marking) for which you will receive an "
+        "     The Evaluation is in online mode (Onscreen Marking) for which you will receive an "
         "email after assignment of the evaluation task.",
         justified,
     ))
+    
+    story.append(Spacer(1, 6))
+    
     story.append(Paragraph(
-        "An honorarium, as per the rules will be paid towards the assessment.",
+        "     An honorarium, as per the rules will be paid towards the assessment.",
         justified,
     ))
+    
+    story.append(Spacer(1, 6))
+    
     story.append(Paragraph("Thank you.", justified))
     story.append(Spacer(1, 14))
+
+    story.append(Spacer(1, 6))
 
     # 5. Signature Block
     story.append(_build_signature_block(styles, page_width, container_inset))
@@ -1003,9 +1028,9 @@ def build_thanking_letter_story(
 
     tbl_width = page_width - 2 * container_inset
     col_widths = [
-        tbl_width * 0.37,
-        tbl_width * 0.16,
-        tbl_width * 0.31,
+        tbl_width * 0.40,
+        tbl_width * 0.10,
+        tbl_width * 0.32,
         tbl_width * 0.16,
     ]
     subj_table = Table(table_data, colWidths=col_widths, repeatRows=1)
@@ -1057,9 +1082,10 @@ def generate_letter_pdf(
     exam_month_year="",
 ):
     """
-    Generates either:
-    - Appointment Letter PDF (one page per subject assignment), or
-    - Thanking Letter PDF (single page with all subjects in a table).
+    Generates:
+    - Appointment Letter PDF (one page per subject assignment),
+    - Thanking Letter PDF (single page with all subjects in a table), or
+    - All Letters PDF (all Appointment Letters followed by the Thanking Letter on the last page).
     """
     extract_college_assets_from_docx(college_key)
     cfg = COLLEGE_CONFIGS[college_key]
@@ -1087,7 +1113,11 @@ def generate_letter_pdf(
         for i, rec in enumerate(records):
             if i > 0:
                 story.append(PageBreak())
-            story.extend(build_appointment_letter_story(college_key, rec, details, styles, page_width))
+            story.extend(
+                build_appointment_letter_story(
+                    college_key, rec, details, exam_month_year, styles, page_width
+                )
+            )
 
     if letter_type in ("Thanking Letter", "All Letters"):
         if story:
@@ -1119,7 +1149,7 @@ def show():
         unsafe_allow_html=True,
     )
 
-    st.subheader("\u2709\ufe0f Letters to External Examiners")
+    st.subheader("✉️ Letters to External Examiners")
 
     # ------------------------------------------------------------------
     # Top Bar: 1. Select College & 2. Upload Evaluation Dashboard Excel
@@ -1146,7 +1176,7 @@ def show():
     assets_ok = extract_college_assets_from_docx(college_key)
     if not assets_ok:
         with st.expander(
-            f"\u26A0\ufe0f Missing {college_key} Logo / Signature \u2014 Upload '{college_cfg['docx_candidates'][0]}' once",
+            f"⚠️ Missing {college_key} Logo / Signature — Upload '{college_cfg['docx_candidates'][0]}' once",
             expanded=True,
         ):
             docx_up = st.file_uploader(
@@ -1156,7 +1186,7 @@ def show():
             )
             if docx_up is not None:
                 if extract_college_assets_from_docx(college_key, docx_up):
-                    st.success(f"\u2705 {college_key} letterhead logos and signature extracted to `./logos/`!")
+                    st.success(f"✅ {college_key} letterhead logos and signature extracted to `./logos/`!")
                     st.rerun()
                 else:
                     st.error("Could not extract all required images from the uploaded Word file.")
@@ -1198,7 +1228,7 @@ def show():
     name_of = {k: eligible.loc[eligible["examiner_key"] == k, "examiner_name"].iloc[0] for k in ex_keys}
 
     st.caption(
-        f"**{college_cfg['code']} Format Active** \u2022 Loaded **{len(recs)}** rows \u2022 "
+        f"**{college_cfg['code']} Format Active** • Loaded **{len(recs)}** rows • "
         f"**{len(eligible)}** Moderator/Revaluator assignments across **{len(ex_keys)}** examiners."
     )
 
@@ -1405,7 +1435,7 @@ def show():
     clean_name = re.sub(r"[^A-Za-z0-9]+", "_", letter_name.strip() or default_name).strip("_")
 
     gen_all = st.button(
-        "\u26A1 Generate All Letters (Appointment + Thanking) \u2014 Single PDF",
+        "⚡ Generate All Letters (Appointment + Thanking) — Single PDF",
         type="primary",
         use_container_width=True,
     )
@@ -1428,7 +1458,7 @@ def show():
     pdf_ready = ("appt_pdf" in st.session_state and st.session_state.get("appt_sig") == base_sig)
     if not pdf_ready:
         if "appt_pdf" in st.session_state:
-            st.caption("\u2139\ufe0f Inputs changed since last generation \u2014 click the generate button above.")
+            st.caption("ℹ️ Inputs changed since last generation — click the generate button above.")
         return
 
     active_filename = st.session_state.get("pdf_filename", f"{college_cfg['code']}_Letters_{clean_name}.pdf")
@@ -1447,9 +1477,10 @@ def show():
     # Compact Email Section
     # ------------------------------------------------------------------
     with st.container(border=True):
-        st.caption("**Send Letters (Appointment + Thanking) via Email** \u2014 use the .eml draft for an auto-attached PDF, or the buttons (PDF must be attached manually).")
+        st.caption("**Send Letters (Appointment + Thanking) via Email** — use the .eml draft for an auto-attached PDF, or the buttons (PDF must be attached manually).")
         excel_email = ex_rows["examiner_email"].iloc[0] if len(ex_rows) else ""
         roles_txt = " / ".join(dict.fromkeys(r["role"] for r in final_records))
+        subj_word = "subject" if len(final_records) == 1 else "subjects"
 
         email_subject = (
             f"Appointment & Thanking Letters ({college_cfg['code']}) - {roles_txt} - "
@@ -1457,19 +1488,21 @@ def show():
         )
         default_body = (
             f"Dear {salutation},\n\n"
-            f"Greetings from the Examination Department.\n\n"
+            f"Greetings from the Examination Department, {college_cfg['short_name']}.\n\n"
             f"Please find attached your appointment letter(s) as {roles_txt} for the End Semester "
-            f"Examination ({len(final_records)} subject(s)), followed by our letter of appreciation "
+            f"Examination ({len(final_records)} {subj_word}), followed by our letter of appreciation "
             f"for your valuable contribution to the End Semester Examinations held in {exam_month_year}.\n\n"
             f"If you have any queries, please feel free to reach out to the Examination Cell.\n\n"
-            f"Warm regards,"
+            f"Warm regards,\n"
+            f"{SIGNATORY['title']}\n"
+            f"{college_cfg['short_name']}"
         )
 
         email_to = st.text_input("Recipient Email", value=excel_email, key=f"email_{sel_key}")
         email_body = st.text_area(
             "Email Message",
             value=default_body,
-            height=135,
+            height=155,
             key=f"emailbody_{college_key}_{sel_key}_{salutation.replace('/', '_')}",
         )
 
@@ -1482,10 +1515,10 @@ def show():
         )
         m_c1, m_c2 = st.columns(2)
         m_c1.link_button("\U0001F310 Open in Outlook Web", owa_url, use_container_width=True)
-        m_c2.link_button("\u2709\ufe0f Open in Default Mail App", mailto_url, use_container_width=True)
+        m_c2.link_button("✉️ Open in Default Mail App", mailto_url, use_container_width=True)
 
         st.download_button(
-            "\U0001F4CE Download Email Draft (.eml) \u2014 PDF already attached",
+            "\U0001F4CE Download Email Draft (.eml) — PDF already attached",
             data=build_eml_draft(email_to, email_subject, email_body, st.session_state["appt_pdf"], active_filename),
             file_name=f"{college_cfg['code']}_Email_Draft_{clean_name}.eml",
             mime="message/rfc822",
