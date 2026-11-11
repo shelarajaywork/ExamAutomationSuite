@@ -875,7 +875,7 @@ def build_appointment_letter_story(college_key, rec, details, exam_month_year, s
     story.append(Spacer(1, 6))
 
     story.append(Paragraph(
-        f"     We are pleased to appoint you as Examiner ({role}) for the End Semester "
+        f"We are pleased to appoint you as Examiner ({role}) for the End Semester "
         f"Examination held in {_esc(exam_month_year)}.",
         justified,
     ))
@@ -890,7 +890,7 @@ def build_appointment_letter_story(college_key, rec, details, exam_month_year, s
     story.append(Spacer(1, 6))
     
     story.append(Paragraph(
-        "     The Evaluation is in online mode (Onscreen Marking) for which you will receive an "
+        "The Evaluation is in online mode (Onscreen Marking) for which you will receive an "
         "email after assignment of the evaluation task.",
         justified,
     ))
@@ -898,7 +898,7 @@ def build_appointment_letter_story(college_key, rec, details, exam_month_year, s
     story.append(Spacer(1, 6))
     
     story.append(Paragraph(
-        "     An honorarium, as per the rules will be paid towards the assessment.",
+        "An honorarium, as per the rules will be paid towards the assessment.",
         justified,
     ))
     
@@ -1028,8 +1028,8 @@ def build_thanking_letter_story(
 
     tbl_width = page_width - 2 * container_inset
     col_widths = [
-        tbl_width * 0.40,
-        tbl_width * 0.10,
+        tbl_width * 0.38,
+        tbl_width * 0.12,
         tbl_width * 0.32,
         tbl_width * 0.16,
     ]
